@@ -1,0 +1,115 @@
+package proxy
+
+import (
+	"encoding/json"
+)
+
+// openAIResponse is the non-streaming Chat Completions response from the gateway.
+type openAIResponse struct {
+	ID      string `json:"id"`
+	Choices []struct {
+		Index        int `json:"index"`
+		Message       struct {
+			Role      string          `json:"role"`
+			Content   string          `json:"content"`
+			ToolCalls []openAITool    `json:"tool_calls"`
+			Reasoning string          `json:"reasoning_content"` // stripped, never forwarded
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
+}
+
+// anthropicContentBlock is one block in an Anthropic message content array.
+type anthropicContentBlock struct {
+	Type  string          `json:"type"`
+	Text  string          `json:"text,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
+
+// anthropicResponse is the Anthropic Messages response we return to Claude Code.
+type anthropicResponse struct {
+	ID           string                 `json:"id"`
+	Type         string                 `json:"type"` // "message"
+	Role         string                 `json:"role"` // "assistant"
+	Model        string                 `json:"model"`
+	Content      []anthropicContentBlock `json:"content"`
+	StopReason   string                 `json:"stop_reason"`
+	StopSequence *string                `json:"stop_sequence"`
+	Usage        anthropicUsage         `json:"usage"`
+}
+
+type anthropicUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
+
+// toAnthropic translates a non-streaming OpenAI response into an Anthropic
+// Messages response. model is the model id Claude Code expects to see echoed.
+func (r *openAIResponse) toAnthropic(model string) *anthropicResponse {
+	resp := &anthropicResponse{
+		ID:    "msg_" + r.ID,
+		Type:  "message",
+		Role:  "assistant",
+		Model: model,
+		Usage: anthropicUsage{
+			InputTokens:  r.Usage.PromptTokens,
+			OutputTokens: r.Usage.CompletionTokens,
+		},
+	}
+	if len(r.Choices) == 0 {
+		resp.StopReason = "end_turn"
+		return resp
+	}
+	choice := r.Choices[0]
+	resp.StopReason = mapStopReason(choice.FinishReason)
+
+	if choice.Message.Content != "" {
+		resp.Content = append(resp.Content, anthropicContentBlock{Type: "text", Text: choice.Message.Content})
+	} else if choice.Message.Reasoning != "" {
+		// Reasoning models (e.g. glm-5.1) may emit the answer in
+		// reasoning_content when the token budget is exhausted. Surface it as a
+		// text block so Claude Code is never handed an empty message.
+		resp.Content = append(resp.Content, anthropicContentBlock{Type: "text", Text: choice.Message.Reasoning})
+	}
+	for _, tc := range choice.Message.ToolCalls {
+		var input json.RawMessage
+		// arguments is a JSON string; parse it to an object for Anthropic input.
+		if tc.Function.Arguments != "" {
+			input = json.RawMessage(tc.Function.Arguments)
+		} else {
+			input = json.RawMessage(`{}`)
+		}
+		resp.Content = append(resp.Content, anthropicContentBlock{
+			Type:  "tool_use",
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: input,
+		})
+	}
+	if len(resp.Content) == 0 {
+		resp.Content = []anthropicContentBlock{{Type: "text", Text: ""}}
+	}
+	return resp
+}
+
+// mapStopReason converts OpenAI finish_reason to Anthropic stop_reason.
+func mapStopReason(finish string) string {
+	switch finish {
+	case "stop":
+		return "end_turn"
+	case "tool_calls", "function_call":
+		return "tool_use"
+	case "length":
+		return "max_tokens"
+	case "content_filter":
+		return "end_turn"
+	default:
+		return "end_turn"
+	}
+}
