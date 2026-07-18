@@ -28,6 +28,7 @@ type anthropicRequest struct {
 	TopK          *int            `json:"top_k"`
 	StopSequences []string        `json:"stop_sequences"`
 	Metadata      json.RawMessage `json:"metadata"`
+	Thinking      json.RawMessage `json:"thinking"` // extended thinking config — stripped, not forwarded
 }
 
 type anthropicMsg struct {
@@ -43,11 +44,12 @@ type anthropicTool struct {
 
 // openAIMessage is one message in the OpenAI Chat Completions format.
 type openAIMessage struct {
-	Role       string         `json:"role"`
-	Content    any            `json:"content,omitempty"`
-	ToolCalls  []openAITool   `json:"tool_calls,omitempty"`
-	ToolCallID string         `json:"tool_call_id,omitempty"`
-	Name       string         `json:"name,omitempty"`
+	Role             string       `json:"role"`
+	Content          any          `json:"content,omitempty"`
+	ReasoningContent *string      `json:"reasoning_content,omitempty"`
+	ToolCalls        []openAITool `json:"tool_calls,omitempty"`
+	ToolCallID       string       `json:"tool_call_id,omitempty"`
+	Name             string       `json:"name,omitempty"`
 }
 
 type openAITool struct {
@@ -100,21 +102,53 @@ func (a *anthropicRequest) toOpenAI(model string) (*openAIRequest, error) {
 	}
 
 	// Tools: wrap each Anthropic tool in OpenAI's {type:function,function:{...}}.
-	if len(a.Tools) > 0 {
-		tools := make([]map[string]any, 0, len(a.Tools))
-		for _, t := range a.Tools {
-			fn := map[string]any{
-				"name":       t.Name,
-				"parameters": json.RawMessage(t.InputSchema),
-			}
-			if t.Description != "" {
-				fn["description"] = t.Description
-			}
-			tools = append(tools, map[string]any{
-				"type":     "function",
-				"function": fn,
-			})
+	// Also scan the conversation history for tool_calls referencing tools that
+	// aren't in the current tool list (e.g., a tool the model tried to use in
+	// a previous turn but isn't available in this session). The upstream
+	// provider rejects tool_calls for unknown tools, so we add minimal stubs.
+	seenTools := map[string]bool{}
+	tools := make([]map[string]any, 0, len(a.Tools))
+	for _, t := range a.Tools {
+		seenTools[t.Name] = true
+		fn := map[string]any{
+			"name":       t.Name,
+			"parameters": json.RawMessage(t.InputSchema),
 		}
+		if t.Description != "" {
+			fn["description"] = t.Description
+		}
+		tools = append(tools, map[string]any{
+			"type":     "function",
+			"function": fn,
+		})
+	}
+	// Scan message history for tools referenced in tool_calls.
+	for _, m := range a.Messages {
+		var blocks []map[string]json.RawMessage
+		if err := json.Unmarshal(m.Content, &blocks); err != nil {
+			continue
+		}
+		for _, b := range blocks {
+			if jsonString(b["type"]) == "tool_use" {
+				name := jsonString(b["name"])
+				if name != "" && !seenTools[name] {
+					seenTools[name] = true
+					tools = append(tools, map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name": name,
+							"parameters": map[string]any{
+								"type":       "object",
+								"properties": map[string]any{},
+								"required":   []string{},
+							},
+						},
+					})
+				}
+			}
+		}
+	}
+	if len(tools) > 0 {
 		raw, err := json.Marshal(tools)
 		if err != nil {
 			return nil, err
@@ -127,26 +161,82 @@ func (a *anthropicRequest) toOpenAI(model string) (*openAIRequest, error) {
 		req.ToolChoice = translateToolChoice(a.ToolChoice)
 	}
 
+	req.Messages = repairUnresolvedToolCalls(req.Messages)
+
 	return req, nil
+}
+
+// repairUnresolvedToolCalls makes every assistant tool_call round-trip
+// complete. The Zen gateway's upstream provider rejects an assistant message
+// carrying tool_calls unless each call is answered by a matching "tool"
+// result message later in the conversation — a dangling tool_calls turn (e.g.
+// after history compaction, or an interrupted agent loop) gets a 400
+// "Upstream request failed". For every tool_call id with no matching tool
+// message, we insert a stub tool result immediately after that assistant
+// message. Existing tool results are left untouched; inserting the stubs
+// directly after the assistant message keeps the required
+// assistant(tool_calls) -> tool* ordering.
+func repairUnresolvedToolCalls(msgs []openAIMessage) []openAIMessage {
+	// Collect every tool_call_id that already has a tool result message.
+	resolved := map[string]bool{}
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			resolved[m.ToolCallID] = true
+		}
+	}
+
+	out := make([]openAIMessage, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m)
+		if m.Role != "assistant" || len(m.ToolCalls) == 0 {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if resolved[tc.ID] {
+				continue
+			}
+			id := tc.ID
+			if id == "" {
+				id = "toolu_stub"
+			}
+			out = append(out, openAIMessage{
+				Role:       "tool",
+				ToolCallID: id,
+				Content:    "(tool result unavailable)",
+			})
+			resolved[id] = true // don't stub the same id twice
+		}
+	}
+	return out
 }
 
 // translateMessage turns one Anthropic message into one or more OpenAI messages.
 // A user message containing tool_result blocks emits separate "tool" messages
 // (one per result) followed by an optional "user" message for any text.
 func translateMessage(m anthropicMsg) ([]openAIMessage, error) {
+	// Normalize the role for OpenAI: the only valid roles in the messages
+	// array are "user", "assistant", and "tool". Any non-standard role
+	// (e.g. "system" — mid-conversation system injections from Claude
+	// Code) maps to "user" to avoid duplicate system messages which the
+	// upstream provider rejects with a 400 "Upstream request failed".
+	role := m.Role
+	if role != "user" && role != "assistant" {
+		role = "user"
+	}
+
 	content := strings.TrimSpace(string(m.Content))
 	// String content.
 	if len(m.Content) == 0 || content == `""` || content == "null" {
-		return []openAIMessage{{Role: m.Role, Content: ""}}, nil
+		return []openAIMessage{{Role: role, Content: ""}}, nil
 	}
 	// If content does not start with '[', it is a plain string.
 	if m.Content[0] != '[' {
 		var s string
 		if err := json.Unmarshal(m.Content, &s); err != nil {
 			// Not a string; treat as opaque content.
-			return []openAIMessage{{Role: m.Role, Content: json.RawMessage(m.Content)}}, nil
+			return []openAIMessage{{Role: role, Content: json.RawMessage(m.Content)}}, nil
 		}
-		return []openAIMessage{{Role: m.Role, Content: s}}, nil
+		return []openAIMessage{{Role: role, Content: s}}, nil
 	}
 
 	// Array of blocks.
@@ -165,10 +255,22 @@ func translateMessage(m anthropicMsg) ([]openAIMessage, error) {
 		switch typ {
 		case "text":
 			txt := jsonString(b["text"])
-			if m.Role == "assistant" {
+			if role == "assistant" {
 				assistantText.WriteString(txt)
 			} else {
 				userText.WriteString(txt)
+			}
+		case "thinking":
+			// Extended-thinking blocks (Claude Code --effort max). The Zen
+			// gateway has no thinking channel, so fold the thinking text into
+			// the assistant content. This also prevents an empty assistant
+			// message (thinking-only) which providers reject with a 400.
+			txt := jsonString(b["thinking"])
+			if txt == "" {
+				txt = jsonString(b["text"])
+			}
+			if txt != "" {
+				assistantText.WriteString(txt)
 			}
 		case "tool_use":
 			id := jsonString(b["id"])
@@ -198,7 +300,7 @@ func translateMessage(m anthropicMsg) ([]openAIMessage, error) {
 		}
 	}
 
-	switch m.Role {
+	switch role {
 	case "assistant":
 		msg := openAIMessage{Role: "assistant"}
 		if assistantText.Len() > 0 {
@@ -206,6 +308,12 @@ func translateMessage(m anthropicMsg) ([]openAIMessage, error) {
 		}
 		if len(assistantToolCalls) > 0 {
 			msg.ToolCalls = assistantToolCalls
+			// DeepSeek requires reasoning_content on every assistant message
+			// that carries tool_calls, even if only an empty placeholder.
+			// Without it the provider rejects the request with 400 "Upstream
+			// request failed" (param:null).
+			empty := ""
+			msg.ReasoningContent = &empty
 		}
 		out = append(out, msg)
 	case "user":
@@ -214,13 +322,14 @@ func translateMessage(m anthropicMsg) ([]openAIMessage, error) {
 			out = append(out, openAIMessage{Role: "user", Content: userText.String()})
 		}
 	default:
+		// role was normalized to "user" at the top for non-standard roles.
 		if userText.Len() > 0 || assistantText.Len() > 0 {
-			out = append(out, openAIMessage{Role: m.Role, Content: userText.String() + assistantText.String()})
+			out = append(out, openAIMessage{Role: role, Content: userText.String() + assistantText.String()})
 		}
 	}
 
 	if len(out) == 0 {
-		out = append(out, openAIMessage{Role: m.Role, Content: ""})
+		out = append(out, openAIMessage{Role: role, Content: ""})
 	}
 	return out, nil
 }

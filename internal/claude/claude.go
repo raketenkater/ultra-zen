@@ -1,9 +1,8 @@
 // Package claude builds the environment and arguments for exec'ing Claude Code
-// pointed at the local ultra-zen proxy. The recipe is adapted from ggrun
-// (llm-server cmd/ggrun/main.go claudeCodeEnv) and from the user's local_claude
-// launcher: drop the real Anthropic key, set a dummy auth token + base URL, map
-// every inference tier to the selected model, and relax the watchdogs so a
-// remote-but-slower gateway never trips Claude Code's idle timers.
+// pointed at the local ultra-zen proxy. It drops the real Anthropic API key,
+// sets a dummy auth token and local base URL, maps every inference tier to the
+// selected model, and relaxes the watchdogs so a remote-but-slower gateway never
+// trips Claude Code's idle timers.
 package claude
 
 import (
@@ -12,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/raketenkater/ultra-zen/internal/workflow"
 )
 
 // JavaScript's maximum safe timer value: ~24.8 days, effectively no deadline.
@@ -49,38 +50,44 @@ func Env(proxyURL, model string) []string {
 		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",
 		"CLAUDE_ENABLE_STREAM_WATCHDOG=0",
 		"API_FORCE_IDLE_TIMEOUT=0",
-		"DISABLE_PROMPT_CACHING=1",
+		// Behind a custom base URL Claude Code assumes a 200k window and won't
+		// auto-compact until ~92% (~184k tokens). The Zen gateway models have a
+		// smaller real context, so the conversation overflows and the gateway
+		// fails the request ("Upstream request failed" / context_length). Compact
+		// early at a conservative percentage so agents never overflow. A user-set
+		// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the environment still takes precedence.
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "60"),
 	)
+}
+
+// envOr returns the current environment value for key, or def if unset/empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 // SettingsJSON returns the inline --settings JSON injected at launch. It wires
 // a PreToolUse hook that rewrites Workflow tool scripts to set stallMs to the
 // maximum safe value, so Ultracode/Workflow fan-out never aborts a quiet model.
-// This mirrors ggrun's claude_workflow.go hook, but is self-contained: the hook
-// command rewrites the script in-process without an external binary.
-//
-// hookScript is the shell command Claude Code runs for every Workflow tool
-// invocation. It reads the hook JSON on stdin, rewrites agent() stallMs, and
-// emits the updated input.
-const hookScript = `node -e '
-const fs=require("fs");
-let s=fs.readFileSync(0,"utf8");
-let j=JSON.parse(s);
-if(j.tool_name==="Workflow"&&j.tool_input&&j.tool_input.script){
-  j.tool_input.script=j.tool_input.script.replace(/agent\s*\(/g,"agent(").replace(/agent\(([^,)]*)\)/g,(m,a)=>"agent("+a+", { stallMs: 2147483647 })");
-}
-process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",permissionDecisionReason:"ultra-zen Workflow policy",updatedInput:j.tool_input}}));
-'`
+// The hook calls `ultra-zen workflow-hook`, which uses a proper JS tokenizer
+// (internal/workflow) that understands strings, template literals and comments
+// — unlike a naive regex, it cannot corrupt a script that has a ')' inside an
+// agent prompt string literal. hookCmd is the absolute path to the ultra-zen
+// binary so the hook works even if ultra-zen is not on PATH.
 
-// SettingsJSON returns the settings payload passed via --settings.
-func SettingsJSON() string {
+// SettingsJSON returns the settings payload passed via --settings. hookCmd is
+// the command to run for the Workflow PreToolUse hook (typically the absolute
+// path to the ultra-zen binary plus "workflow-hook").
+func SettingsJSON(hookCmd string) string {
 	settings := map[string]any{
 		"hooks": map[string]any{
 			"PreToolUse": []map[string]any{
 				{
 					"matcher": "Workflow",
 					"hooks": []map[string]any{
-						{"type": "command", "command": hookScript},
+						{"type": "command", "command": hookCmd},
 					},
 				},
 			},
@@ -90,20 +97,59 @@ func SettingsJSON() string {
 	return string(b)
 }
 
-// Args returns the claude arguments: the inline --settings plus any
-// user-supplied passthrough args. If the user already passed --settings, we
-// merge by skipping our own to avoid clobbering theirs.
-func Args(userArgs []string) []string {
-	out := []string{"--settings", SettingsJSON()}
+// Args returns the claude arguments: the selected model, the inline --settings,
+// and any user-supplied passthrough args. The explicit --model makes ultra-zen
+// self-contained: it overrides any "model" default in the user's global
+// settings.json (e.g. "sonnet") so the session always uses the selected Zen
+// model regardless of the user's existing Claude Code config. If the user
+// already passed --model/-m we leave theirs alone. If the user already passed
+// --settings, we merge by skipping our own to avoid clobbering theirs.
+//
+// hookCmd is the Workflow PreToolUse hook command (see SettingsJSON). A
+// --append-system-prompt is also injected as belt-and-suspenders: if a Claude
+// Code version or custom --settings suppresses hooks, the model still learns
+// to set stallMs itself.
+func Args(model, hookCmd string, userArgs []string) []string {
+	var out []string
+	if !hasArg(userArgs, "--model") && !hasArg(userArgs, "-m") {
+		out = append(out, "--model", model)
+	}
+	if !hasArg(userArgs, "--settings") {
+		out = append(out, "--settings", SettingsJSON(hookCmd))
+	}
+	// Default to the highest effort ("max") so a fresh ultra-zen session starts
+	// at full thinking budget — matching the "ultracode effort" launch intent.
+	// If the user already passed --effort, leave theirs alone.
+	if !hasArg(userArgs, "--effort") {
+		out = append(out, "--effort", "max")
+	}
+	out = append(out, workflowPromptArgs(userArgs)...)
 	out = append(out, researchArgs(userArgs)...)
 	out = append(out, userArgs...)
 	return out
 }
 
-// researchArgs mirrors ggrun's approach to web research on a non-Anthropic
-// endpoint: the built-in WebSearch/WebFetch tools are Anthropic server-side
-// tools that cannot run against the local proxy, so we disable WebSearch and
-// wire a no-key DuckDuckGo MCP in its place (when uvx is available). This keeps
+// workflowPromptArgs appends the Workflow stallMs instruction to the session
+// system prompt. If the user already passed --append-system-prompt we merge
+// into theirs instead of adding a second one.
+func workflowPromptArgs(userArgs []string) []string {
+	out := append([]string(nil), userArgs...)
+	for i, arg := range out {
+		if arg == "--append-system-prompt" && i+1 < len(out) {
+			out[i+1] += "\n\n" + workflow.SystemPrompt
+			return []string{"--append-system-prompt", out[i+1]}
+		}
+		if strings.HasPrefix(arg, "--append-system-prompt=") {
+			return []string{"--append-system-prompt=" + arg + "\n\n" + workflow.SystemPrompt}
+		}
+	}
+	return []string{"--append-system-prompt", workflow.SystemPrompt}
+}
+
+// researchArgs configures web research for a non-Anthropic endpoint: the
+// built-in WebSearch/WebFetch tools are Anthropic server-side tools that
+// cannot run against the local proxy, so we disable WebSearch and wire a
+// no-key DuckDuckGo MCP in its place (when uvx is available). This keeps
 // Ultracode workflows and agents able to do online research. If the user
 // supplies their own --mcp-config or --disallowedTools we leave theirs alone.
 func researchArgs(userArgs []string) []string {

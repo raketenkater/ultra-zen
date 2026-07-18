@@ -57,7 +57,7 @@ func List(httpClient *http.Client, apiKey string) ([]Model, error) {
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Free != out[j].Free {
-			return !out[i].Free // paid go-tier first, free second
+			return out[i].Free // free tier first, paid go-tier second
 		}
 		return out[i].Name < out[j].Name
 	})

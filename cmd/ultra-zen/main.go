@@ -15,10 +15,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -27,15 +30,34 @@ import (
 	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/proxy"
 	"github.com/raketenkater/ultra-zen/internal/tui"
+	"github.com/raketenkater/ultra-zen/internal/workflow"
 )
 
+// Version is set at build time via -ldflags. Falls back to "dev" in local builds.
+var Version = "dev"
+
 func main() {
+	// Subcommand dispatch (before flag parsing, which would choke on the
+	// subcommand). `workflow-hook` is invoked by Claude Code's PreToolUse hook
+	// to deterministically rewrite Workflow agent() scripts with a safe stallMs.
+	if len(os.Args) > 1 && os.Args[1] == "workflow-hook" {
+		workflow.RunHook()
+		return
+	}
+
+	// Redirect the proxy's log output (log.Printf in internal/proxy) to a file
+	// instead of stderr. Claude Code's TUI owns stderr, so any log line written
+	// there leaks into the front-end as garbled text. Write to
+	// ~/.cache/ultra-zen/proxy.log so diagnostics are still available.
+	redirectProxyLog()
+
 	var (
 		authPath  = flag.String("auth", "", "path to opencode auth.json (default: auto)")
 		provider  = flag.String("provider", "opencode-go", "opencode auth provider name")
-		port      = flag.Int("port", 8787, "local proxy listen port")
+		port      = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly  = flag.Bool("list", false, "list available models and exit")
 		proxyOnly = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
+		showVer   = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "ultra-zen — run Claude Code on opencode Zen models")
@@ -48,6 +70,11 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *showVer {
+		fmt.Printf("ultra-zen %s\n", Version)
+		return
+	}
 
 	rest := flag.Args()
 	var modelID string
@@ -102,6 +129,7 @@ func main() {
 	if selected == nil {
 		die(fmt.Errorf("model %q not found; run `ultra-zen --list` to see available models", modelID))
 	}
+	models.RecordRecent(selected.ID)
 
 	// Start the proxy.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -117,7 +145,7 @@ func main() {
 	}
 	if err := waitForHealth(srv.BaseURL(), 5*time.Second); err != nil {
 		cancel()
-		die(fmt.Errorf("proxy health check: %w", err))
+		die(err)
 	}
 
 	if *proxyOnly {
@@ -138,7 +166,15 @@ func main() {
 	}()
 
 	env := claude.Env(srv.BaseURL(), selected.ID)
-	args := claude.Args(claudeArgs)
+
+	// Resolve the ultra-zen binary path so the Workflow PreToolUse hook can
+	// invoke `ultra-zen workflow-hook` by absolute path (works even if ultra-zen
+	// is not on PATH). Fall back to "ultra-zen" if the path can't be resolved.
+	hookBin := "ultra-zen"
+	if exe, err := os.Executable(); err == nil {
+		hookBin = exe
+	}
+	args := claude.Args(selected.ID, hookBin+" workflow-hook", claudeArgs)
 
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
@@ -165,6 +201,7 @@ func main() {
 // timeout elapses.
 func waitForHealth(base string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(base + "/health")
 		if err == nil && resp.StatusCode == 200 {
@@ -173,13 +210,35 @@ func waitForHealth(base string, timeout time.Duration) error {
 		}
 		if resp != nil {
 			resp.Body.Close()
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		} else {
+			lastErr = err
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout")
+	return fmt.Errorf("proxy health check timed out after %v: %w", timeout, lastErr)
 }
 
 func die(err error) {
 	fmt.Fprintf(os.Stderr, "ultra-zen: %v\n", err)
 	os.Exit(1)
+}
+
+// redirectProxyLog points the standard logger (used by internal/proxy via
+// log.Printf) at ~/.cache/ultra-zen/proxy.log so diagnostic output never
+// leaks into Claude Code's TUI (which owns stderr). If the file can't be
+// created, fall back to discarding logs — never stderr.
+func redirectProxyLog() {
+	dir := filepath.Join(os.Getenv("HOME"), ".cache", "ultra-zen")
+	f, err := os.OpenFile(filepath.Join(dir, "proxy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		_ = os.MkdirAll(dir, 0755)
+		f, err = os.OpenFile(filepath.Join(dir, "proxy.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	}
+	if err != nil {
+		log.SetOutput(io.Discard)
+		return
+	}
+	log.SetOutput(f)
+	log.SetFlags(log.LstdFlags)
 }

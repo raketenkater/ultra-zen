@@ -9,37 +9,47 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strconv"
+	"os"
+	"strings"
 	"time"
 )
 
 // Config holds the gateway target and credentials for the proxy.
 type Config struct {
 	BaseURL string // e.g. https://opencode.ai/zen/go/v1
-	APIKey string
-	Model  string // the Zen model id to forward to
-	Port   int    // local listen port
+	APIKey  string
+	Model   string // the Zen model id to forward to
+	Port    int    // local listen port
 }
+
+// maxOutputTokens is the maximum max_tokens the proxy forwards to the Zen
+// gateway. Claude Code often requests a very large max_tokens (e.g. 512000 or
+// more) to avoid truncating long agent outputs; the Zen gateway rejects any
+// value above the model's real output limit with a 400 "Upstream request
+// failed". Clamping to a safe ceiling avoids that class of 400 entirely. 65536
+// is well within every current Zen model's output budget and generous enough
+// for long agent/tool-use responses.
+const maxOutputTokens = 65536
 
 // Server is the in-process Anthropic->OpenAI bridge.
 type Server struct {
 	cfg     Config
 	srv     *http.Server
-	baseURL string // resolved address, e.g. http://127.0.0.1:8787
+	baseURL string // resolved address, e.g. http://127.0.0.1:38271
 }
 
 // New creates a proxy listening on the given port. Call Start to run it.
+// A Port of 0 lets the OS assign a free port, which allows many ultra-zen
+// instances to run concurrently without port collisions.
 func New(cfg Config) *Server {
-	if cfg.Port == 0 {
-		cfg.Port = 8787
-	}
 	s := &Server{cfg: cfg}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", s.handleMessages)
+	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/", s.handleHealth) // any other path -> health
 	s.srv = &http.Server{
-		Handler:      mux,
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
@@ -77,6 +87,29 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `{"status":"ok"}`)
 }
 
+// handleModels advertises the selected Zen model id at GET /v1/models. Claude
+// Code (and every subagent / background agent it spawns) probes this endpoint
+// to validate ANTHROPIC_MODEL before issuing a request; if the configured model
+// is not listed it rejects the session or falls back. The proxy still overrides
+// the model on every /v1/messages request, so listing a single id here is
+// sufficient and correct.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	out := map[string]any{
+		"object": "list",
+		"data": []map[string]any{
+			{"id": s.cfg.Model, "object": "model", "owned_by": "ultra-zen"},
+		},
+	}
+	body, _ := json.Marshal(out)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+}
+
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -97,31 +130,76 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	payload, err := json.Marshal(oreq)
-	if err != nil {
-		writeError(w, 500, "api_error", err.Error())
-		return
+	// Clamp max_tokens to a safe ceiling. Claude Code frequently requests very
+	// large values that the Zen gateway rejects with a 400.
+	if oreq.MaxTokens > maxOutputTokens || oreq.MaxTokens <= 0 {
+		oreq.MaxTokens = maxOutputTokens
 	}
 
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.cfg.BaseURL+"/chat/completions", bytes.NewReader(payload))
-	if err != nil {
-		writeError(w, 500, "api_error", err.Error())
-		return
-	}
-	upstreamReq.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
-	upstreamReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient().Do(upstreamReq)
+	payload, resp, err := s.forward(r.Context(), oreq)
 	if err != nil {
 		writeError(w, 502, "api_error", "gateway request failed: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	// On a 400 "Upstream request failed", retry. Two strategies:
+	//   1. Same params (handles transient backend failures).
+	//   2. Halve max_tokens (handles oversized-token 400s).
+	if resp.StatusCode == http.StatusBadRequest {
 		ub, _ := io.ReadAll(resp.Body)
-		// Pass the gateway error through in Anthropic error shape so Claude
-		// Code surfaces it instead of crashing.
+		resp.Body.Close()
+		s.dumpFailingRequest(ub, payload)
+		log.Printf("ultra-zen proxy: upstream 400 (max_tokens=%d): %s | request: %s", oreq.MaxTokens, truncate(string(ub), 200), truncate(string(payload), 500))
+
+		// First retry: same params (handles transient backend failures).
+		_, resp2, err := s.forward(r.Context(), oreq)
+		if err != nil {
+			writeError(w, 502, "api_error", "gateway retry failed: "+err.Error())
+			return
+		}
+		if resp2.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			resp.Body = resp2.Body
+			resp.StatusCode = resp2.StatusCode
+			resp.Header = resp2.Header
+			log.Printf("ultra-zen proxy: retry (same params) succeeded")
+		} else {
+			ub2, _ := io.ReadAll(resp2.Body)
+			resp2.Body.Close()
+			log.Printf("ultra-zen proxy: retry (same params) failed (%d): %s", resp2.StatusCode, truncate(string(ub2), 200))
+			if oreq.MaxTokens > 1024 {
+				oreq.MaxTokens /= 2
+				payload3, resp3, err := s.forward(r.Context(), oreq)
+				if err != nil {
+					writeError(w, 502, "api_error", "gateway retry failed: "+err.Error())
+					return
+				}
+				if resp3.StatusCode == http.StatusOK {
+					resp.Body.Close()
+					resp.Body = resp3.Body
+					resp.StatusCode = resp3.StatusCode
+					resp.Header = resp3.Header
+					log.Printf("ultra-zen proxy: retry (halved max_tokens=%d) succeeded", oreq.MaxTokens)
+				} else {
+					ub3, _ := io.ReadAll(resp3.Body)
+					resp3.Body.Close()
+					log.Printf("ultra-zen proxy: retry (halved) also failed (%d): %s | request: %s", resp3.StatusCode, truncate(string(ub3), 200), truncate(string(payload3), 500))
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(resp3.StatusCode)
+					w.Write(ub3)
+					return
+				}
+			} else {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp2.StatusCode)
+				w.Write(ub2)
+				return
+			}
+		}
+	} else if resp.StatusCode != http.StatusOK {
+		ub, _ := io.ReadAll(resp.Body)
+		log.Printf("ultra-zen proxy: upstream %d: %s | request: %s", resp.StatusCode, truncate(string(ub), 200), truncate(string(payload), 500))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(ub)
@@ -133,6 +211,60 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.nonStreamResponse(w, resp, areq.Model)
+}
+
+// forward marshals the OpenAI request and sends it to the Zen gateway,
+// returning the marshalled payload (for diagnostic logging on errors) and
+// the raw upstream response.
+func (s *Server) forward(ctx context.Context, oreq *openAIRequest) (payload []byte, resp *http.Response, err error) {
+	payload, err = json.Marshal(oreq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal request: %w", err)
+	}
+	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.BaseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, err
+	}
+	upstreamReq.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	resp, err = httpClient().Do(upstreamReq)
+	return payload, resp, err
+}
+
+// truncate returns s trimmed of leading/trailing whitespace, capped at n chars.
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
+// dumpFailingRequest writes the full request payload + upstream error to
+// ~/.cache/ultra-zen/last-400.json so the exact failing request can be
+// inspected without truncation. Overwrites on each 400.
+func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
+	dir := os.Getenv("HOME") + "/.cache/ultra-zen"
+	_ = os.MkdirAll(dir, 0755)
+	dump := struct {
+		Model       string          `json:"model"`
+		Upstream    string          `json:"upstream"`
+		MaxTokens   int             `json:"max_tokens"`
+		Request     json.RawMessage `json:"request"`
+		UpstreamErr json.RawMessage `json:"upstream_error"`
+	}{
+		Model:       s.cfg.Model,
+		Upstream:    s.cfg.BaseURL,
+		Request:     json.RawMessage(payload),
+		UpstreamErr: json.RawMessage(upstreamErr),
+	}
+	var p struct {
+		MaxTokens int `json:"max_tokens"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	dump.MaxTokens = p.MaxTokens
+	b, _ := json.MarshalIndent(dump, "", "  ")
+	_ = os.WriteFile(dir+"/last-400.json", b, 0644)
 }
 
 func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
@@ -184,6 +316,3 @@ func httpClient() *http.Client {
 
 // Port returns the configured listen port.
 func (s *Server) Port() int { return s.cfg.Port }
-
-// PortString returns the port as a string for env vars.
-func (s *Server) PortString() string { return strconv.Itoa(s.cfg.Port) }

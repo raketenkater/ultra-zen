@@ -1,7 +1,7 @@
 // Package tui is the interactive model selector shown before Claude Code
-// launches. It is a focused port of ggrun's Bubble Tea main list: a searchable
-// list of Zen models grouped into the opencode-go tier and the free tier, with
-// arrow-key navigation and a filter. Selecting a model returns its id.
+// launches. It presents a searchable Bubble Tea list of Zen models grouped
+// into the opencode-go tier and the free tier, with arrow-key navigation and
+// a filter. Selecting a model returns its id.
 package tui
 
 import (
@@ -16,18 +16,24 @@ var (
 	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))
 	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Bold(true)
 	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
+	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4EC9B0"))
 )
 
 // modelItem adapts models.Model to bubbles/list.Item.
 type modelItem struct {
-	m models.Model
+	m      models.Model
+	recent bool // in the MRU list; shown with a marker
 }
 
 func (i modelItem) Title() string {
+	t := i.m.ID
 	if i.m.Free {
-		return i.m.ID + "  (free)"
+		t += "  (free)"
 	}
-	return i.m.ID
+	if i.recent {
+		t += "  " + recentStyle.Render("● recent")
+	}
+	return t
 }
 func (i modelItem) Description() string {
 	if i.m.Free {
@@ -82,9 +88,15 @@ func (m model) View() string {
 // Run shows the selector over the given models and returns the chosen model id,
 // or "" if the user quit.
 func Run(list_ []models.Model) (string, error) {
-	items := make([]list.Item, 0, len(list_))
-	for _, mdl := range list_ {
-		items = append(items, modelItem{m: mdl})
+	recent := models.LoadRecent()
+	ordered := models.SortByRecent(list_, recent)
+	isRecent := make(map[string]bool, len(recent))
+	for _, id := range recent {
+		isRecent[id] = true
+	}
+	items := make([]list.Item, 0, len(ordered))
+	for _, mdl := range ordered {
+		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID]})
 	}
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
 	l.Title = ""
