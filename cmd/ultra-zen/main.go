@@ -234,6 +234,7 @@ func main() {
 		die(fmt.Errorf("model %q not found; run `ultra-zen --list` to see available models", modelID))
 	}
 	models.RecordRecent(selected.ID)
+	models.RecordCombo(selected.ID, *workerModel)
 
 	// Build the model list for /v1/models (Claude Code's /model command).
 	modelInfos := make([]proxy.ModelInfo, 0, len(list))

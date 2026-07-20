@@ -1,6 +1,8 @@
 // Package tui is the interactive model selector shown before Claude Code
-// launches. It runs a two-step flow: first pick the orchestrator (main model),
-// then optionally pick a cheaper worker for background sub-agents.
+// launches. It opens on a list of recommended and recently used
+// orchestrator/worker combos; choosing one launches immediately. Choosing
+// "pick manually" falls through to a two-step flow: pick the orchestrator, then
+// optionally pick a worker for background sub-agents.
 package tui
 
 import (
@@ -17,6 +19,7 @@ var (
 	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4EC9B0"))
 )
 
+// modelItem is a single model row in the orchestrator/worker lists.
 type modelItem struct {
 	m      models.Model
 	recent bool
@@ -47,24 +50,70 @@ func (i modelItem) Description() string {
 }
 func (i modelItem) FilterValue() string { return i.m.ID }
 
-// step represents which selection screen is active.
+// comboItem is a row on the first screen: a preset pairing, a recent pairing,
+// or the "pick manually" fall-through (when manual is true).
+type comboItem struct {
+	combo  models.Combo
+	label  string // "recommended" or "recent"
+	manual bool
+}
+
+func (i comboItem) Title() string {
+	if i.manual {
+		return "Pick models manually →"
+	}
+	if i.combo.Worker == "" {
+		return i.combo.Orchestrator
+	}
+	return i.combo.Orchestrator + "  +  " + i.combo.Worker
+}
+func (i comboItem) Description() string {
+	if i.manual {
+		return "choose orchestrator and worker yourself"
+	}
+	if i.combo.Worker == "" {
+		return i.label + " · single model"
+	}
+	return i.label + " · orchestrator + worker"
+}
+func (i comboItem) FilterValue() string {
+	return i.combo.Orchestrator + " " + i.combo.Worker
+}
+
 type step int
 
 const (
-	stepOrchestrator step = iota
+	stepCombo step = iota
+	stepOrchestrator
 	stepWorker
 )
 
 type model struct {
-	list     list.Model
-	choice   string
-	worker   string // set on second step; empty = none
-	quit     bool
-	subtitle string
-	step     step
+	list      list.Model
+	all       []models.Model // for rebuilding lists between steps
+	choice    string
+	worker    string
+	quit      bool
+	subtitle  string
+	step      step
+	hasCombos bool
 }
 
 func (m model) Init() tea.Cmd { return nil }
+
+func (m *model) enterOrchestratorStep() {
+	m.step = stepOrchestrator
+	m.list.SetItems(buildModelItems(m.all))
+	m.list.ResetSelected()
+	m.list.ResetFilter()
+}
+
+func (m *model) enterWorkerStep() {
+	m.step = stepWorker
+	m.list.SetItems(buildModelItems(m.all))
+	m.list.ResetSelected()
+	m.list.ResetFilter()
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -79,21 +128,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "esc":
 			if m.step == stepWorker {
-				// Skip worker selection.
 				m.worker = ""
 				return m, tea.Quit
 			}
 		case "enter":
-			if item, ok := m.list.SelectedItem().(modelItem); ok {
-				if m.step == stepOrchestrator {
+			switch m.step {
+			case stepCombo:
+				if item, ok := m.list.SelectedItem().(comboItem); ok {
+					if item.manual {
+						m.enterOrchestratorStep()
+						return m, nil
+					}
+					m.choice = item.combo.Orchestrator
+					m.worker = item.combo.Worker
+					return m, tea.Quit
+				}
+			case stepOrchestrator:
+				if item, ok := m.list.SelectedItem().(modelItem); ok {
 					m.choice = item.m.ID
-					m.step = stepWorker
-					m.list.ResetSelected()
+					m.enterWorkerStep()
 					return m, nil
 				}
-				// Worker step: selected a worker.
-				m.worker = item.m.ID
-				return m, tea.Quit
+			case stepWorker:
+				if item, ok := m.list.SelectedItem().(modelItem); ok {
+					m.worker = item.m.ID
+					return m, tea.Quit
+				}
 			}
 		}
 	}
@@ -105,21 +165,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var b string
 	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	if m.step == stepOrchestrator {
-		b += subtitleStyle.Render("  " + m.subtitle + " — pick orchestrator") + "\n\n"
-	} else {
-		b += subtitleStyle.Render("  orchestrator: " + m.choice) + "\n"
-		b += subtitleStyle.Render("  pick worker (Esc to skip)") + "\n\n"
+	switch m.step {
+	case stepCombo:
+		b += subtitleStyle.Render("  "+m.subtitle+" — pick a combo, or choose manually") + "\n\n"
+		b += m.list.View() + "\n"
+		b += mutedStyle.Render("  / filter · Enter select · Ctrl+C quit")
+	case stepOrchestrator:
+		b += subtitleStyle.Render("  "+m.subtitle+" — pick orchestrator (main model)") + "\n\n"
+		b += m.list.View() + "\n"
+		b += mutedStyle.Render("  / filter · Enter select · Ctrl+C quit")
+	case stepWorker:
+		b += subtitleStyle.Render("  orchestrator: "+m.choice) + "\n"
+		b += subtitleStyle.Render("  pick worker for sub-agents (Esc to skip)") + "\n\n"
+		b += m.list.View() + "\n"
+		b += mutedStyle.Render("  / filter · Enter select · Esc skip · Ctrl+C quit")
 	}
-	b += m.list.View() + "\n"
-	b += mutedStyle.Render("  / filter · Enter select · Esc skip worker · Ctrl+C quit")
 	return b
 }
 
-// buildItems creates list items from models, with recent ones first.
-func buildItems(list_ []models.Model) []list.Item {
+// buildModelItems returns model rows with recently used models first.
+func buildModelItems(ms []models.Model) []list.Item {
 	recent := models.LoadRecent()
-	ordered := models.SortByRecent(list_, recent)
+	ordered := models.SortByRecent(ms, recent)
 	isRecent := make(map[string]bool, len(recent))
 	for _, id := range recent {
 		isRecent[id] = true
@@ -131,29 +198,80 @@ func buildItems(list_ []models.Model) []list.Item {
 	return items
 }
 
+// buildComboItems returns recent combos first, then recommended combos whose
+// models are actually available, then the manual fall-through. Only combos
+// whose orchestrator (and worker, if set) exist in ms are shown.
+func buildComboItems(ms []models.Model) []list.Item {
+	avail := make(map[string]bool, len(ms))
+	for _, m := range ms {
+		avail[m.ID] = true
+	}
+	comboOK := func(c models.Combo) bool {
+		if !avail[c.Orchestrator] {
+			return false
+		}
+		return c.Worker == "" || avail[c.Worker]
+	}
+	seen := make(map[string]bool)
+	key := func(c models.Combo) string { return c.Orchestrator + "|" + c.Worker }
+
+	var items []list.Item
+	for _, c := range models.LoadCombos() {
+		if comboOK(c) && !seen[key(c)] {
+			seen[key(c)] = true
+			items = append(items, comboItem{combo: c, label: "recent"})
+		}
+	}
+	for _, c := range models.RecommendedCombos {
+		if comboOK(c) && !seen[key(c)] {
+			seen[key(c)] = true
+			items = append(items, comboItem{combo: c, label: "recommended"})
+		}
+	}
+	items = append(items, comboItem{manual: true})
+	return items
+}
+
 func providerSubtitle(provider string) string {
 	switch provider {
 	case "openrouter":
 		return "OpenRouter"
+	case "codex":
+		return "Codex endpoint"
 	default:
 		return "opencode Zen"
 	}
 }
 
-// Run shows a two-step selector:
-//  1. Pick the orchestrator model (required).
-//  2. Pick the worker model (Enter selects, Esc skips).
-//
-// Returns (orchestrator, worker, quit). worker is "" if skipped.
-func Run(list_ []models.Model, provider string) (string, string, bool) {
-	items := buildItems(list_)
+// Run shows the selector and returns (orchestrator, worker, quit). The first
+// screen lists combos; picking one returns immediately. "Pick manually" leads
+// to orchestrator then optional worker selection. worker is "" if none chosen.
+func Run(ms []models.Model, provider string) (string, string, bool) {
+	comboItems := buildComboItems(ms)
+	// If the only combo item is the manual fall-through, skip straight to
+	// manual selection — there are no combos worth showing.
+	startStep := stepCombo
+	var items []list.Item
+	if len(comboItems) <= 1 {
+		startStep = stepOrchestrator
+		items = buildModelItems(ms)
+	} else {
+		items = comboItems
+	}
+
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
 	l.Title = ""
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(false)
 
-	p := tea.NewProgram(model{list: l, subtitle: providerSubtitle(provider), step: stepOrchestrator})
+	p := tea.NewProgram(model{
+		list:      l,
+		all:       ms,
+		subtitle:  providerSubtitle(provider),
+		step:      startStep,
+		hasCombos: startStep == stepCombo,
+	})
 	res, err := p.Run()
 	if err != nil {
 		return "", "", false

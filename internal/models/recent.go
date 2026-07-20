@@ -63,6 +63,69 @@ func RecordRecent(id string) {
 	_ = os.WriteFile(p, b, 0644)
 }
 
+// Combo is an orchestrator/worker pairing the user launched.
+type Combo struct {
+	Orchestrator string `json:"orchestrator"`
+	Worker       string `json:"worker"`
+}
+
+// combosPath is where recently used combos are stored.
+func combosPath() string {
+	return filepath.Join(filepath.Dir(recentPath()), "recent-combos.json")
+}
+
+// LoadCombos returns the recorded orchestrator/worker combos, most recent first.
+func LoadCombos() []Combo {
+	b, err := os.ReadFile(combosPath())
+	if err != nil {
+		return nil
+	}
+	var cs []Combo
+	if err := json.Unmarshal(b, &cs); err != nil {
+		return nil
+	}
+	return cs
+}
+
+// RecordCombo moves the (orch, worker) pairing to the front and persists it.
+func RecordCombo(orchestrator, worker string) {
+	if orchestrator == "" {
+		return
+	}
+	combos := LoadCombos()
+	out := make([]Combo, 0, len(combos)+1)
+	out = append(out, Combo{Orchestrator: orchestrator, Worker: worker})
+	for _, c := range combos {
+		if c.Orchestrator == orchestrator && c.Worker == worker {
+			continue
+		}
+		out = append(out, c)
+	}
+	if len(out) > maxRecent {
+		out = out[:maxRecent]
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	p := combosPath()
+	_ = os.MkdirAll(filepath.Dir(p), 0755)
+	_ = os.WriteFile(p, b, 0644)
+}
+
+// RecommendedCombos are curated orchestrator/worker pairings. The orchestrator
+// does the planning (needs a strong reasoning model); the worker fans out
+// background sub-agents (wants a cheap, high-rate-limit model). These reflect
+// common opencode Zen / OpenRouter practice as of mid-2026.
+var RecommendedCombos = []Combo{
+	{Orchestrator: "glm-5.2", Worker: "deepseek-v4-flash-free"},
+	{Orchestrator: "kimi-k3", Worker: "deepseek-v4-flash-free"},
+	{Orchestrator: "glm-5.2", Worker: "mini-max-m2.5"},
+	{Orchestrator: "kimi-k2.7-code", Worker: "deepseek-v4-flash-free"},
+	{Orchestrator: "qwen/qwen3-coder:free", Worker: "deepseek-v4-flash-free"},
+	{Orchestrator: "glm-5.2", Worker: "mini-max-m3"},
+}
+
 // SortByRecent returns list ordered with recently used models first (in MRU
 // order), followed by the rest in their existing relative order. The input is
 // not mutated.
