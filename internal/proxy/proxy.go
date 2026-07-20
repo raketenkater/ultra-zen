@@ -104,19 +104,39 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Claude Code is an Anthropic client, so return the Anthropic /v1/models
+	// shape: each entry has type/id/display_name/created_at, and the list has
+	// has_more/first_id/last_id. The OpenAI-style object/owned_by fields are
+	// included too so OpenAI-compatible probes still work.
+	entry := func(id, name string) map[string]any {
+		if name == "" {
+			name = id
+		}
+		return map[string]any{
+			"type":         "model",
+			"id":           id,
+			"display_name": name,
+			"created_at":   "2026-01-01T00:00:00Z",
+			"object":       "model",
+			"owned_by":     "ultra-zen",
+		}
+	}
 	var models []map[string]any
 	for _, m := range s.cfg.Models {
-		models = append(models, map[string]any{
-			"id": m.ID, "object": "model", "display_name": m.Name,
-			"owned_by": "ultra-zen",
-		})
+		models = append(models, entry(m.ID, m.Name))
 	}
 	if len(models) == 0 {
-		models = append(models, map[string]any{
-			"id": s.cfg.Model, "object": "model", "owned_by": "ultra-zen",
-		})
+		models = append(models, entry(s.cfg.Model, ""))
 	}
-	out := map[string]any{"object": "list", "data": models}
+	out := map[string]any{
+		"object":   "list",
+		"data":     models,
+		"has_more": false,
+	}
+	if len(models) > 0 {
+		out["first_id"] = models[0]["id"]
+		out["last_id"] = models[len(models)-1]["id"]
+	}
 	body, _ := json.Marshal(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
