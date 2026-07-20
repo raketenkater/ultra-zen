@@ -132,6 +132,33 @@ func ListOpenRouter(httpClient *http.Client, apiKey string) ([]Model, error) {
 	return out, nil
 }
 
+// ListCodex fetches the model list from a local Codex-compatible endpoint
+// (e.g. ChatMock, an OAuth bridge that serves OpenAI-compatible chat/completions
+// backed by a ChatGPT Plus/Pro subscription). The endpoint already proxies
+// OpenAI models, so every id it advertises is usable.
+func ListCodex(httpClient *http.Client, baseURL, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	ids, err := fetchIDs(httpClient, baseURL, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("codex: %w", err)
+	}
+	var out []Model
+	for _, id := range ids {
+		out = append(out, Model{
+			ID:   id,
+			Name: pretty(id),
+			Base: baseURL,
+			Free: false, // subscription-backed, not free-tier
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
 // Find returns the model with the given id, or nil.
 func Find(list []Model, id string) *Model {
 	for i := range list {

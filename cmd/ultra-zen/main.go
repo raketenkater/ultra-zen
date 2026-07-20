@@ -22,6 +22,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -53,8 +55,10 @@ func main() {
 
 	var (
 		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
-		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go or openrouter")
+		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex")
 		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
+		codexBaseURL  = flag.String("codex-url", "", "Codex endpoint base URL (or set CODEX_BASE_URL), e.g. http://127.0.0.1:8000/v1")
+		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
 		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
@@ -72,6 +76,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Providers:")
 		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
 		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
+		fmt.Fprintln(os.Stderr, "  --provider codex         Local Codex endpoint (ChatGPT sub, e.g. ChatMock)")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Orchestrator/worker split (saves quota):")
 		fmt.Fprintln(os.Stderr, "  --worker <model>         Use a cheaper model for background sub-agents")
@@ -95,6 +100,54 @@ func main() {
 		}
 	}
 
+	// Go's flag.Parse() stops at the first positional arg, so flags placed
+	// after the model name (e.g. `ultra-zen glm-5.1 --provider openrouter`)
+	// land in claudeArgs instead of being parsed. Re-scan those trailing args
+	// for our own flags so ordering is irrelevant.
+	for i := 0; i < len(claudeArgs); {
+		arg := claudeArgs[i]
+		switch {
+		case arg == "--provider" && i+1 < len(claudeArgs):
+			*provider = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--provider="):
+			*provider = strings.TrimPrefix(arg, "--provider=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--worker" && i+1 < len(claudeArgs):
+			*workerModel = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--worker="):
+			*workerModel = strings.TrimPrefix(arg, "--worker=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--openrouter-key" && i+1 < len(claudeArgs):
+			*openRouterKey = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--openrouter-key="):
+			*openRouterKey = strings.TrimPrefix(arg, "--openrouter-key=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--codex-url" && i+1 < len(claudeArgs):
+			*codexBaseURL = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--codex-url="):
+			*codexBaseURL = strings.TrimPrefix(arg, "--codex-url=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--codex-key" && i+1 < len(claudeArgs):
+			*codexKey = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--codex-key="):
+			*codexKey = strings.TrimPrefix(arg, "--codex-key=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--port" && i+1 < len(claudeArgs):
+			*port, _ = strconv.Atoi(claudeArgs[i+1])
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--port="):
+			*port, _ = strconv.Atoi(strings.TrimPrefix(arg, "--port="))
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		default:
+			i++
+		}
+	}
+
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	var list []models.Model
 	var key string
@@ -113,6 +166,27 @@ func main() {
 		list, err = models.ListOpenRouter(httpClient, key)
 		if err != nil {
 			die(err)
+		}
+	case "codex":
+		base := *codexBaseURL
+		if base == "" {
+			base = os.Getenv("CODEX_BASE_URL")
+		}
+		if base == "" {
+			die(fmt.Errorf("codex provider requires a base URL: set CODEX_BASE_URL or pass --codex-url\nPoint it at a local Codex endpoint (e.g. ChatMock on http://127.0.0.1:8000/v1)"))
+		}
+		ck := *codexKey
+		if ck == "" {
+			ck = os.Getenv("CODEX_API_KEY")
+		}
+		if ck == "" {
+			ck = "codex" // ChatMock ignores the key
+		}
+		key = ck
+		var err error
+		list, err = models.ListCodex(httpClient, base, ck)
+		if err != nil {
+			die(fmt.Errorf("codex: %w", err))
 		}
 	default:
 		store, err := auth.Load(*authPath)
