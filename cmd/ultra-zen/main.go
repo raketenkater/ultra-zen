@@ -144,14 +144,15 @@ func main() {
 	}
 
 	if modelID == "" {
-		var err error
-		modelID, err = tui.Run(list, *provider)
-		if err != nil {
-			die(fmt.Errorf("model selector: %w", err))
-		}
-		if modelID == "" {
-			// User quit the selector.
+		var workerPick string
+		var quit bool
+		modelID, workerPick, quit = tui.Run(list, *provider)
+		if quit || modelID == "" {
 			return
+		}
+		// CLI --worker flag overrides TUI pick; TUI pick fills the default.
+		if *workerModel == "" && workerPick != "" {
+			*workerModel = workerPick
 		}
 	}
 	selected := models.Find(list, modelID)
@@ -159,6 +160,12 @@ func main() {
 		die(fmt.Errorf("model %q not found; run `ultra-zen --list` to see available models", modelID))
 	}
 	models.RecordRecent(selected.ID)
+
+	// Build the model list for /v1/models (Claude Code's /model command).
+	modelInfos := make([]proxy.ModelInfo, 0, len(list))
+	for _, m := range list {
+		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name})
+	}
 
 	// Start the proxy.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -169,6 +176,7 @@ func main() {
 		Model:       selected.ID,
 		WorkerModel: *workerModel,
 		Port:        *port,
+		Models:      modelInfos,
 	})
 	if err := srv.Start(ctx); err != nil {
 		die(fmt.Errorf("start proxy: %w", err))

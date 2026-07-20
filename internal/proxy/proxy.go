@@ -21,6 +21,13 @@ type Config struct {
 	Model       string // the Zen model id to forward orchestrator requests to
 	WorkerModel string // if set, background sub-agents use this cheaper model
 	Port        int    // local listen port
+	Models      []ModelInfo // full model list advertised at /v1/models
+}
+
+// ModelInfo is a minimal model entry for /v1/models advertising.
+type ModelInfo struct {
+	ID   string
+	Name string
 }
 
 // maxOutputTokens is the maximum max_tokens the proxy forwards to the Zen
@@ -88,25 +95,25 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `{"status":"ok"}`)
 }
 
-// handleModels advertises the available model(s) at GET /v1/models. Claude
-// Code (and every subagent / background agent it spawns) probes this endpoint
-// to validate ANTHROPIC_MODEL before issuing a request. When a worker model is
-// configured, both orchestrator and worker are advertised so Claude Code's
-// /model command can switch between them at runtime. The proxy still overrides
-// the model on every /v1/messages request based on tool classification, so
-// listing both ids is correct — the runtime routing is independent of which
-// model Claude Code thinks it's using.
+// handleModels advertises every usable model at GET /v1/models so Claude
+// Code's /model command shows the full list. The proxy's runtime routing
+// (orchestrator/worker) still applies per-request based on tool classification;
+// the advertised list is independent.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	models := []map[string]any{
-		{"id": s.cfg.Model, "object": "model", "owned_by": "ultra-zen"},
-	}
-	if s.cfg.WorkerModel != "" && s.cfg.WorkerModel != s.cfg.Model {
+	var models []map[string]any
+	for _, m := range s.cfg.Models {
 		models = append(models, map[string]any{
-			"id": s.cfg.WorkerModel, "object": "model", "owned_by": "ultra-zen",
+			"id": m.ID, "object": "model", "display_name": m.Name,
+			"owned_by": "ultra-zen",
+		})
+	}
+	if len(models) == 0 {
+		models = append(models, map[string]any{
+			"id": s.cfg.Model, "object": "model", "owned_by": "ultra-zen",
 		})
 	}
 	out := map[string]any{"object": "list", "data": models}

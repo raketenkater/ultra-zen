@@ -1,7 +1,6 @@
 // Package tui is the interactive model selector shown before Claude Code
-// launches. It presents a searchable Bubble Tea list of Zen models grouped
-// into the opencode-go tier and the free tier, with arrow-key navigation and
-// a filter. Selecting a model returns its id.
+// launches. It runs a two-step flow: first pick the orchestrator (main model),
+// then optionally pick a cheaper worker for background sub-agents.
 package tui
 
 import (
@@ -14,15 +13,13 @@ import (
 var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7D56F4"))
 	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Bold(true)
 	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
 	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4EC9B0"))
 )
 
-// modelItem adapts models.Model to bubbles/list.Item.
 type modelItem struct {
 	m      models.Model
-	recent bool // in the MRU list; shown with a marker
+	recent bool
 }
 
 func (i modelItem) Title() string {
@@ -31,35 +28,41 @@ func (i modelItem) Title() string {
 		t += "  (free)"
 	}
 	if i.recent {
-		t += "  " + recentStyle.Render("● recent")
+		t += "  " + recentStyle.Render("recent")
 	}
 	return t
 }
-var (
-	baseOpenRouter = "https://openrouter.ai/api/v1"
-)
+
+var baseOpenRouter = "https://openrouter.ai/api/v1"
 
 func (i modelItem) Description() string {
 	switch {
 	case i.m.Base == baseOpenRouter:
-		return "OpenRouter · free"
+		return "OpenRouter free"
 	case i.m.Free:
-		return "zen main tier · no credits"
+		return "zen free tier"
 	default:
 		return "opencode-go tier"
 	}
 }
 func (i modelItem) FilterValue() string { return i.m.ID }
 
+// step represents which selection screen is active.
+type step int
+
+const (
+	stepOrchestrator step = iota
+	stepWorker
+)
+
 type model struct {
 	list     list.Model
 	choice   string
+	worker   string // set on second step; empty = none
 	quit     bool
-	subtitle string // provider name for the header
+	subtitle string
+	step     step
 }
-
-type selectedMsg struct{ id string }
-type quitMsg struct{}
 
 func (m model) Init() tea.Cmd { return nil }
 
@@ -71,12 +74,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			m.quit = true
 			return m, tea.Quit
+		case "esc":
+			if m.step == stepWorker {
+				// Skip worker selection.
+				m.worker = ""
+				return m, tea.Quit
+			}
 		case "enter":
 			if item, ok := m.list.SelectedItem().(modelItem); ok {
-				m.choice = item.m.ID
+				if m.step == stepOrchestrator {
+					m.choice = item.m.ID
+					m.step = stepWorker
+					m.list.ResetSelected()
+					return m, nil
+				}
+				// Worker step: selected a worker.
+				m.worker = item.m.ID
 				return m, tea.Quit
 			}
 		}
@@ -87,17 +103,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	var b = titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  " + m.subtitle + " models") + "\n\n"
+	var b string
+	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
+	if m.step == stepOrchestrator {
+		b += subtitleStyle.Render("  " + m.subtitle + " — pick orchestrator") + "\n\n"
+	} else {
+		b += subtitleStyle.Render("  orchestrator: " + m.choice) + "\n"
+		b += subtitleStyle.Render("  pick worker (Esc to skip)") + "\n\n"
+	}
 	b += m.list.View() + "\n"
-	b += mutedStyle.Render("  ↑/↓ move · / filter · Enter select · q quit")
+	b += mutedStyle.Render("  / filter · Enter select · Esc skip worker · Ctrl+C quit")
 	return b
 }
 
-// Run shows the selector and returns the chosen model id, or "" if the user
-// quit. provider is "opencode-go", "openrouter", or similar — used for the
-// subtitle only.
-func Run(list_ []models.Model, provider string) (string, error) {
+// buildItems creates list items from models, with recent ones first.
+func buildItems(list_ []models.Model) []list.Item {
 	recent := models.LoadRecent()
 	ordered := models.SortByRecent(list_, recent)
 	isRecent := make(map[string]bool, len(recent))
@@ -108,29 +128,39 @@ func Run(list_ []models.Model, provider string) (string, error) {
 	for _, mdl := range ordered {
 		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID]})
 	}
+	return items
+}
+
+func providerSubtitle(provider string) string {
+	switch provider {
+	case "openrouter":
+		return "OpenRouter"
+	default:
+		return "opencode Zen"
+	}
+}
+
+// Run shows a two-step selector:
+//  1. Pick the orchestrator model (required).
+//  2. Pick the worker model (Enter selects, Esc skips).
+//
+// Returns (orchestrator, worker, quit). worker is "" if skipped.
+func Run(list_ []models.Model, provider string) (string, string, bool) {
+	items := buildItems(list_)
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
 	l.Title = ""
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(false)
 
-	subtitle := "opencode Zen"
-	switch provider {
-	case "openrouter":
-		subtitle = "OpenRouter"
-	}
-
-	p := tea.NewProgram(model{list: l, subtitle: subtitle})
+	p := tea.NewProgram(model{list: l, subtitle: providerSubtitle(provider), step: stepOrchestrator})
 	res, err := p.Run()
 	if err != nil {
-		return "", err
+		return "", "", false
 	}
 	mm, ok := res.(model)
-	if !ok {
-		return "", nil
+	if !ok || mm.quit || mm.choice == "" {
+		return "", "", mm.quit
 	}
-	if mm.quit {
-		return "", nil
-	}
-	return mm.choice, nil
+	return mm.choice, mm.worker, false
 }
