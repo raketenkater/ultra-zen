@@ -56,6 +56,7 @@ models** — with zero-config for opencode users.
 | **Setup** | Just Claude | Python + config | Python + config | **Single binary, zero config** |
 | **Free models** | ❌ | ❌ | ❌ | **✅ (Zen + OpenRouter)** |
 | **UltraCode** | ✅ | ❌ | ✅ | **✅ (stallMs hook)** |
+| **Orch/worker split** | ❌ | ❌ | ✅ | **✅** |
 | **TUI selector** | ❌ | ❌ | ❌ | **✅** |
 | **DDG web research** | ❌ | ❌ | ❌ | **✅** |
 | **OpenRouter** | ❌ | ❌ | ❌ | **✅** |
@@ -105,7 +106,28 @@ ultra-zen --list --provider openrouter # list OpenRouter free models
 ultra-zen --proxy-only glm-5.1         # start the proxy and block (debugging)
 ultra-zen --port 8787 glm-5.1          # pin a fixed port
 ultra-zen --version                    # print version and exit
+
+# Orchestrator/worker split — use a smart model for planning, a cheap one for fan-out
+ultra-zen glm-5.1 --worker mini-max-m2.5    # 3x more UltraCode agents per quota
+ultra-zen kimi-k3 --worker deepseek-v4-flash-free  # Go orchestrator + free worker
 ```
+
+### Orchestrator / worker split
+
+`--worker <model>` gives you two models behind one proxy:
+
+- **Orchestrator** (`<model>`): handles the main Claude Code loop — planning,
+  tool-use decisions, synthesis. Gets a smart model.
+- **Worker** (`--worker`): handles background sub-agents spawned by UltraCode
+  workflows. Gets a cheap, high-rate-limit model.
+
+The proxy classifies each request by inspecting the tool list: interactive
+tools (`AskUserQuestion`, `Skill`, `EnterPlanMode`) mean orchestrator;
+everything else uses the worker. This means you can fan out 20 parallel
+sub-agents without burning your expensive orchestrator quota.
+
+On local hardware this makes no difference (every token costs the same), so
+omit `--worker` and everything uses one model.
 
 ### OpenRouter
 

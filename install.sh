@@ -161,11 +161,62 @@ main() {
         log_warn "Installation may have issues. Try: ${INSTALL_DIR}/${BINARY} --version"
     fi
 
+    # --- Claude Code detection ---
+    echo ""
+    log_step "Checking prerequisites..."
+
+    local node_needed=false
+    local claude_installed=true
+
+    if ! command -v node >/dev/null 2>&1; then
+        node_needed=true
+    fi
+
+    if ! command -v claude >/dev/null 2>&1; then
+        claude_installed=false
+    fi
+
+    if [ "$node_needed" = true ]; then
+        log_warn "Node.js is not installed. Claude Code requires Node.js >= 18."
+        log_info "Install Node.js: https://nodejs.org/  (or use nvm, fnm, etc.)"
+        echo ""
+    fi
+
+    if [ "$claude_installed" = false ]; then
+        log_warn "Claude Code is not installed or not on PATH."
+        if [ "$node_needed" = false ]; then
+            log_info "Install Claude Code:"
+            echo ""
+            echo "  npm install -g @anthropic-ai/claude-code"
+            echo ""
+        else
+            log_info "After installing Node.js, run:"
+            echo ""
+            echo "  npm install -g @anthropic-ai/claude-code"
+            echo ""
+        fi
+    else
+        log_info "Claude Code found: $(claude --version 2>/dev/null || echo 'installed')"
+    fi
+
+    # --- uvx check (for web research) ---
+    if ! command -v uvx >/dev/null 2>&1; then
+        log_warn "uvx not found — web research (DDG MCP) will be unavailable."
+        log_info "Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+
     echo ""
     log_step "Next steps:"
-    echo "  1. Make sure Claude Code is installed:  npm i -g @anthropic-ai/claude-code"
-    echo "  2. Run:  ultra-zen"
-    echo "  3. Pick a model from the TUI and start coding!"
+    if [ "$claude_installed" = false ]; then
+        echo "  1. Install Claude Code (see above)"
+        echo "  2. Run:  ultra-zen"
+    else
+        echo "  1. Run:  ultra-zen"
+    fi
+    echo "  2. Pick a model from the TUI and start coding!"
+    echo ""
+    echo "  Orchestrator/worker split (save quota):"
+    echo "    ultra-zen glm-5.1 --worker mini-max-m2.5"
     echo ""
     echo "  OpenRouter:  OPENROUTER_API_KEY=sk-or-v1-... ultra-zen --provider openrouter"
     echo ""

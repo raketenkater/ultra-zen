@@ -16,10 +16,11 @@ import (
 
 // Config holds the gateway target and credentials for the proxy.
 type Config struct {
-	BaseURL string // e.g. https://opencode.ai/zen/go/v1
-	APIKey  string
-	Model   string // the Zen model id to forward to
-	Port    int    // local listen port
+	BaseURL     string // e.g. https://opencode.ai/zen/go/v1
+	APIKey      string
+	Model       string // the Zen model id to forward orchestrator requests to
+	WorkerModel string // if set, background sub-agents use this cheaper model
+	Port        int    // local listen port
 }
 
 // maxOutputTokens is the maximum max_tokens the proxy forwards to the Zen
@@ -87,23 +88,28 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `{"status":"ok"}`)
 }
 
-// handleModels advertises the selected Zen model id at GET /v1/models. Claude
+// handleModels advertises the available model(s) at GET /v1/models. Claude
 // Code (and every subagent / background agent it spawns) probes this endpoint
-// to validate ANTHROPIC_MODEL before issuing a request; if the configured model
-// is not listed it rejects the session or falls back. The proxy still overrides
-// the model on every /v1/messages request, so listing a single id here is
-// sufficient and correct.
+// to validate ANTHROPIC_MODEL before issuing a request. When a worker model is
+// configured, both orchestrator and worker are advertised so Claude Code's
+// /model command can switch between them at runtime. The proxy still overrides
+// the model on every /v1/messages request based on tool classification, so
+// listing both ids is correct — the runtime routing is independent of which
+// model Claude Code thinks it's using.
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	out := map[string]any{
-		"object": "list",
-		"data": []map[string]any{
-			{"id": s.cfg.Model, "object": "model", "owned_by": "ultra-zen"},
-		},
+	models := []map[string]any{
+		{"id": s.cfg.Model, "object": "model", "owned_by": "ultra-zen"},
 	}
+	if s.cfg.WorkerModel != "" && s.cfg.WorkerModel != s.cfg.Model {
+		models = append(models, map[string]any{
+			"id": s.cfg.WorkerModel, "object": "model", "owned_by": "ultra-zen",
+		})
+	}
+	out := map[string]any{"object": "list", "data": models}
 	body, _ := json.Marshal(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -125,7 +131,17 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request_error", "invalid Anthropic request: "+err.Error())
 		return
 	}
-	oreq, err := areq.toOpenAI(s.cfg.Model)
+	// Model routing: when a worker model is configured, background sub-agents
+	// use the cheaper worker model. The main loop carries interactive-only tools
+	// (AskUserQuestion, Skill) that sub-agents never see, so we inspect the tool
+	// list to classify each request. On local hardware all models cost the same
+	// (your electricity), so splitting makes no difference — WorkerModel stays
+	// empty and everything uses Model.
+	model := s.cfg.Model
+	if s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
+		model = s.cfg.WorkerModel
+	}
+	oreq, err := areq.toOpenAI(model)
 	if err != nil {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -316,3 +332,17 @@ func httpClient() *http.Client {
 
 // Port returns the configured listen port.
 func (s *Server) Port() int { return s.cfg.Port }
+
+// hasInteractiveTools reports whether the tool list includes tools that only
+// appear in the main Claude Code loop (AskUserQuestion, Skill, etc.).
+// Sub-agents/Workflow workers never see these, so their absence reliably
+// identifies a background request that can use the cheaper worker model.
+func hasInteractiveTools(tools []anthropicTool) bool {
+	for _, t := range tools {
+		switch t.Name {
+		case "AskUserQuestion", "Skill", "EnterPlanMode", "ExitPlanMode":
+			return true
+		}
+	}
+	return false
+}

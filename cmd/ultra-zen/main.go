@@ -52,13 +52,14 @@ func main() {
 	redirectProxyLog()
 
 	var (
-		authPath    = flag.String("auth", "", "path to opencode auth.json (default: auto)")
-		provider    = flag.String("provider", "opencode-go", "backend provider: opencode-go or openrouter")
+		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
+		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go or openrouter")
 		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
-		port        = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
-		listOnly    = flag.Bool("list", false, "list available models and exit")
-		proxyOnly   = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
-		showVer     = flag.Bool("version", false, "print version and exit")
+		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
+		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
+		listOnly      = flag.Bool("list", false, "list available models and exit")
+		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
+		showVer       = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "ultra-zen — run Claude Code on opencode Zen or OpenRouter models")
@@ -71,6 +72,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Providers:")
 		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
 		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Orchestrator/worker split (saves quota):")
+		fmt.Fprintln(os.Stderr, "  --worker <model>         Use a cheaper model for background sub-agents")
 		fmt.Fprintln(os.Stderr, "")
 		flag.PrintDefaults()
 	}
@@ -160,10 +164,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := proxy.New(proxy.Config{
-		BaseURL: selected.Base,
-		APIKey:  key,
-		Model:   selected.ID,
-		Port:    *port,
+		BaseURL:     selected.Base,
+		APIKey:      key,
+		Model:       selected.ID,
+		WorkerModel: *workerModel,
+		Port:        *port,
 	})
 	if err := srv.Start(ctx); err != nil {
 		die(fmt.Errorf("start proxy: %w", err))
@@ -179,8 +184,11 @@ func main() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\n  ultra-zen ▸ %s  (%s)\n  proxy on %s  →  claude\n\n",
-		selected.ID, selected.Base, srv.BaseURL())
+	fmt.Fprintf(os.Stderr, "\n  ultra-zen ▸ %s  (%s)\n", selected.ID, selected.Base)
+	if *workerModel != "" {
+		fmt.Fprintf(os.Stderr, "  worker    ▸ %s\n", *workerModel)
+	}
+	fmt.Fprintf(os.Stderr, "  proxy on %s  →  claude\n\n", srv.BaseURL())
 
 	// Forward SIGINT/SIGTERM to claude and tear down the proxy.
 	sigCh := make(chan os.Signal, 1)
