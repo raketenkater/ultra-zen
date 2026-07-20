@@ -5,6 +5,8 @@
 [![License](https://img.shields.io/github/license/raketenkater/ultra-zen)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/raketenkater/ultra-zen)](https://goreportcard.com/report/github.com/raketenkater/ultra-zen)
 
+Run Claude Code — including Ultracode workflows — on free and low-cost models.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="ultra-zen-selector.png">
   <img alt="ultra-zen model selector" src="ultra-zen-selector.png" width="660">
@@ -12,15 +14,20 @@
 
 Run **Claude Code** on **opencode Zen models** (the full `opencode-go` tier:
 glm, kimi, minimax, qwen, deepseek, grok, mimo, hy3-preview, plus the `*-free`
-models) or **OpenRouter free models** — with full Claude Code feature parity
-(Ultracode workflows, subagents, MCP, hooks, WebFetch, tools, streaming).
+models), **OpenRouter free models**, or a **Codex endpoint** backed by a ChatGPT
+subscription — with full Claude Code feature parity (Ultracode workflows,
+subagents, MCP, hooks, WebFetch, tools, streaming).
+
+The Ultracode workflow engine — Claude Code's multi-agent, deep-reasoning mode —
+is the reason ultra-zen exists: it works end to end on free models, with a hook
+that keeps background fan-out alive on slow gateways.
 
 `ultra-zen` is a launch wrapper around Claude Code. It reads your opencode API
-key (or an OpenRouter key from the environment), lists available models, lets
-you pick one from a searchable TUI, starts a local **Anthropic → OpenAI
-translation proxy**, and execs `claude` pointed at it. Claude Code only speaks
-the Anthropic Messages API; a thin bridge translates to the OpenAI Chat
-Completions format the upstream gateways serve.
+key (or an OpenRouter/Codex key), lists available models, lets you pick one from
+a searchable TUI, starts a local **Anthropic → OpenAI translation proxy**, and
+execs `claude` pointed at it. Claude Code only speaks the Anthropic Messages API;
+a thin bridge translates to the OpenAI Chat Completions format the upstream
+gateways serve.
 
 ```
 ultra-zen
@@ -96,6 +103,19 @@ key from `auth.json`. Lists `opencode-go` tier models and `*-free` models.
 environment. Lists `:free` models, including `qwen/qwen3-coder:free`,
 `deepseek/deepseek-chat:free`, `google/gemini-2.5-flash:free`, and
 `openrouter/free` (auto-routes to the best available free model).
+
+**Codex / ChatGPT subscription** (`--provider codex`): points at a local
+OpenAI-compatible endpoint backed by a ChatGPT Plus/Pro login — e.g.
+[ChatMock](https://github.com/RayBytes/ChatMock), which serves GPT-5 through the
+Codex OAuth client without an OpenAI API key. Start the endpoint, then:
+
+```bash
+export CODEX_BASE_URL=http://127.0.0.1:8000/v1
+ultra-zen --provider codex
+```
+
+When run interactively, ultra-zen prompts for the key or URL if it isn't set,
+so you don't have to export anything up front.
 
 ### Orchestrator / worker split
 
