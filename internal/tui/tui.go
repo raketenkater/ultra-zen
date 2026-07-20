@@ -35,18 +35,27 @@ func (i modelItem) Title() string {
 	}
 	return t
 }
+var (
+	baseOpenRouter = "https://openrouter.ai/api/v1"
+)
+
 func (i modelItem) Description() string {
-	if i.m.Free {
-		return "main tier · no credits"
+	switch {
+	case i.m.Base == baseOpenRouter:
+		return "OpenRouter · free"
+	case i.m.Free:
+		return "zen main tier · no credits"
+	default:
+		return "opencode-go tier"
 	}
-	return "opencode-go tier"
 }
 func (i modelItem) FilterValue() string { return i.m.ID }
 
 type model struct {
-	list   list.Model
-	choice string
-	quit   bool
+	list     list.Model
+	choice   string
+	quit     bool
+	subtitle string // provider name for the header
 }
 
 type selectedMsg struct{ id string }
@@ -79,15 +88,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	var b = titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  Pick a Zen model for Claude Code") + "\n\n"
+	b += subtitleStyle.Render("  " + m.subtitle + " models") + "\n\n"
 	b += m.list.View() + "\n"
 	b += mutedStyle.Render("  ↑/↓ move · / filter · Enter select · q quit")
 	return b
 }
 
-// Run shows the selector over the given models and returns the chosen model id,
-// or "" if the user quit.
-func Run(list_ []models.Model) (string, error) {
+// Run shows the selector and returns the chosen model id, or "" if the user
+// quit. provider is "opencode-go", "openrouter", or similar — used for the
+// subtitle only.
+func Run(list_ []models.Model, provider string) (string, error) {
 	recent := models.LoadRecent()
 	ordered := models.SortByRecent(list_, recent)
 	isRecent := make(map[string]bool, len(recent))
@@ -104,7 +114,13 @@ func Run(list_ []models.Model) (string, error) {
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(false)
 
-	p := tea.NewProgram(model{list: l})
+	subtitle := "opencode Zen"
+	switch provider {
+	case "openrouter":
+		subtitle = "OpenRouter"
+	}
+
+	p := tea.NewProgram(model{list: l, subtitle: subtitle})
 	res, err := p.Run()
 	if err != nil {
 		return "", err

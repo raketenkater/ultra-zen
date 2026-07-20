@@ -145,7 +145,7 @@ func main() {
 
 	if modelID == "" {
 		var err error
-		modelID, err = tui.Run(list)
+		modelID, err = tui.Run(list, *provider)
 		if err != nil {
 			die(fmt.Errorf("model selector: %w", err))
 		}

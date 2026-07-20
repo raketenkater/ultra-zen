@@ -156,9 +156,9 @@ main() {
     # Final check
     if "${INSTALL_DIR}/${BINARY}" --version >/dev/null 2>&1; then
         log_info "$(${INSTALL_DIR}/${BINARY} --version)"
-        log_info "✓ ultra-zen installed successfully!"
+        log_info "ultra-zen installed to ${INSTALL_DIR}/${BINARY}"
     else
-        log_warn "Installation may have issues. Try: ${INSTALL_DIR}/${BINARY} --version"
+        log_warn "Binary may not be functional: ${INSTALL_DIR}/${BINARY} --version"
     fi
 
     # --- Claude Code detection ---
@@ -178,7 +178,7 @@ main() {
 
     if [ "$node_needed" = true ]; then
         log_warn "Node.js is not installed. Claude Code requires Node.js >= 18."
-        log_info "Install Node.js: https://nodejs.org/  (or use nvm, fnm, etc.)"
+        log_info "Install Node.js: https://nodejs.org"
         echo ""
     fi
 
@@ -208,18 +208,13 @@ main() {
     echo ""
     log_step "Next steps:"
     if [ "$claude_installed" = false ]; then
-        echo "  1. Install Claude Code (see above)"
-        echo "  2. Run:  ultra-zen"
+        echo "  Install Claude Code (see above), then run: ultra-zen"
     else
-        echo "  1. Run:  ultra-zen"
+        echo "  ultra-zen"
     fi
-    echo "  2. Pick a model from the TUI and start coding!"
     echo ""
-    echo "  Orchestrator/worker split (save quota):"
-    echo "    ultra-zen glm-5.1 --worker mini-max-m2.5"
-    echo ""
-    echo "  OpenRouter:  OPENROUTER_API_KEY=sk-or-v1-... ultra-zen --provider openrouter"
-    echo ""
+    echo "  With OpenRouter:  OPENROUTER_API_KEY=sk-or-v1-... ultra-zen --provider openrouter"
+    echo "  With worker split: ultra-zen glm-5.1 --worker mini-max-m2.5"
     echo "  Docs: https://github.com/raketenkater/ultra-zen"
 }
 
