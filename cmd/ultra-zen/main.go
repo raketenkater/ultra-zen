@@ -152,11 +152,18 @@ func main() {
 	var list []models.Model
 	var key string
 
+	// interactive is true when no model was named on the CLI, so it's safe to
+	// open a TUI prompt for a missing key rather than exiting.
+	interactive := modelID == ""
+
 	switch *provider {
 	case "openrouter":
 		k := *openRouterKey
 		if k == "" {
 			k = os.Getenv("OPENROUTER_API_KEY")
+		}
+		if k == "" && interactive {
+			k = tui.PromptKey("OpenRouter API key", "get one at https://openrouter.ai/keys", true)
 		}
 		if k == "" {
 			die(fmt.Errorf("OpenRouter requires an API key: set OPENROUTER_API_KEY or pass --openrouter-key\nGet one at https://openrouter.ai/keys"))
@@ -171,6 +178,9 @@ func main() {
 		base := *codexBaseURL
 		if base == "" {
 			base = os.Getenv("CODEX_BASE_URL")
+		}
+		if base == "" && interactive {
+			base = tui.PromptKey("Codex endpoint base URL", "e.g. http://127.0.0.1:8000/v1 (ChatMock)", false)
 		}
 		if base == "" {
 			die(fmt.Errorf("codex provider requires a base URL: set CODEX_BASE_URL or pass --codex-url\nPoint it at a local Codex endpoint (e.g. ChatMock on http://127.0.0.1:8000/v1)"))
@@ -191,6 +201,21 @@ func main() {
 	default:
 		store, err := auth.Load(*authPath)
 		if err != nil {
+			// opencode auth is missing. In interactive mode, offer OpenRouter
+			// as a no-opencode alternative instead of exiting.
+			if interactive {
+				k := tui.PromptKey("No opencode login found. Paste an OpenRouter API key to use free models instead (Esc to cancel)",
+					"get one at https://openrouter.ai/keys · or run `opencode auth login` for Zen", true)
+				if k != "" {
+					*provider = "openrouter"
+					key = k
+					list, err = models.ListOpenRouter(httpClient, key)
+					if err != nil {
+						die(err)
+					}
+					break
+				}
+			}
 			die(err)
 		}
 		key, err = auth.KeyFor(store, *provider)
