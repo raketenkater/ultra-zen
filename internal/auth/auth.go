@@ -72,3 +72,14 @@ func KeyFor(s Store, provider string) (string, error) {
 	}
 	return e.Key, nil
 }
+
+// KeyFromEnv reads an API key from an environment variable. Used for providers
+// like OpenRouter that expect their key in the environment rather than in
+// opencode's auth store.
+func KeyFromEnv(envVar string) (string, error) {
+	key := os.Getenv(envVar)
+	if key == "" {
+		return "", fmt.Errorf("environment variable %s is not set; export it or pass --auth", envVar)
+	}
+	return key, nil
+}

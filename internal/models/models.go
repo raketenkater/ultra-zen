@@ -14,10 +14,11 @@ import (
 	"time"
 )
 
-// Base URLs for the two Zen tiers.
+// Base URLs for the supported providers.
 const (
-	GoBase   = "https://opencode.ai/zen/go/v1"
-	MainBase = "https://opencode.ai/zen/v1"
+	GoBase        = "https://opencode.ai/zen/go/v1"
+	MainBase      = "https://opencode.ai/zen/v1"
+	OpenRouterBase = "https://openrouter.ai/api/v1"
 )
 
 // Model is one selectable model.
@@ -101,6 +102,34 @@ func pretty(id string) string {
 	name := id
 	name = strings.TrimSuffix(name, "-free")
 	return name
+}
+
+// ListOpenRouter fetches all free models available via OpenRouter. The
+// :free models and the openrouter/free router are returned; paid models are
+// omitted since ultra-zen is about free/cheap access.
+func ListOpenRouter(httpClient *http.Client, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	ids, err := fetchIDs(httpClient, OpenRouterBase, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("openrouter: %w", err)
+	}
+	var out []Model
+	for _, id := range ids {
+		if strings.Contains(id, ":free") || id == "openrouter/free" {
+			out = append(out, Model{
+				ID:   id,
+				Name: pretty(id),
+				Base: OpenRouterBase,
+				Free: true,
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
 }
 
 // Find returns the model with the given id, or nil.

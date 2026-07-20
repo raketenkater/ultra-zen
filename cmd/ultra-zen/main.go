@@ -52,20 +52,25 @@ func main() {
 	redirectProxyLog()
 
 	var (
-		authPath  = flag.String("auth", "", "path to opencode auth.json (default: auto)")
-		provider  = flag.String("provider", "opencode-go", "opencode auth provider name")
-		port      = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
-		listOnly  = flag.Bool("list", false, "list available models and exit")
-		proxyOnly = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
-		showVer   = flag.Bool("version", false, "print version and exit")
+		authPath    = flag.String("auth", "", "path to opencode auth.json (default: auto)")
+		provider    = flag.String("provider", "opencode-go", "backend provider: opencode-go or openrouter")
+		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
+		port        = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
+		listOnly    = flag.Bool("list", false, "list available models and exit")
+		proxyOnly   = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
+		showVer     = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "ultra-zen — run Claude Code on opencode Zen models")
+		fmt.Fprintln(os.Stderr, "ultra-zen — run Claude Code on opencode Zen or OpenRouter models")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Usage:")
 		fmt.Fprintln(os.Stderr, "  ultra-zen                 # pick a model, then launch claude")
 		fmt.Fprintln(os.Stderr, "  ultra-zen <model>         # use this model id")
 		fmt.Fprintln(os.Stderr, "  ultra-zen <model> -- <args>   # pass args through to claude")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Providers:")
+		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
+		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
 		fmt.Fprintln(os.Stderr, "")
 		flag.PrintDefaults()
 	}
@@ -86,22 +91,41 @@ func main() {
 		}
 	}
 
-	store, err := auth.Load(*authPath)
-	if err != nil {
-		die(err)
-	}
-	key, err := auth.KeyFor(store, *provider)
-	if err != nil {
-		die(err)
-	}
-
 	httpClient := &http.Client{Timeout: 20 * time.Second}
-	list, err := models.List(httpClient, key)
-	if err != nil {
-		die(err)
+	var list []models.Model
+	var key string
+
+	switch *provider {
+	case "openrouter":
+		k := *openRouterKey
+		if k == "" {
+			k = os.Getenv("OPENROUTER_API_KEY")
+		}
+		if k == "" {
+			die(fmt.Errorf("OpenRouter requires an API key: set OPENROUTER_API_KEY or pass --openrouter-key\nGet one at https://openrouter.ai/keys"))
+		}
+		key = k
+		var err error
+		list, err = models.ListOpenRouter(httpClient, key)
+		if err != nil {
+			die(err)
+		}
+	default:
+		store, err := auth.Load(*authPath)
+		if err != nil {
+			die(err)
+		}
+		key, err = auth.KeyFor(store, *provider)
+		if err != nil {
+			die(err)
+		}
+		list, err = models.List(httpClient, key)
+		if err != nil {
+			die(err)
+		}
 	}
 	if len(list) == 0 {
-		die(fmt.Errorf("no models available on the Zen gateway for the %s provider", *provider))
+		die(fmt.Errorf("no models available for provider %q", *provider))
 	}
 
 	if *listOnly {
@@ -116,6 +140,7 @@ func main() {
 	}
 
 	if modelID == "" {
+		var err error
 		modelID, err = tui.Run(list)
 		if err != nil {
 			die(fmt.Errorf("model selector: %w", err))

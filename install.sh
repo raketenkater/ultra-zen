@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ultra-zen installer — single-command setup
+# Usage: curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/main/install.sh | sh
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+REPO="raketenkater/ultra-zen"
+BINARY="ultra-zen"
+BINDIR="${ULTRA_ZEN_BINDIR:-}"
+VERSION="${ULTRA_ZEN_VERSION:-latest}"
+INSTALL_DIR=""
+NEEDS_SUDO=false
+
+log_info()  { echo -e "${GREEN}→${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}!${NC} $1"; }
+log_error() { echo -e "${RED}✗${NC} $1"; }
+log_step()  { echo -e "${CYAN}==>${NC} $1"; }
+
+# --- Platform detection ---
+detect_platform() {
+    local os arch
+
+    case "$(uname -s)" in
+        Linux)  os="linux" ;;
+        Darwin) os="darwin" ;;
+        *)
+            log_error "Unsupported OS: $(uname -s)"
+            log_info "ultra-zen supports Linux and macOS."
+            log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
+            exit 1
+            ;;
+    esac
+
+    case "$(uname -m)" in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *)
+            log_error "Unsupported architecture: $(uname -m)"
+            log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
+            exit 1
+            ;;
+    esac
+
+    echo "${os}_${arch}"
+}
+
+# --- Find a writable install directory ---
+find_bindir() {
+    # User override
+    if [ -n "$BINDIR" ]; then
+        INSTALL_DIR="$BINDIR"
+        return
+    fi
+
+    # Try /usr/local/bin first (may need sudo)
+    if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+        INSTALL_DIR="/usr/local/bin"
+    elif [ -d "/usr/local/bin" ]; then
+        INSTALL_DIR="/usr/local/bin"
+        NEEDS_SUDO=true
+    elif [ -d "$HOME/.local/bin" ]; then
+        INSTALL_DIR="$HOME/.local/bin"
+    else
+        INSTALL_DIR="$HOME/.local/bin"
+        mkdir -p "$INSTALL_DIR"
+    fi
+}
+
+# --- Resolve latest version ---
+resolve_version() {
+    if [ "$VERSION" != "latest" ]; then
+        echo "$VERSION"
+        return
+    fi
+    local tag
+    tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | \
+        grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)"/\1/')
+    if [ -z "$tag" ]; then
+        log_error "Could not determine latest release version."
+        log_info "Try pinning a version: curl -fsSL ... | ULTRA_ZEN_VERSION=v0.1.0 sh"
+        log_info "Or build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
+        exit 1
+    fi
+    echo "$tag"
+}
+
+# --- Main ---
+main() {
+    log_step "ultra-zen installer"
+
+    local platform version tarball url tmpdir
+
+    platform=$(detect_platform)
+    version=$(resolve_version)
+    log_info "Platform: ${platform}, Version: ${version}"
+
+    find_bindir
+    log_info "Install directory: ${INSTALL_DIR}"
+
+    # Download URL
+    tarball="${BINARY}_${version}_${platform}.tar.gz"
+    url="https://github.com/${REPO}/releases/download/${version}/${tarball}"
+
+    # Create temp dir
+    tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    # Download
+    log_step "Downloading ${tarball}..."
+    if ! curl -fsSL --progress-bar -o "${tmpdir}/${tarball}" "$url"; then
+        log_error "Download failed: ${url}"
+        log_info "The release may not yet have binaries for your platform."
+        log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
+        exit 1
+    fi
+
+    # Extract
+    log_step "Extracting..."
+    tar -xzf "${tmpdir}/${tarball}" -C "${tmpdir}"
+
+    # Verify binary exists
+    if [ ! -f "${tmpdir}/${BINARY}" ]; then
+        log_error "Binary not found in archive. Contents:"
+        ls -la "${tmpdir}/"
+        exit 1
+    fi
+
+    # Install
+    log_step "Installing to ${INSTALL_DIR}..."
+    if [ "$NEEDS_SUDO" = true ]; then
+        log_info "Need sudo for ${INSTALL_DIR}"
+        sudo cp "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        sudo chmod +x "${INSTALL_DIR}/${BINARY}"
+    else
+        cp "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        chmod +x "${INSTALL_DIR}/${BINARY}"
+    fi
+
+    # Verify installation
+    if ! command -v "${BINARY}" >/dev/null 2>&1 && ! [ -x "${INSTALL_DIR}/${BINARY}" ]; then
+        log_warn "${BINARY} installed but may not be on PATH."
+        if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
+            log_info "Add to your shell config:"
+            echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        fi
+    fi
+
+    # Final check
+    if "${INSTALL_DIR}/${BINARY}" --version >/dev/null 2>&1; then
+        log_info "$(${INSTALL_DIR}/${BINARY} --version)"
+        log_info "✓ ultra-zen installed successfully!"
+    else
+        log_warn "Installation may have issues. Try: ${INSTALL_DIR}/${BINARY} --version"
+    fi
+
+    echo ""
+    log_step "Next steps:"
+    echo "  1. Make sure Claude Code is installed:  npm i -g @anthropic-ai/claude-code"
+    echo "  2. Run:  ultra-zen"
+    echo "  3. Pick a model from the TUI and start coding!"
+    echo ""
+    echo "  OpenRouter:  OPENROUTER_API_KEY=sk-or-v1-... ultra-zen --provider openrouter"
+    echo ""
+    echo "  Docs: https://github.com/raketenkater/ultra-zen"
+}
+
+main "$@"
