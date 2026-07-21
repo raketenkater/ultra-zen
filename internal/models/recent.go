@@ -125,9 +125,9 @@ var RecommendedCombos = []Combo{
 	{Orchestrator: "kimi-k2.7-code", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "glm-5.2", Worker: "mini-max-m3"},
 	// Free — single model, no worker needed
-	{Orchestrator: "deepseek-v4-flash-free"},
-	{Orchestrator: "qwen/qwen3-coder:free"},
-	{Orchestrator: "north-mini-code:free"},
+	{Orchestrator: "deepseek-v4-flash-free", Worker: "deepseek-v4-flash-free"},
+	{Orchestrator: "qwen/qwen3-coder:free", Worker: "deepseek-v4-flash-free"},
+	{Orchestrator: "north-mini-code:free", Worker: "deepseek-v4-flash-free"},
 }
 
 // SortByRecent returns list ordered with recently used models first (in MRU

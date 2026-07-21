@@ -62,7 +62,7 @@ func (i comboItem) Title() string {
 	if i.manual {
 		return "Pick models manually →"
 	}
-	if i.combo.Worker == "" {
+	if i.combo.Worker == "" || i.combo.Worker == i.combo.Orchestrator {
 		return i.combo.Orchestrator
 	}
 	return i.combo.Orchestrator + "  +  " + i.combo.Worker
@@ -71,8 +71,8 @@ func (i comboItem) Description() string {
 	if i.manual {
 		return "choose orchestrator and worker yourself"
 	}
-	if i.combo.Worker == "" {
-		return i.label + " · single model"
+	if i.combo.Worker == "" || i.combo.Worker == i.combo.Orchestrator {
+		return i.label + " · free"
 	}
 	return i.label + " · orchestrator + worker"
 }
