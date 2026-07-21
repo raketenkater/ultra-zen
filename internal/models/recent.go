@@ -118,12 +118,16 @@ func RecordCombo(orchestrator, worker string) {
 // background sub-agents (wants a cheap, high-rate-limit model). These reflect
 // common opencode Zen / OpenRouter practice as of mid-2026.
 var RecommendedCombos = []Combo{
+	// Paid Go-tier — smart orchestrator + cheap worker
 	{Orchestrator: "glm-5.2", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "kimi-k3", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "glm-5.2", Worker: "mini-max-m2.5"},
 	{Orchestrator: "kimi-k2.7-code", Worker: "deepseek-v4-flash-free"},
-	{Orchestrator: "qwen/qwen3-coder:free", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "glm-5.2", Worker: "mini-max-m3"},
+	// Free — single model, no worker needed
+	{Orchestrator: "deepseek-v4-flash-free"},
+	{Orchestrator: "qwen/qwen3-coder:free"},
+	{Orchestrator: "north-mini-code:free"},
 }
 
 // SortByRecent returns list ordered with recently used models first (in MRU
