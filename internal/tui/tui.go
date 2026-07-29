@@ -80,6 +80,24 @@ func (i comboItem) FilterValue() string {
 	return i.combo.Orchestrator + " " + i.combo.Worker
 }
 
+// ResumeOption describes a recorded, resumable Claude Code session for the
+// current directory, so the picker's opening screen can offer to reopen it
+// instead of starting a fresh one.
+type ResumeOption struct {
+	SessionID   string // session id to resume
+	Label       string // e.g. the model it was recorded under
+	Description string // e.g. recorded time and cached-agent count
+}
+
+// resumeItem is the picker row for a ResumeOption. It only ever appears on
+// the opening screen (see Run) — once the user chooses to pick a model
+// instead, it does not reappear on later steps.
+type resumeItem struct{ opt ResumeOption }
+
+func (i resumeItem) Title() string       { return "↻ Resume: " + i.opt.Label }
+func (i resumeItem) Description() string { return i.opt.Description }
+func (i resumeItem) FilterValue() string { return "resume " + i.opt.Label }
+
 type step int
 
 const (
@@ -93,6 +111,7 @@ type model struct {
 	all       []models.Model // for rebuilding lists between steps
 	choice    string
 	worker    string
+	resumeID  string
 	quit      bool
 	subtitle  string
 	step      step
@@ -132,6 +151,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 		case "enter":
+			if item, ok := m.list.SelectedItem().(resumeItem); ok {
+				m.resumeID = item.opt.SessionID
+				return m, tea.Quit
+			}
 			switch m.step {
 			case stepCombo:
 				if item, ok := m.list.SelectedItem().(comboItem); ok {
@@ -243,10 +266,16 @@ func providerSubtitle(provider string) string {
 	}
 }
 
-// Run shows the selector and returns (orchestrator, worker, quit). The first
-// screen lists combos; picking one returns immediately. "Pick manually" leads
-// to orchestrator then optional worker selection. worker is "" if none chosen.
-func Run(ms []models.Model, provider string) (string, string, bool) {
+// Run shows the selector and returns (orchestrator, worker, resumeSessionID,
+// quit). The first screen lists combos; picking one returns immediately.
+// "Pick manually" leads to orchestrator then optional worker selection.
+// worker is "" if none chosen.
+//
+// If resume is non-nil, it is shown as an extra row on the opening screen
+// only; choosing it sets resumeSessionID and returns immediately with an
+// empty choice, so the caller can reopen that session instead of launching a
+// fresh one.
+func Run(ms []models.Model, provider string, resume *ResumeOption) (choice, worker, resumeSessionID string, quit bool) {
 	comboItems := buildComboItems(ms)
 	// If the only combo item is the manual fall-through, skip straight to
 	// manual selection — there are no combos worth showing.
@@ -257,6 +286,9 @@ func Run(ms []models.Model, provider string) (string, string, bool) {
 		items = buildModelItems(ms)
 	} else {
 		items = comboItems
+	}
+	if resume != nil {
+		items = append([]list.Item{resumeItem{opt: *resume}}, items...)
 	}
 
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
@@ -274,11 +306,17 @@ func Run(ms []models.Model, provider string) (string, string, bool) {
 	})
 	res, err := p.Run()
 	if err != nil {
-		return "", "", false
+		return "", "", "", false
 	}
 	mm, ok := res.(model)
-	if !ok || mm.quit || mm.choice == "" {
-		return "", "", mm.quit
+	if !ok {
+		return "", "", "", false
 	}
-	return mm.choice, mm.worker, false
+	if mm.resumeID != "" {
+		return "", "", mm.resumeID, false
+	}
+	if mm.quit || mm.choice == "" {
+		return "", "", "", mm.quit
+	}
+	return mm.choice, mm.worker, "", false
 }

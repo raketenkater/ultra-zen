@@ -117,6 +117,49 @@ ultra-zen --provider codex
 When run interactively, ultra-zen prompts for the key or URL if it isn't set,
 so you don't have to export anything up front.
 
+**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere`):
+BYO-key OpenAI-compatible endpoints with their own free tiers, beyond opencode
+Zen. Each needs its own personal API key — set the provider's env var or pass
+`--api-key`:
+
+| `--provider`  | Env var            | Get a key                                           |
+|---------------|---------------------|-----------------------------------------------------|
+| `groq`        | `GROQ_API_KEY`      | https://console.groq.com/keys                       |
+| `cerebras`    | `CEREBRAS_API_KEY`  | https://cloud.cerebras.ai/platform/apikeys           |
+| `huggingface` | `HF_TOKEN`          | https://huggingface.co/settings/tokens               |
+| `cohere`      | `COHERE_API_KEY`    | https://dashboard.cohere.com/api-keys                |
+
+```bash
+ultra-zen --provider groq
+ultra-zen --provider huggingface --api-key hf_xxx
+```
+
+Sourced from the community-curated free-tier list at
+[cheahjs/free-llm-api-resources](https://github.com/cheahjs/free-llm-api-resources),
+restricted to providers that actually serve `GET /models` in OpenAI's format
+(a few well-known free tiers, e.g. Gemini's OpenAI-compat layer, don't
+implement model listing and so aren't wired up here). Free-tier limits change
+often — check the provider's own dashboard if requests start getting
+rate-limited.
+
+### Session resume
+
+ultra-zen records the Claude Code session ID behind every launch, so an
+interrupted Ultracode workflow run can be reopened later instead of starting
+over:
+
+```bash
+ultra-zen sessions          # list recorded sessions for this directory
+ultra-zen resume            # reopen the newest one, replaying its launch
+ultra-zen resume latest --provider openrouter   # reopen, overriding a flag
+```
+
+On resume, ultra-zen looks up the session's newest workflow run in Claude
+Code's own transcript state, reports how many agents will replay from cache,
+and asks Claude to call `Workflow({ resumeFromRunId: ... })` as its opening
+turn — cached agents skip a model call; anything still in flight when the
+session stopped re-runs.
+
 ### Orchestrator / worker split
 
 `--worker <model>` runs two models behind one proxy. The main Claude Code loop

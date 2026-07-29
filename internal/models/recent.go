@@ -128,6 +128,12 @@ var RecommendedCombos = []Combo{
 	{Orchestrator: "deepseek-v4-flash-free", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "qwen/qwen3-coder:free", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "north-mini-code:free", Worker: "deepseek-v4-flash-free"},
+	// OpenRouter free tier — rotates daily; these two have held up well as of
+	// mid-2026 (Laguna S 2.1: 118B-A8B coding agent model; Nemotron 3 Ultra:
+	// 550B-A55B MoE, 1M context). If either falls off OpenRouter's free list,
+	// this entry just stops matching and disappears from the picker.
+	{Orchestrator: "poolside/laguna-s-2.1:free", Worker: "poolside/laguna-s-2.1:free"},
+	{Orchestrator: "nvidia/nemotron-3-ultra-550b-a55b:free", Worker: "nvidia/nemotron-3-ultra-550b-a55b:free"},
 }
 
 // SortByRecent returns list ordered with recently used models first (in MRU

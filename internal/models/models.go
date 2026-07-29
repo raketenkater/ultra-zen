@@ -16,10 +16,39 @@ import (
 
 // Base URLs for the supported providers.
 const (
-	GoBase        = "https://opencode.ai/zen/go/v1"
-	MainBase      = "https://opencode.ai/zen/v1"
-	OpenRouterBase = "https://openrouter.ai/api/v1"
+	GoBase          = "https://opencode.ai/zen/go/v1"
+	MainBase        = "https://opencode.ai/zen/v1"
+	OpenRouterBase  = "https://openrouter.ai/api/v1"
+	GroqBase        = "https://api.groq.com/openai/v1"
+	CerebrasBase    = "https://api.cerebras.ai/v1"
+	HuggingFaceBase = "https://router.huggingface.co/v1"
+	CohereBase      = "https://api.cohere.ai/compatibility/v1"
 )
+
+// FreeTierProvider describes a BYO-key OpenAI-compatible endpoint that offers
+// a free usage tier, beyond the opencode Zen gateway ultra-zen defaults to.
+// Each requires its own personal API key (there is no shared gateway key for
+// these, unlike opencode Zen), so ultra-zen reads it from --api-key or the
+// provider's own env var the same way it already does for OpenRouter.
+type FreeTierProvider struct {
+	Base    string // OpenAI-compatible base URL (must serve GET {Base}/models)
+	EnvKey  string // environment variable ultra-zen checks for a key
+	KeyHint string // where to get a key, shown in prompts/errors
+}
+
+// FreeTierProviders lists the additional free-tier providers ultra-zen can
+// pull models from via --provider <name>. Sourced from the community-curated
+// free-tier list at github.com/cheahjs/free-llm-api-resources, restricted to
+// providers that actually expose an OpenAI-compatible GET /models endpoint
+// (confirmed live; several well-known free tiers, e.g. Gemini's OpenAI-compat
+// layer, do not implement model listing and so are not usable here without a
+// hardcoded model list, which would drift out of sync silently).
+var FreeTierProviders = map[string]FreeTierProvider{
+	"groq":        {Base: GroqBase, EnvKey: "GROQ_API_KEY", KeyHint: "https://console.groq.com/keys"},
+	"cerebras":    {Base: CerebrasBase, EnvKey: "CEREBRAS_API_KEY", KeyHint: "https://cloud.cerebras.ai/platform/apikeys"},
+	"huggingface": {Base: HuggingFaceBase, EnvKey: "HF_TOKEN", KeyHint: "https://huggingface.co/settings/tokens"},
+	"cohere":      {Base: CohereBase, EnvKey: "COHERE_API_KEY", KeyHint: "https://dashboard.cohere.com/api-keys"},
+}
 
 // Model is one selectable model.
 type Model struct {
@@ -152,6 +181,28 @@ func ListCodex(httpClient *http.Client, baseURL, apiKey string) ([]Model, error)
 			Base: baseURL,
 			Free: false, // subscription-backed, not free-tier
 		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// ListFreeTier fetches the model list from a free-tier OpenAI-compatible
+// endpoint (see FreeTierProviders). Every model it advertises is treated as
+// free, since these are personal-signup free tiers rather than gateways with
+// a mix of free and paid models.
+func ListFreeTier(httpClient *http.Client, base, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	ids, err := fetchIDs(httpClient, base, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", base, err)
+	}
+	var out []Model
+	for _, id := range ids {
+		out = append(out, Model{ID: id, Name: pretty(id), Base: base, Free: true})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name

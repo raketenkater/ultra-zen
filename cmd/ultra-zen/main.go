@@ -46,6 +46,13 @@ func main() {
 		workflow.RunHook()
 		return
 	}
+	// `sessions` lists recorded resumable Claude Code sessions for this
+	// directory; `resume` reopens one, replaying the launch it was recorded
+	// under. See session.go.
+	if len(os.Args) > 1 && (os.Args[1] == "sessions" || os.Args[1] == "resume") {
+		cmdSessions(os.Args[1], os.Args[2:])
+		return
+	}
 
 	// Redirect the proxy's log output (log.Printf in internal/proxy) to a file
 	// instead of stderr. Claude Code's TUI owns stderr, so any log line written
@@ -53,17 +60,23 @@ func main() {
 	// ~/.cache/ultra-zen/proxy.log so diagnostics are still available.
 	redirectProxyLog()
 
+	// The raw invocation, before flag parsing rewrites it, is what a later
+	// `ultra-zen resume` replays to reproduce this exact launch.
+	originalArgs := stripResumeArgs(os.Args[1:])
+
 	var (
 		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
 		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex")
 		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
 		codexBaseURL  = flag.String("codex-url", "", "Codex endpoint base URL (or set CODEX_BASE_URL), e.g. http://127.0.0.1:8000/v1")
 		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
+		apiKey        = flag.String("api-key", "", "API key for --provider groq/cerebras/huggingface/cohere (or set that provider's own env var)")
 		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
+		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")
 	)
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "ultra-zen — run Claude Code on opencode Zen or OpenRouter models")
@@ -77,6 +90,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
 		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
 		fmt.Fprintln(os.Stderr, "  --provider codex         Local Codex endpoint (ChatGPT sub, e.g. ChatMock)")
+		fmt.Fprintln(os.Stderr, "  --provider groq          Groq free tier (set GROQ_API_KEY or --api-key)")
+		fmt.Fprintln(os.Stderr, "  --provider cerebras      Cerebras free tier (set CEREBRAS_API_KEY or --api-key)")
+		fmt.Fprintln(os.Stderr, "  --provider huggingface   HuggingFace Inference router (set HF_TOKEN or --api-key)")
+		fmt.Fprintln(os.Stderr, "  --provider cohere        Cohere free trial tier (set COHERE_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Orchestrator/worker split (saves quota):")
 		fmt.Fprintln(os.Stderr, "  --worker <model>         Use a cheaper model for background sub-agents")
@@ -143,6 +160,18 @@ func main() {
 		case strings.HasPrefix(arg, "--port="):
 			*port, _ = strconv.Atoi(strings.TrimPrefix(arg, "--port="))
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--resume-session" && i+1 < len(claudeArgs):
+			*resumeSession = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--resume-session="):
+			*resumeSession = strings.TrimPrefix(arg, "--resume-session=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--api-key" && i+1 < len(claudeArgs):
+			*apiKey = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--api-key="):
+			*apiKey = strings.TrimPrefix(arg, "--api-key=")
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		default:
 			i++
 		}
@@ -156,8 +185,25 @@ func main() {
 	// open a TUI prompt for a missing key rather than exiting.
 	interactive := modelID == ""
 
-	switch *provider {
-	case "openrouter":
+	switch def, isFreeTier := models.FreeTierProviders[*provider]; {
+	case isFreeTier:
+		k := *apiKey
+		if k == "" {
+			k = os.Getenv(def.EnvKey)
+		}
+		if k == "" && interactive {
+			k = tui.PromptKey(fmt.Sprintf("%s API key", *provider), "get one at "+def.KeyHint, true)
+		}
+		if k == "" {
+			die(fmt.Errorf("%s requires an API key: set %s or pass --api-key\nGet one at %s", *provider, def.EnvKey, def.KeyHint))
+		}
+		key = k
+		var err error
+		list, err = models.ListFreeTier(httpClient, def.Base, key)
+		if err != nil {
+			die(fmt.Errorf("%s: %w", *provider, err))
+		}
+	case *provider == "openrouter":
 		k := *openRouterKey
 		if k == "" {
 			k = os.Getenv("OPENROUTER_API_KEY")
@@ -174,7 +220,7 @@ func main() {
 		if err != nil {
 			die(err)
 		}
-	case "codex":
+	case *provider == "codex":
 		base := *codexBaseURL
 		if base == "" {
 			base = os.Getenv("CODEX_BASE_URL")
@@ -243,9 +289,13 @@ func main() {
 	}
 
 	if modelID == "" {
-		var workerPick string
+		var workerPick, resumeID string
 		var quit bool
-		modelID, workerPick, quit = tui.Run(list, *provider)
+		modelID, workerPick, resumeID, quit = tui.Run(list, *provider, buildResumeOption())
+		if resumeID != "" {
+			cmdSessionResume(resumeID, nil)
+			return
+		}
 		if quit || modelID == "" {
 			return
 		}
@@ -317,6 +367,26 @@ func main() {
 	}
 	args := claude.Args(selected.ID, hookBin+" workflow-hook", claudeArgs)
 
+	cacheDir := sessionCacheDir()
+	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *port, originalArgs)
+	if sessionErr != nil {
+		cancel()
+		die(fmt.Errorf("resume: %w", sessionErr))
+	}
+	sessionArgs, err := sessionClaudeArgs(sessionSpec, claudeArgs, args)
+	if err != nil {
+		cancel()
+		die(err)
+	}
+	args = sessionArgs
+	if summary := describeSessionResume(sessionSpec); summary != "" {
+		fmt.Fprintln(os.Stderr, summary)
+	}
+	// The resume instruction goes last so it becomes Claude's opening turn.
+	if prompt := sessionResumePrompt(sessionSpec); prompt != "" && sessionSpec.Resume {
+		args = append(args, prompt)
+	}
+
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		cancel()
@@ -328,12 +398,16 @@ func main() {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	runErr := cmd.Run()
+	// Record on exit as well as on launch: the workflow run ID is assigned
+	// inside Claude Code, so only now is the resume handle complete.
+	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *port, originalArgs)
+	if runErr != nil {
 		cancel()
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		die(err)
+		die(runErr)
 	}
 	cancel()
 }
