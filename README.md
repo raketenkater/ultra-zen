@@ -74,6 +74,23 @@ make build
 - **uvx** (optional) for web research — `ultra-zen` wires a no-key DuckDuckGo
   MCP in place of the Anthropic-only `WebSearch` tool.
 
+### API keys
+
+Every provider that needs a key is resolved in this order:
+
+1. **Flag / env var** — `--api-key`, `--openrouter-key`, or the provider's env
+   var (`OPENROUTER_API_KEY`, `MODELSCOPE_API_KEY`, `GROQ_API_KEY`, ...).
+2. **The stored key** — `~/.config/ultra-zen/keys/<provider>` (one file per
+   provider, mode `0600`). Use the TUI's key manager (press `k` in the
+   selector) or write the file directly.
+3. **Interactive prompt** — when running interactively with no key set, the
+   TUI asks you to paste one, then **saves it to the key store** so you only
+   enter it once.
+
+Precedence is `flag/env` → `stored` → `prompt`, so an env var always wins over
+a stored key. Clearing a stored key (empty string) makes the prompt appear
+again.
+
 ## Usage
 
 ```bash
@@ -87,12 +104,20 @@ ultra-zen --proxy-only glm-5.1               # proxy only (debugging)
 ultra-zen --port 8787 glm-5.1                # pin a port
 ultra-zen --version                          # print version
 
-# Orchestrator/worker split — smart model plans, cheap model fans out
+# Resilient cross-provider session — first route is primary
+ultra-zen --free-model openrouter:qwen/qwen3-coder:free \
+          --free-model opencode:deepseek-v4-flash-free \
+          --free-model openrouter:openrouter/free
+
+# Zen primary with a cross-provider OpenRouter escape hatch
+ultra-zen --free-model openrouter/free laguna-s-2.1-free
+
+# Legacy orchestrator/worker split
 ultra-zen glm-5.1 --worker mini-max-m2.5
 ```
 
-Flags must come **before** the model argument (standard Go flag parsing):
-`ultra-zen --port 9000 --provider openrouter`.
+Flags may come before or after the model argument. Put `--` before arguments
+that must be passed through unchanged to Claude Code.
 
 ### Backends
 
@@ -103,6 +128,15 @@ key from `auth.json`. Lists `opencode-go` tier models and `*-free` models.
 environment. Lists `:free` models, including `qwen/qwen3-coder:free`,
 `deepseek/deepseek-chat:free`, `google/gemini-2.5-flash:free`, and
 `openrouter/free` (auto-routes to the best available free model).
+
+OpenRouter currently allows **50 free-model requests per day** on a free
+account. After the account has purchased at least **$10 in credits**, that
+allowance becomes **1,000 free-model requests per day**. The credits remain
+available for paid models; this is a purchase threshold, not a requirement to
+spend $10 on free requests. See OpenRouter's current
+[rate-limit FAQ](https://openrouter.ai/docs/faq). The free tier is also limited
+to 20 requests/minute; ultra-zen therefore paces one session to 20 RPM by
+default (`--openrouter-rpm 0` disables this).
 
 **Codex / ChatGPT subscription** (`--provider codex`): points at a local
 OpenAI-compatible endpoint backed by a ChatGPT Plus/Pro login — e.g.
@@ -117,7 +151,7 @@ ultra-zen --provider codex
 When run interactively, ultra-zen prompts for the key or URL if it isn't set,
 so you don't have to export anything up front.
 
-**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere`):
+**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere|modelscope`):
 BYO-key OpenAI-compatible endpoints with their own free tiers, beyond opencode
 Zen. Each needs its own personal API key — set the provider's env var or pass
 `--api-key`:
@@ -128,11 +162,20 @@ Zen. Each needs its own personal API key — set the provider's env var or pass
 | `cerebras`    | `CEREBRAS_API_KEY`  | https://cloud.cerebras.ai/platform/apikeys           |
 | `huggingface` | `HF_TOKEN`          | https://huggingface.co/settings/tokens               |
 | `cohere`      | `COHERE_API_KEY`    | https://dashboard.cohere.com/api-keys                |
+| `modelscope`  | `MODELSCOPE_API_KEY` | https://modelscope.cn/my/apiToken                    |
 
 ```bash
 ultra-zen --provider groq
 ultra-zen --provider huggingface --api-key hf_xxx
+ultra-zen --provider modelscope                # Alibaba ModelScope free tier
 ```
+
+ModelScope's API-Inference serves open-source models (DeepSeek-V4, GLM-5.x,
+Qwen 3.5, MiniMax) free of charge, but it is a non-commercial, non-profit
+product: quotas are ~2,000 calls/day total per account with a ~500
+calls/day per-model cap, and it is meant for development and evaluation, not
+production traffic. See the [usage limits
+docs](https://modelscope.ai/docs/model-service/API-Inference/limits).
 
 Sourced from the community-curated free-tier list at
 [cheahjs/free-llm-api-resources](https://github.com/cheahjs/free-llm-api-resources),
@@ -160,7 +203,57 @@ and asks Claude to call `Workflow({ resumeFromRunId: ... })` as its opening
 turn — cached agents skip a model call; anything still in flight when the
 session stopped re-runs.
 
-### Orchestrator / worker split
+### Resilient free-model pool
+
+`--free-model <provider:model>` creates an ordered, cross-provider free-model
+pool. Use `openrouter:<id>` or `opencode:<id>`, repeat the flag, or pass a
+comma-separated list. A bare ID remains shorthand for OpenRouter. The first
+model is the primary when no positional model is supplied; otherwise the
+positional model stays primary and the `--free-model` entries are its
+fallbacks.
+
+In the interactive selector, press `f` to build the same ordered pool. Enter
+toggles a model, `r` clears the pool, and Esc returns to model selection. The
+pool remains selected if you reopen the screen; choosing it replaces a combo's
+legacy worker model for that session. Press `k` to add or change provider keys
+without leaving the selector.
+
+```bash
+# Explicit OpenRouter + opencode Zen provider pool (no positional model needed)
+ultra-zen --free-model openrouter:qwen/qwen3-coder:free \
+          --free-model opencode:deepseek-v4-flash-free \
+          --free-model openrouter:openrouter/free
+
+# Keep a Zen free model first, then leave that provider when its allocation ends
+ultra-zen --free-model openrouter:qwen/qwen3-coder:free \
+          --free-model openrouter:openrouter/free \
+          laguna-s-2.1-free
+```
+
+The pool replaces the worker/thinker split for that session: main-loop,
+background-agent, and fast-tier requests all share the same active route.
+Daily/free-allocation exhaustion is provider-wide: OpenRouter's
+`free-models-per-day` opens the circuit for every OpenRouter free route, while
+Zen's `FreeUsageLimitError` opens it for every opencode free route. The
+interrupted request is replayed immediately on the other provider, with its
+full Claude Code conversation intact. Temporary per-model `429` responses can
+still try a sibling model, honor `Retry-After` when present, and otherwise use
+exponential backoff. Once a fallback succeeds it becomes the first route for
+subsequent requests.
+
+Without an explicit pool, ultra-zen discovers both providers from credentials
+already present: `OPENROUTER_API_KEY` supplies `openrouter/free`, and the
+opencode `auth.json` supplies its live `*-free` model list. Selecting a free
+model on either provider therefore adds the other provider automatically when
+both credentials are configured, without another prompt.
+
+Model rotation cannot bypass OpenRouter's account-wide daily allowance: after
+the account's 50/1,000 free requests are consumed, every OpenRouter free model
+will reject requests, so ultra-zen switches to opencode rather than trying more
+OpenRouter models under the same exhausted account. Purchasing $10 of credits
+is the supported way to raise OpenRouter's account-wide free allowance.
+
+### Legacy orchestrator / worker split
 
 `--worker <model>` runs two models behind one proxy. The main Claude Code loop
 uses the orchestrator model; background sub-agents spawned by Ultracode
@@ -176,6 +269,9 @@ ultra-zen glm-5.1 --worker mini-max-m2.5       # go tier
 ultra-zen kimi-k3 --worker deepseek-v4-flash-free  # free worker
 ```
 
+`--worker` remains available for existing paid/cheap two-model setups, but it
+cannot be combined with an explicit `--free-model` pool.
+
 ## How it works
 
 ### Model selection
@@ -186,6 +282,10 @@ ultra-zen kimi-k3 --worker deepseek-v4-flash-free  # free worker
 - **free tier** (`https://opencode.ai/zen/v1`) — `*-free` models.
 - **OpenRouter** (`https://openrouter.ai/api/v1`) — `:free` models and
   `openrouter/free`.
+
+Free pools keep the selected primary plus ordered OpenRouter routes in the
+local proxy. The proxy rotates only on rate-limit responses; ordinary invalid
+requests still surface as errors instead of silently changing models.
 
 ### Translation proxy
 The proxy (`internal/proxy`) translates both directions:

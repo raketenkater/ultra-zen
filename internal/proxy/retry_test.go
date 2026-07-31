@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMaxTokensClamp verifies the proxy clamps oversized max_tokens before
@@ -137,6 +138,227 @@ func TestRetryOn400Halve(t *testing.T) {
 	// Third call should have halved max_tokens: 65536 / 2 = 32768.
 	if gotMax != 32768 {
 		t.Fatalf("halved retry should have max_tokens=32768: got %d", gotMax)
+	}
+}
+
+// TestFreePoolRotatesAndStays verifies the failure seen in real Zen logs:
+// FreeUsageLimitError retires that provider for this Claude Code session,
+// retries the interrupted request on the selected OpenRouter fallback, and
+// starts the next request there instead of hitting exhausted Zen again.
+func TestFreePoolRotatesAndStays(t *testing.T) {
+	var primaryCalls, fallbackCalls int
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded"}}`))
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		var req struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Model != "openrouter/free" {
+			t.Errorf("fallback model = %q, want openrouter/free", req.Model)
+		}
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer fallback.Close()
+
+	srv := New(Config{
+		BaseURL: primary.URL,
+		APIKey:  "zen-key",
+		Model:   "laguna-s-2.1-free",
+		Fallbacks: []Upstream{
+			{
+				// This sibling shares the exhausted Zen provider and must be
+				// skipped when FreeUsageLimitError opens that provider circuit.
+				BaseURL: primary.URL,
+				APIKey:  "zen-key",
+				Model:   "another-zen-free",
+			},
+			{
+				BaseURL: fallback.URL,
+				APIKey:  "or-key",
+				Model:   "openrouter/free",
+			},
+		},
+		Port: 0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status %d", i+1, resp.StatusCode)
+		}
+	}
+	if primaryCalls != 1 {
+		t.Fatalf("exhausted primary called %d times, want 1", primaryCalls)
+	}
+	if fallbackCalls != 2 {
+		t.Fatalf("fallback called %d times, want 2", fallbackCalls)
+	}
+}
+
+// TestTemporary429Retries verifies a provider throttle is retried rather than
+// returned to Claude Code (which would terminate a background subagent).
+func TestTemporary429Retries(t *testing.T) {
+	var calls int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"type":"rate_limit_error","code":"provider_rate_limit_exceeded"}}`))
+			return
+		}
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer up.Close()
+
+	srv := New(Config{
+		BaseURL:          up.URL,
+		APIKey:           "k",
+		Model:            "m",
+		Port:             0,
+		RateLimitRetries: 1,
+		RateLimitBackoff: time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+		`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 after retry", resp.StatusCode)
+	}
+	if calls != 2 {
+		t.Fatalf("upstream calls = %d, want 2", calls)
+	}
+}
+
+// TestOpenRouterDailyLimitStopsPool verifies an account-wide daily quota error
+// does not burn another failed attempt on each selected OpenRouter model.
+func TestOpenRouterDailyLimitStopsPool(t *testing.T) {
+	var primaryCalls, fallbackCalls int
+	openRouter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "vendor/a:free" {
+			primaryCalls++
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429}}`))
+			return
+		}
+		fallbackCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"should not run"},"finish_reason":"stop"}]}`))
+	}))
+	defer openRouter.Close()
+
+	srv := New(Config{
+		BaseURL: openRouter.URL,
+		APIKey:  "same-openrouter-key",
+		Model:   "vendor/a:free",
+		Fallbacks: []Upstream{{
+			BaseURL: openRouter.URL,
+			APIKey:  "same-openrouter-key",
+			Model:   "vendor/b:free",
+		}},
+		Port: 0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("request %d: status %d, want 429", i+1, resp.StatusCode)
+		}
+	}
+	if primaryCalls != 1 {
+		t.Fatalf("daily-limit primary called %d times, want 1", primaryCalls)
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("fallback called %d times after account-wide exhaustion, want 0", fallbackCalls)
+	}
+}
+
+// TestDailyLimitSwitchesProvider verifies the intended provider boundary: an
+// OpenRouter daily-limit response skips every sibling OpenRouter route and
+// replays the request on Zen, which remains the active provider afterward.
+func TestDailyLimitSwitchesProvider(t *testing.T) {
+	var openRouterCalls, zenCalls int
+	openRouter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		openRouterCalls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","code":429}}`))
+	}))
+	defer openRouter.Close()
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		zenCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer zen.Close()
+
+	srv := New(Config{
+		BaseURL: openRouter.URL,
+		APIKey:  "or-key",
+		Model:   "vendor/a:free",
+		Fallbacks: []Upstream{
+			{BaseURL: openRouter.URL, APIKey: "or-key", Model: "vendor/b:free"},
+			{BaseURL: zen.URL, APIKey: "zen-key", Model: "zen-model-free"},
+		},
+		Port: 0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status %d, want 200", i+1, resp.StatusCode)
+		}
+	}
+	if openRouterCalls != 1 {
+		t.Fatalf("OpenRouter called %d times, want 1", openRouterCalls)
+	}
+	if zenCalls != 2 {
+		t.Fatalf("Zen called %d times, want 2", zenCalls)
 	}
 }
 

@@ -9,9 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/raketenkater/ultra-zen/internal/keys"
 )
 
 // Base URLs for the supported providers.
@@ -23,6 +26,7 @@ const (
 	CerebrasBase    = "https://api.cerebras.ai/v1"
 	HuggingFaceBase = "https://router.huggingface.co/v1"
 	CohereBase      = "https://api.cohere.ai/compatibility/v1"
+	ModelScopeBase  = "https://api-inference.modelscope.cn/v1"
 )
 
 // FreeTierProvider describes a BYO-key OpenAI-compatible endpoint that offers
@@ -48,6 +52,40 @@ var FreeTierProviders = map[string]FreeTierProvider{
 	"cerebras":    {Base: CerebrasBase, EnvKey: "CEREBRAS_API_KEY", KeyHint: "https://cloud.cerebras.ai/platform/apikeys"},
 	"huggingface": {Base: HuggingFaceBase, EnvKey: "HF_TOKEN", KeyHint: "https://huggingface.co/settings/tokens"},
 	"cohere":      {Base: CohereBase, EnvKey: "COHERE_API_KEY", KeyHint: "https://dashboard.cohere.com/api-keys"},
+	"modelscope":  {Base: ModelScopeBase, EnvKey: "MODELSCOPE_API_KEY", KeyHint: "https://modelscope.cn/my/apiToken"},
+}
+
+// ProviderKey resolves the API key ultra-zen uses for a free-pool provider,
+// in the same precedence main.go applies for the primary provider:
+// explicit flag > env var > persistent key store. flagKey is the caller's
+// already-resolved value for the shared --api-key / --openrouter-key flag;
+// zenKey is the already-resolved opencode-go key (from opencode auth.json).
+// Returns "" when no key is available.
+func ProviderKey(provider, flagKey, zenKey string) string {
+	switch provider {
+	case "openrouter":
+		if flagKey != "" {
+			return flagKey
+		}
+		if os.Getenv("OPENROUTER_API_KEY") != "" {
+			return os.Getenv("OPENROUTER_API_KEY")
+		}
+		return keys.Load("openrouter")
+	case "opencode-go":
+		if zenKey != "" {
+			return zenKey
+		}
+		return keys.Load("opencode-go")
+	default:
+		// BYO-key free-tier provider (modelscope/groq/cerebras/huggingface/cohere).
+		if flagKey != "" {
+			return flagKey
+		}
+		if def, ok := FreeTierProviders[provider]; ok && os.Getenv(def.EnvKey) != "" {
+			return os.Getenv(def.EnvKey)
+		}
+		return keys.Load(provider)
+	}
 }
 
 // Model is one selectable model.
@@ -91,6 +129,27 @@ func List(httpClient *http.Client, apiKey string) ([]Model, error) {
 		}
 		return out[i].Name < out[j].Name
 	})
+	return out, nil
+}
+
+// ListZenFree fetches only opencode's main free tier. It is used when Zen is
+// an alternate provider for an OpenRouter-first session, so an unavailable or
+// unfunded opencode-go endpoint cannot hide otherwise usable *-free models.
+func ListZenFree(httpClient *http.Client, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	ids, err := fetchIDs(httpClient, MainBase, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("main free tier: %w", err)
+	}
+	var out []Model
+	for _, id := range ids {
+		if strings.HasSuffix(id, "-free") {
+			out = append(out, Model{ID: id, Name: pretty(id), Base: MainBase, Free: true})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 

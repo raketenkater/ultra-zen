@@ -134,6 +134,10 @@ var RecommendedCombos = []Combo{
 	// this entry just stops matching and disappears from the picker.
 	{Orchestrator: "poolside/laguna-s-2.1:free", Worker: "poolside/laguna-s-2.1:free"},
 	{Orchestrator: "nvidia/nemotron-3-ultra-550b-a55b:free", Worker: "nvidia/nemotron-3-ultra-550b-a55b:free"},
+	// ModelScope API-Inference free tier — near-frontier open models, ~2,000
+	// calls/day total, ~500/model/day. Shown only when --provider modelscope.
+	{Orchestrator: "deepseek-ai/DeepSeek-V4-Pro", Worker: "deepseek-ai/DeepSeek-V4-Flash"},
+	{Orchestrator: "ZhipuAI/GLM-5.2", Worker: "deepseek-ai/DeepSeek-V4-Flash"},
 }
 
 // SortByRecent returns list ordered with recently used models first (in MRU

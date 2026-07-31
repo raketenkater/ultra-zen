@@ -29,6 +29,7 @@ import (
 
 	"github.com/raketenkater/ultra-zen/internal/auth"
 	"github.com/raketenkater/ultra-zen/internal/claude"
+	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/proxy"
 	"github.com/raketenkater/ultra-zen/internal/tui"
@@ -37,6 +38,72 @@ import (
 
 // Version is set at build time via -ldflags. Falls back to "dev" in local builds.
 var Version = "dev"
+
+// modelFlag is a repeatable, comma-friendly model list. Keeping each selected
+// model explicit makes a free pool deterministic while still allowing the
+// convenient `--free-model a,b,c` spelling.
+type modelFlag []string
+
+func (f *modelFlag) String() string { return strings.Join(*f, ",") }
+
+func (f *modelFlag) Set(value string) error {
+	for _, id := range strings.Split(value, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			*f = append(*f, id)
+		}
+	}
+	return nil
+}
+
+// splitFreeModelSpec accepts provider-qualified free routes while keeping bare
+// OpenRouter model IDs backward compatible. The BYO-key providers
+// (modelscope/groq/cerebras/huggingface/cohere) mirror models.FreeTierProviders;
+// codex is recognized but its models are subscription-backed (Free:false) and
+// are rejected by addRoute. Examples:
+//
+//	opencode:deepseek-v4-flash-free
+//	openrouter:qwen/qwen3-coder:free
+//	modelscope:deepseek-ai/DeepSeek-V4-Flash
+//	openrouter/free
+func splitFreeModelSpec(value string) (provider, model string, err error) {
+	value = strings.TrimSpace(value)
+	switch {
+	case strings.HasPrefix(value, "opencode:"):
+		provider, model = "opencode-go", strings.TrimPrefix(value, "opencode:")
+	case strings.HasPrefix(value, "opencode-go:"):
+		provider, model = "opencode-go", strings.TrimPrefix(value, "opencode-go:")
+	case strings.HasPrefix(value, "openrouter:"):
+		provider, model = "openrouter", strings.TrimPrefix(value, "openrouter:")
+	case strings.HasPrefix(value, "modelscope:"):
+		provider, model = "modelscope", strings.TrimPrefix(value, "modelscope:")
+	case strings.HasPrefix(value, "groq:"):
+		provider, model = "groq", strings.TrimPrefix(value, "groq:")
+	case strings.HasPrefix(value, "cerebras:"):
+		provider, model = "cerebras", strings.TrimPrefix(value, "cerebras:")
+	case strings.HasPrefix(value, "huggingface:"):
+		provider, model = "huggingface", strings.TrimPrefix(value, "huggingface:")
+	case strings.HasPrefix(value, "cohere:"):
+		provider, model = "cohere", strings.TrimPrefix(value, "cohere:")
+	case strings.HasPrefix(value, "codex:"):
+		provider, model = "codex", strings.TrimPrefix(value, "codex:")
+	default:
+		provider, model = "openrouter", value
+	}
+	if strings.TrimSpace(model) == "" {
+		return "", "", fmt.Errorf("free model specification %q has no model id", value)
+	}
+	return provider, model, nil
+}
+
+func freeTierModels(list []models.Model) []models.Model {
+	free := make([]models.Model, 0, len(list))
+	for _, model := range list {
+		if model.Free {
+			free = append(free, model)
+		}
+	}
+	return models.SortByRecent(free, models.LoadRecent())
+}
 
 func main() {
 	// Subcommand dispatch (before flag parsing, which would choke on the
@@ -53,6 +120,11 @@ func main() {
 		cmdSessions(os.Args[1], os.Args[2:])
 		return
 	}
+	// `keys` manages the persistent API-key store without the TUI. See keys.go.
+	if len(os.Args) > 1 && os.Args[1] == "keys" {
+		cmdKeys(os.Args[2:])
+		return
+	}
 
 	// Redirect the proxy's log output (log.Printf in internal/proxy) to a file
 	// instead of stderr. Claude Code's TUI owns stderr, so any log line written
@@ -64,6 +136,7 @@ func main() {
 	// `ultra-zen resume` replays to reproduce this exact launch.
 	originalArgs := stripResumeArgs(os.Args[1:])
 
+	var freeModels modelFlag
 	var (
 		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
 		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex")
@@ -72,12 +145,14 @@ func main() {
 		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
 		apiKey        = flag.String("api-key", "", "API key for --provider groq/cerebras/huggingface/cohere (or set that provider's own env var)")
 		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
+		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
 		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")
 	)
+	flag.Var(&freeModels, "free-model", "free fallback as [openrouter:|opencode:]model; repeat or comma-separate (replaces --worker)")
 	flag.Usage = func() {
 		fmt.Fprintln(os.Stderr, "ultra-zen — run Claude Code on opencode Zen or OpenRouter models")
 		fmt.Fprintln(os.Stderr, "")
@@ -94,13 +169,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, "  --provider cerebras      Cerebras free tier (set CEREBRAS_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider huggingface   HuggingFace Inference router (set HF_TOKEN or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider cohere        Cohere free trial tier (set COHERE_API_KEY or --api-key)")
+		fmt.Fprintln(os.Stderr, "  --provider modelscope    ModelScope API-Inference free tier (set MODELSCOPE_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Orchestrator/worker split (saves quota):")
+		fmt.Fprintln(os.Stderr, "Resilient free-model pool (recommended for free sessions):")
+		fmt.Fprintln(os.Stderr, "  --free-model <route>     Add [openrouter:|opencode:]model fallback (repeatable)")
+		fmt.Fprintln(os.Stderr, "  --openrouter-rpm <n>     Pace shared OpenRouter traffic (default 20)")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Legacy orchestrator/worker split:")
 		fmt.Fprintln(os.Stderr, "  --worker <model>         Use a cheaper model for background sub-agents")
 		fmt.Fprintln(os.Stderr, "")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	cliWorkerRequested := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "worker" {
+			cliWorkerRequested = true
+		}
+	})
 
 	if *showVer {
 		fmt.Printf("ultra-zen %s\n", Version)
@@ -132,9 +218,32 @@ func main() {
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		case arg == "--worker" && i+1 < len(claudeArgs):
 			*workerModel = claudeArgs[i+1]
+			cliWorkerRequested = true
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
 		case strings.HasPrefix(arg, "--worker="):
 			*workerModel = strings.TrimPrefix(arg, "--worker=")
+			cliWorkerRequested = true
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--free-model" && i+1 < len(claudeArgs):
+			_ = freeModels.Set(claudeArgs[i+1])
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--free-model="):
+			_ = freeModels.Set(strings.TrimPrefix(arg, "--free-model="))
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--openrouter-rpm" && i+1 < len(claudeArgs):
+			value, err := strconv.Atoi(claudeArgs[i+1])
+			if err != nil {
+				die(fmt.Errorf("invalid --openrouter-rpm %q", claudeArgs[i+1]))
+			}
+			*openRouterRPM = value
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--openrouter-rpm="):
+			raw := strings.TrimPrefix(arg, "--openrouter-rpm=")
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				die(fmt.Errorf("invalid --openrouter-rpm %q", raw))
+			}
+			*openRouterRPM = value
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		case arg == "--openrouter-key" && i+1 < len(claudeArgs):
 			*openRouterKey = claudeArgs[i+1]
@@ -177,6 +286,22 @@ func main() {
 		}
 	}
 
+	freePoolRequested := len(freeModels) > 0
+	// A free pool can be the complete launch specification: the first model is
+	// the primary and the remainder are ordered fallbacks on OpenRouter.
+	if modelID == "" && freePoolRequested {
+		poolProvider, poolModel, err := splitFreeModelSpec(freeModels[0])
+		if err != nil {
+			die(err)
+		}
+		*provider = poolProvider
+		modelID = poolModel
+		freeModels = freeModels[1:]
+	}
+	if *openRouterRPM < 0 {
+		die(fmt.Errorf("--openrouter-rpm must be zero or greater"))
+	}
+
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	var list []models.Model
 	var key string
@@ -191,8 +316,14 @@ func main() {
 		if k == "" {
 			k = os.Getenv(def.EnvKey)
 		}
+		if k == "" {
+			k = keys.Load(*provider)
+		}
 		if k == "" && interactive {
 			k = tui.PromptKey(fmt.Sprintf("%s API key", *provider), "get one at "+def.KeyHint, true)
+			if k != "" {
+				_ = keys.Save(*provider, k) // remember for next time
+			}
 		}
 		if k == "" {
 			die(fmt.Errorf("%s requires an API key: set %s or pass --api-key\nGet one at %s", *provider, def.EnvKey, def.KeyHint))
@@ -208,8 +339,14 @@ func main() {
 		if k == "" {
 			k = os.Getenv("OPENROUTER_API_KEY")
 		}
+		if k == "" {
+			k = keys.Load("openrouter")
+		}
 		if k == "" && interactive {
 			k = tui.PromptKey("OpenRouter API key", "get one at https://openrouter.ai/keys", true)
+			if k != "" {
+				_ = keys.Save("openrouter", k) // remember for next time
+			}
 		}
 		if k == "" {
 			die(fmt.Errorf("OpenRouter requires an API key: set OPENROUTER_API_KEY or pass --openrouter-key\nGet one at https://openrouter.ai/keys"))
@@ -244,7 +381,17 @@ func main() {
 		if err != nil {
 			die(fmt.Errorf("codex: %w", err))
 		}
-	default:
+	case *provider == "opencode-go":
+		storedKey := keys.Load("opencode-go")
+		if storedKey != "" {
+			key = storedKey
+			var err error
+			list, err = models.List(httpClient, key)
+			if err != nil {
+				die(err)
+			}
+			break
+		}
 		store, err := auth.Load(*authPath)
 		if err != nil {
 			// opencode auth is missing. In interactive mode, offer OpenRouter
@@ -255,6 +402,7 @@ func main() {
 				if k != "" {
 					*provider = "openrouter"
 					key = k
+					_ = keys.Save("openrouter", k) // remember for next time
 					list, err = models.ListOpenRouter(httpClient, key)
 					if err != nil {
 						die(err)
@@ -272,6 +420,8 @@ func main() {
 		if err != nil {
 			die(err)
 		}
+	default:
+		die(fmt.Errorf("unknown provider %q", *provider))
 	}
 	if len(list) == 0 {
 		die(fmt.Errorf("no models available for provider %q", *provider))
@@ -288,10 +438,13 @@ func main() {
 		return
 	}
 
+	var tuiFreePool []tui.FreeRoute
 	if modelID == "" {
 		var workerPick, resumeID string
 		var quit bool
-		modelID, workerPick, resumeID, quit = tui.Run(list, *provider, buildResumeOption())
+		res := tui.Run(list, *provider, buildResumeOption())
+		modelID, workerPick, resumeID, quit = res.Choice, res.Worker, res.ResumeSessionID, res.Quit
+		tuiFreePool = res.FreePool
 		if resumeID != "" {
 			cmdSessionResume(resumeID, nil)
 			return
@@ -300,9 +453,20 @@ func main() {
 			return
 		}
 		// CLI --worker flag overrides TUI pick; TUI pick fills the default.
-		if *workerModel == "" && workerPick != "" {
+		if *workerModel == "" && workerPick != "" && !freePoolRequested {
 			*workerModel = workerPick
 		}
+	}
+	// A TUI-configured pool (from the 'f' screen) is folded into freeModels when
+	// no --free-model flags were given (explicit CLI flags win, most explicit).
+	if !freePoolRequested && !cliWorkerRequested && len(tuiFreePool) > 0 {
+		for _, route := range tuiFreePool {
+			_ = freeModels.Set(route.String())
+		}
+		freePoolRequested = true
+		// The fallback pool is the TUI replacement for the legacy combo worker.
+		// A combo selected after configuring the pool must not re-enable both.
+		*workerModel = ""
 	}
 	selected := models.Find(list, modelID)
 	if selected == nil {
@@ -311,22 +475,226 @@ func main() {
 	models.RecordRecent(selected.ID)
 	models.RecordCombo(selected.ID, *workerModel)
 
+	// Build a provider-aware free pool. Permanent daily/free-allocation limits
+	// switch providers (OpenRouter <-> opencode Zen), while temporary throttles
+	// may still try another model within the active provider.
+	explicitFreePool := freePoolRequested
+	if explicitFreePool && *workerModel != "" {
+		die(fmt.Errorf("--free-model replaces the orchestrator/worker split and cannot be combined with --worker"))
+	}
+
+	var fallbackRoutes []proxy.Upstream
+	var openRouterList []models.Model
+	openRouterPoolKey := *openRouterKey
+	if openRouterPoolKey == "" {
+		openRouterPoolKey = os.Getenv("OPENROUTER_API_KEY")
+	}
+	if openRouterPoolKey == "" {
+		openRouterPoolKey = keys.Load("openrouter")
+	}
+	openRouterLoaded := false
+	if *provider == "openrouter" {
+		openRouterPoolKey, openRouterList, openRouterLoaded = key, list, true
+	}
+	ensureOpenRouter := func(prompt bool) error {
+		if openRouterLoaded {
+			return nil
+		}
+		if openRouterPoolKey == "" && prompt && interactive {
+			openRouterPoolKey = tui.PromptKey("OpenRouter API key for the free pool", "get one at https://openrouter.ai/keys", true)
+			if openRouterPoolKey != "" {
+				_ = keys.Save("openrouter", openRouterPoolKey) // remember for next time
+			}
+		}
+		if openRouterPoolKey == "" {
+			return fmt.Errorf("set OPENROUTER_API_KEY or pass --openrouter-key")
+		}
+		var err error
+		openRouterList, err = models.ListOpenRouter(httpClient, openRouterPoolKey)
+		if err != nil {
+			return err
+		}
+		openRouterLoaded = true
+		return nil
+	}
+
+	// ensureFreeTier lazily loads the free-model list for a BYO-key free-tier
+	// provider (modelscope/groq/cerebras/huggingface/cohere). Caches per
+	// provider. Requires the key to already exist (flag/env/keys store) — no
+	// interactive prompt, because a TUI-configured pool already implies the user
+	// saw a key prompt in the picker.
+	freeTierLists := map[string][]models.Model{}
+	freeTierKeys := map[string]string{}
+	ensureFreeTier := func(p string) error {
+		if _, ok := freeTierLists[p]; ok {
+			return nil
+		}
+		def, ok := models.FreeTierProviders[p]
+		if !ok {
+			return fmt.Errorf("unknown free-tier provider %q", p)
+		}
+		k := ""
+		if p == *provider {
+			k = key
+		} else {
+			k = models.ProviderKey(p, "", "")
+		}
+		if k == "" {
+			return fmt.Errorf("no key for %s; set %s or --api-key", p, def.EnvKey)
+		}
+		freeTierKeys[p] = k
+		list, err := models.ListFreeTier(httpClient, def.Base, k)
+		if err != nil {
+			return err
+		}
+		freeTierLists[p] = list
+		return nil
+	}
+
+	var zenList []models.Model
+	var zenPoolKey string
+	zenLoaded := false
+	if *provider == "opencode-go" {
+		zenPoolKey, zenList, zenLoaded = key, list, true
+	}
+	ensureZen := func() error {
+		if zenLoaded {
+			return nil
+		}
+		zenPoolKey = keys.Load("opencode-go")
+		if zenPoolKey != "" {
+			var err error
+			zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+			if err != nil {
+				return err
+			}
+			zenLoaded = true
+			return nil
+		}
+		store, err := auth.Load(*authPath)
+		if err != nil {
+			return err
+		}
+		zenPoolKey, err = auth.KeyFor(store, "opencode-go")
+		if err != nil {
+			return err
+		}
+		zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+		if err != nil {
+			return err
+		}
+		zenLoaded = true
+		return nil
+	}
+
+	seenRoutes := map[string]bool{selected.Base + "\x00" + selected.ID: true}
+	addRoute := func(model *models.Model, routeKey string) {
+		if model == nil || !model.Free {
+			return
+		}
+		key := model.Base + "\x00" + model.ID
+		if seenRoutes[key] {
+			return
+		}
+		seenRoutes[key] = true
+		fallbackRoutes = append(fallbackRoutes, proxy.Upstream{
+			BaseURL: model.Base,
+			APIKey:  routeKey,
+			Model:   model.ID,
+		})
+	}
+
+	// With no explicit remainder (including a one-model --free-model launch),
+	// discover both providers from credentials already present on the machine.
+	// No extra credential prompt is introduced for an automatic alternate.
+	automaticPool := !explicitFreePool || len(freeModels) == 0
+	if automaticPool && *workerModel == "" && selected.Free {
+		if selected.Base == models.OpenRouterBase {
+			if err := ensureOpenRouter(false); err == nil && selected.ID != "openrouter/free" {
+				addRoute(models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+			}
+			if err := ensureZen(); err == nil {
+				free := freeTierModels(zenList)
+				for i := range free {
+					addRoute(&free[i], zenPoolKey)
+				}
+			}
+		} else {
+			if err := ensureZen(); err == nil {
+				free := freeTierModels(zenList)
+				for i := range free {
+					addRoute(&free[i], zenPoolKey)
+				}
+			}
+			if err := ensureOpenRouter(false); err == nil {
+				addRoute(models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+			}
+		}
+	} else if explicitFreePool {
+		for _, raw := range freeModels {
+			poolProvider, id, err := splitFreeModelSpec(raw)
+			if err != nil {
+				die(err)
+			}
+			switch poolProvider {
+			case "openrouter":
+				if err := ensureOpenRouter(true); err != nil {
+					die(fmt.Errorf("load OpenRouter free fallback %q: %w", id, err))
+				}
+				fallback := models.Find(openRouterList, id)
+				if fallback == nil || !fallback.Free {
+					die(fmt.Errorf("OpenRouter free fallback %q not found; run `ultra-zen --list --provider openrouter`", id))
+				}
+				addRoute(fallback, openRouterPoolKey)
+			case "opencode-go":
+				if err := ensureZen(); err != nil {
+					die(fmt.Errorf("load opencode Zen free fallback %q: %w", id, err))
+				}
+				fallback := models.Find(zenList, id)
+				if fallback == nil || !fallback.Free {
+					die(fmt.Errorf("opencode Zen free fallback %q not found; run `ultra-zen --list`", id))
+				}
+				addRoute(fallback, zenPoolKey)
+			case "modelscope", "groq", "cerebras", "huggingface", "cohere":
+				if err := ensureFreeTier(poolProvider); err != nil {
+					die(fmt.Errorf("load %s free fallback %q: %w", poolProvider, id, err))
+				}
+				fallback := models.Find(freeTierLists[poolProvider], id)
+				if fallback == nil || !fallback.Free {
+					die(fmt.Errorf("%s free fallback %q not found; run `ultra-zen --list --provider %s`", poolProvider, id, poolProvider))
+				}
+				addRoute(fallback, freeTierKeys[poolProvider])
+			case "codex":
+				die(fmt.Errorf("codex model %q cannot be used as a free fallback; codex endpoints are subscription-backed", id))
+			default:
+				die(fmt.Errorf("unknown free fallback provider %q", poolProvider))
+			}
+		}
+	}
+
 	// Build the model list for /v1/models (Claude Code's /model command).
 	modelInfos := make([]proxy.ModelInfo, 0, len(list))
 	for _, m := range list {
 		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name})
+	}
+	for _, route := range fallbackRoutes {
+		if models.Find(list, route.Model) == nil {
+			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: route.Model})
+		}
 	}
 
 	// Start the proxy.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := proxy.New(proxy.Config{
-		BaseURL:     selected.Base,
-		APIKey:      key,
-		Model:       selected.ID,
-		WorkerModel: *workerModel,
-		Port:        *port,
-		Models:      modelInfos,
+		BaseURL:       selected.Base,
+		APIKey:        key,
+		Model:         selected.ID,
+		WorkerModel:   *workerModel,
+		Fallbacks:     fallbackRoutes,
+		OpenRouterRPM: *openRouterRPM,
+		Port:          *port,
+		Models:        modelInfos,
 	})
 	if err := srv.Start(ctx); err != nil {
 		die(fmt.Errorf("start proxy: %w", err))
@@ -345,6 +713,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "\n  ultra-zen ▸ %s  (%s)\n", selected.ID, selected.Base)
 	if *workerModel != "" {
 		fmt.Fprintf(os.Stderr, "  worker    ▸ %s\n", *workerModel)
+	}
+	for i, fallback := range fallbackRoutes {
+		fmt.Fprintf(os.Stderr, "  fallback %d ▸ %s  (%s)\n", i+1, fallback.Model, fallback.BaseURL)
 	}
 	fmt.Fprintf(os.Stderr, "  proxy on %s  →  claude\n\n", srv.BaseURL())
 

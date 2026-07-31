@@ -36,12 +36,31 @@ func (i modelItem) Title() string {
 	return t
 }
 
-var baseOpenRouter = "https://openrouter.ai/api/v1"
+var (
+	baseOpenRouter  = "https://openrouter.ai/api/v1"
+	baseModelScope  = "https://api-inference.modelscope.cn/v1"
+	baseGroq        = "https://api.groq.com/openai/v1"
+	baseCerebras    = "https://api.cerebras.ai/v1"
+	baseHuggingFace = "https://router.huggingface.co/v1"
+	baseCohere      = "https://api.cohere.ai/compatibility/v1"
+)
 
 func (i modelItem) Description() string {
-	switch {
-	case i.m.Base == baseOpenRouter:
+	switch i.m.Base {
+	case baseOpenRouter:
 		return "OpenRouter free"
+	case baseModelScope:
+		return "ModelScope free"
+	case baseGroq:
+		return "Groq free"
+	case baseCerebras:
+		return "Cerebras free"
+	case baseHuggingFace:
+		return "HuggingFace free"
+	case baseCohere:
+		return "Cohere free"
+	}
+	switch {
 	case i.m.Free:
 		return "zen free tier"
 	default:
@@ -104,6 +123,8 @@ const (
 	stepCombo step = iota
 	stepOrchestrator
 	stepWorker
+	stepKeys
+	stepFallbacks
 )
 
 type model struct {
@@ -116,6 +137,10 @@ type model struct {
 	subtitle  string
 	step      step
 	hasCombos bool
+	keys      *keyManager      // non-nil while the key manager screen is open
+	fallbacks *fallbackManager // non-nil while the fallback pool screen is open
+	freePool  []FreeRoute      // configured rotation pool (nil = auto-discover)
+	prevStep  step             // step to restore when a sub-screen closes
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -135,6 +160,29 @@ func (m *model) enterWorkerStep() {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// While the key manager is open, it owns all input.
+	if m.keys != nil {
+		km, cmd := m.keys.Update(msg)
+		m.keys = km.(*keyManager)
+		if m.keys.done {
+			m.quit = m.quit || m.keys.quit
+			m.keys = nil
+			m.step = m.prevStep // return to the picker screen
+		}
+		return m, cmd
+	}
+	// While the fallback pool screen is open, it owns all input.
+	if m.fallbacks != nil {
+		fm, cmd := m.fallbacks.Update(msg)
+		m.fallbacks = fm.(*fallbackManager)
+		if m.fallbacks.done {
+			m.freePool = m.fallbacks.routes()
+			m.quit = m.quit || m.fallbacks.quit
+			m.fallbacks = nil
+			m.step = m.prevStep
+		}
+		return m, cmd
+	}
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.list.SetWidth(msg.Width - 4)
@@ -142,6 +190,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
+		case "k":
+			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker {
+				km := newKeyManager()
+				m.keys = &km
+				m.prevStep = m.step
+				m.step = stepKeys
+				return m, nil
+			}
+		case "f":
+			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker {
+				fm := newFallbackManager(m.choice, m.freePool)
+				m.fallbacks = &fm
+				m.prevStep = m.step
+				m.step = stepFallbacks
+				return m, m.fallbacks.Init() // kick off async provider fetches
+			}
 		case "ctrl+c":
 			m.quit = true
 			return m, tea.Quit
@@ -192,16 +256,33 @@ func (m model) View() string {
 	case stepCombo:
 		b += subtitleStyle.Render("  "+m.subtitle+" — pick a combo, or choose manually") + "\n\n"
 		b += m.list.View() + "\n"
-		b += mutedStyle.Render("  / filter · Enter select · Ctrl+C quit")
+		b += mutedStyle.Render("  / filter · Enter select · k keys · f pool · Ctrl+C quit")
 	case stepOrchestrator:
 		b += subtitleStyle.Render("  "+m.subtitle+" — pick orchestrator (main model)") + "\n\n"
 		b += m.list.View() + "\n"
-		b += mutedStyle.Render("  / filter · Enter select · Ctrl+C quit")
+		b += mutedStyle.Render("  / filter · Enter select · k keys · f pool · Ctrl+C quit")
 	case stepWorker:
 		b += subtitleStyle.Render("  orchestrator: "+m.choice) + "\n"
 		b += subtitleStyle.Render("  pick worker for sub-agents (Esc to skip)") + "\n\n"
 		b += m.list.View() + "\n"
-		b += mutedStyle.Render("  / filter · Enter select · Esc skip · Ctrl+C quit")
+		b += mutedStyle.Render("  / filter · Enter select · Esc skip · k keys · f pool · Ctrl+C quit")
+	case stepKeys:
+		if m.keys != nil {
+			return m.keys.View()
+		}
+		// Fall through to a safe default if the manager is closed but the
+		// step wasn't restored (shouldn't happen — see Update).
+		b += subtitleStyle.Render("  "+m.subtitle) + "\n\n"
+		b += m.list.View() + "\n"
+		return b
+	case stepFallbacks:
+		if m.fallbacks != nil {
+			return m.fallbacks.View()
+		}
+		// Fall through to a safe default (shouldn't happen — see Update).
+		b += subtitleStyle.Render("  "+m.subtitle) + "\n\n"
+		b += m.list.View() + "\n"
+		return b
 	}
 	return b
 }
@@ -261,21 +342,36 @@ func providerSubtitle(provider string) string {
 		return "OpenRouter"
 	case "codex":
 		return "Codex endpoint"
+	case "groq", "cerebras", "huggingface", "cohere", "modelscope":
+		return provider
 	default:
 		return "opencode Zen"
 	}
 }
 
-// Run shows the selector and returns (orchestrator, worker, resumeSessionID,
-// quit). The first screen lists combos; picking one returns immediately.
-// "Pick manually" leads to orchestrator then optional worker selection.
-// worker is "" if none chosen.
+// Result is what the selector returns to the caller. Choice is the selected
+// model id ("" when quitting/resuming/error). Worker is the chosen worker
+// model id ("" if skipped). ResumeSessionID is non-empty when the user picked
+// a resume row. Quit is true when the user Ctrl+C'd. FreePool holds any
+// rotation pool configured via the 'f' screen (nil = auto-discover).
+type Result struct {
+	Choice          string
+	Worker          string
+	ResumeSessionID string
+	Quit            bool
+	FreePool        []FreeRoute
+}
+
+// Run shows the selector and returns the user's choices. The first screen
+// lists combos; picking one returns immediately. "Pick manually" leads to
+// orchestrator then optional worker selection. The 'f' screen configures the
+// free-model rotation pool.
 //
 // If resume is non-nil, it is shown as an extra row on the opening screen
-// only; choosing it sets resumeSessionID and returns immediately with an
-// empty choice, so the caller can reopen that session instead of launching a
+// only; choosing it sets ResumeSessionID and returns immediately with an
+// empty Choice, so the caller can reopen that session instead of launching a
 // fresh one.
-func Run(ms []models.Model, provider string, resume *ResumeOption) (choice, worker, resumeSessionID string, quit bool) {
+func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
 	comboItems := buildComboItems(ms)
 	// If the only combo item is the manual fall-through, skip straight to
 	// manual selection — there are no combos worth showing.
@@ -306,17 +402,17 @@ func Run(ms []models.Model, provider string, resume *ResumeOption) (choice, work
 	})
 	res, err := p.Run()
 	if err != nil {
-		return "", "", "", false
+		return Result{}
 	}
 	mm, ok := res.(model)
 	if !ok {
-		return "", "", "", false
+		return Result{}
 	}
 	if mm.resumeID != "" {
-		return "", "", mm.resumeID, false
+		return Result{ResumeSessionID: mm.resumeID, FreePool: mm.freePool}
 	}
 	if mm.quit || mm.choice == "" {
-		return "", "", "", mm.quit
+		return Result{Quit: mm.quit, FreePool: mm.freePool}
 	}
-	return mm.choice, mm.worker, "", false
+	return Result{Choice: mm.choice, Worker: mm.worker, FreePool: mm.freePool}
 }

@@ -10,18 +10,34 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Config holds the gateway target and credentials for the proxy.
 type Config struct {
-	BaseURL     string // e.g. https://opencode.ai/zen/go/v1
-	APIKey      string
-	Model       string // the Zen model id to forward orchestrator requests to
-	WorkerModel string // if set, background sub-agents use this cheaper model
-	Port        int    // local listen port
-	Models      []ModelInfo // full model list advertised at /v1/models
+	BaseURL          string // e.g. https://opencode.ai/zen/go/v1
+	APIKey           string
+	Model            string        // the Zen model id to forward orchestrator requests to
+	WorkerModel      string        // if set, background sub-agents use this cheaper model
+	Fallbacks        []Upstream    // ordered free-model fallbacks; replaces worker routing when set
+	OpenRouterRPM    int           // session-wide request pace for OpenRouter free models
+	RateLimitRetries int           // full-pool retries after temporary 429s; zero uses the default
+	RateLimitBackoff time.Duration // initial temporary-429 backoff; zero uses the default
+	Port             int           // local listen port
+	Models           []ModelInfo   // full model list advertised at /v1/models
+}
+
+// Upstream identifies one model and the endpoint/key that serves it. Fallbacks
+// may live on a different gateway from the primary model, which lets a Zen free
+// model rotate to an explicitly selected OpenRouter free model without
+// restarting Claude Code.
+type Upstream struct {
+	BaseURL string
+	APIKey  string
+	Model   string
 }
 
 // ModelInfo is a minimal model entry for /v1/models advertising.
@@ -41,16 +57,30 @@ const maxOutputTokens = 65536
 
 // Server is the in-process Anthropic->OpenAI bridge.
 type Server struct {
-	cfg     Config
-	srv     *http.Server
-	baseURL string // resolved address, e.g. http://127.0.0.1:38271
+	cfg            Config
+	srv            *http.Server
+	baseURL        string // resolved address, e.g. http://127.0.0.1:38271
+	poolMu         sync.Mutex
+	activeRoute    int
+	exhaustedRoute []bool
+	gateMu         sync.Mutex
+	nextOpenRouter time.Time
 }
+
+const (
+	defaultRateLimitRetries = 3
+	defaultRateLimitBackoff = 2 * time.Second
+	maxRateLimitWait        = 2 * time.Minute
+)
 
 // New creates a proxy listening on the given port. Call Start to run it.
 // A Port of 0 lets the OS assign a free port, which allows many ultra-zen
 // instances to run concurrently without port collisions.
 func New(cfg Config) *Server {
-	s := &Server{cfg: cfg}
+	s := &Server{
+		cfg:            cfg,
+		exhaustedRoute: make([]bool, 1+len(cfg.Fallbacks)),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 	mux.HandleFunc("/v1/models", s.handleModels)
@@ -158,14 +188,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request_error", "invalid Anthropic request: "+err.Error())
 		return
 	}
-	// Model routing: when a worker model is configured, background sub-agents
-	// use the cheaper worker model. The main loop carries interactive-only tools
-	// (AskUserQuestion, Skill) that sub-agents never see, so we inspect the tool
-	// list to classify each request. On local hardware all models cost the same
-	// (your electricity), so splitting makes no difference — WorkerModel stays
-	// empty and everything uses Model.
+	// Legacy model routing: when a worker model is configured, background
+	// sub-agents use it. A fallback pool replaces this split and gives every
+	// Claude Code role the same resilient route, so a main-loop or subagent
+	// request can continue on the next free model without restarting the session.
 	model := s.cfg.Model
-	if s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
+	if len(s.cfg.Fallbacks) == 0 && s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
 		model = s.cfg.WorkerModel
 	}
 	oreq, err := areq.toOpenAI(model)
@@ -179,9 +207,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		oreq.MaxTokens = maxOutputTokens
 	}
 
-	payload, resp, err := s.forward(r.Context(), oreq)
+	primary := Upstream{BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model}
+	payload, resp, used, err := s.forwardWithRateLimit(r.Context(), primary, oreq)
 	if err != nil {
 		writeError(w, 502, "api_error", "gateway request failed: "+err.Error())
+		return
+	}
+	if resp == nil {
+		writeError(w, 429, "rate_limit_error", "every configured free model is exhausted for this session")
 		return
 	}
 	defer resp.Body.Close()
@@ -196,7 +229,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		log.Printf("ultra-zen proxy: upstream 400 (max_tokens=%d): %s | request: %s", oreq.MaxTokens, truncate(string(ub), 200), truncate(string(payload), 500))
 
 		// First retry: same params (handles transient backend failures).
-		_, resp2, err := s.forward(r.Context(), oreq)
+		_, resp2, err := s.forwardTo(r.Context(), used, oreq)
 		if err != nil {
 			writeError(w, 502, "api_error", "gateway retry failed: "+err.Error())
 			return
@@ -213,7 +246,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Printf("ultra-zen proxy: retry (same params) failed (%d): %s", resp2.StatusCode, truncate(string(ub2), 200))
 			if oreq.MaxTokens > 1024 {
 				oreq.MaxTokens /= 2
-				payload3, resp3, err := s.forward(r.Context(), oreq)
+				payload3, resp3, err := s.forwardTo(r.Context(), used, oreq)
 				if err != nil {
 					writeError(w, 502, "api_error", "gateway retry failed: "+err.Error())
 					return
@@ -256,19 +289,272 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.nonStreamResponse(w, resp, areq.Model)
 }
 
-// forward marshals the OpenAI request and sends it to the Zen gateway,
-// returning the marshalled payload (for diagnostic logging on errors) and
-// the raw upstream response.
-func (s *Server) forward(ctx context.Context, oreq *openAIRequest) (payload []byte, resp *http.Response, err error) {
+// routeChoice retains a route's stable pool index so concurrent requests can
+// promote a working fallback or retire a model whose free allocation ended.
+type routeChoice struct {
+	Upstream
+	index int
+}
+
+// forwardWithRateLimit sends a request through the current route and rotates
+// through the configured pool on 429. A FreeUsageLimitError retires that free
+// provider for the rest of the Claude Code session; ordinary model throttles are
+// retried with Retry-After/exponential backoff. This prevents a transient 429
+// from being handed directly to Claude Code, where it would terminate the
+// affected subagent.
+func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, oreq *openAIRequest) (payload []byte, resp *http.Response, used Upstream, err error) {
+	retries := s.cfg.RateLimitRetries
+	if retries == 0 {
+		retries = defaultRateLimitRetries
+	} else if retries < 0 {
+		retries = 0
+	}
+	backoff := s.cfg.RateLimitBackoff
+	if backoff <= 0 {
+		backoff = defaultRateLimitBackoff
+	}
+
+	var lastPayload, lastBody []byte
+	var lastResp *http.Response
+	var lastUsed Upstream
+	var lastRetryAfter time.Duration
+
+	for round := 0; round <= retries; round++ {
+		routes := s.routeOrder(primary)
+		if len(routes) == 0 {
+			break
+		}
+		temporary := false
+		for _, choice := range routes {
+			if s.routeExhausted(choice.index) {
+				continue
+			}
+			if err := s.waitOpenRouterSlot(ctx, choice.BaseURL); err != nil {
+				return nil, nil, Upstream{}, err
+			}
+			oreq.Model = choice.Model
+			p, candidate, callErr := s.forwardTo(ctx, choice.Upstream, oreq)
+			if callErr != nil {
+				return nil, nil, Upstream{}, callErr
+			}
+			if candidate.StatusCode != http.StatusTooManyRequests {
+				s.promoteRoute(choice.index)
+				return p, candidate, choice.Upstream, nil
+			}
+
+			body, _ := io.ReadAll(candidate.Body)
+			candidate.Body.Close()
+			candidate.Body = io.NopCloser(bytes.NewReader(body))
+			accountExhausted := isOpenRouterDailyLimit(body)
+			providerExhausted := accountExhausted || isFreeUsageLimit(body)
+			if providerExhausted {
+				s.exhaustProviderRoutes(choice.Upstream)
+			} else {
+				s.limitRoute(choice.index, false)
+			}
+			if !providerExhausted {
+				temporary = true
+			}
+			lastRetryAfter = parseRetryAfter(candidate.Header.Get("Retry-After"))
+			lastPayload, lastBody, lastResp, lastUsed = p, body, candidate, choice.Upstream
+			kind := "temporary rate limit"
+			if accountExhausted {
+				kind = "OpenRouter daily free allowance exhausted"
+			} else if providerExhausted {
+				kind = "provider free allocation exhausted"
+			}
+			log.Printf("ultra-zen proxy: %s for %s; rotating (%s)", kind, choice.Model, truncate(string(body), 200))
+		}
+
+		if !temporary || round == retries {
+			break
+		}
+		delay := lastRetryAfter
+		if delay <= 0 {
+			delay = backoff * time.Duration(1<<round)
+		}
+		if delay > maxRateLimitWait {
+			break
+		}
+		log.Printf("ultra-zen proxy: every available route is throttled; retrying in %s", delay)
+		if err := sleepContext(ctx, delay); err != nil {
+			return nil, nil, Upstream{}, err
+		}
+	}
+
+	if lastResp != nil {
+		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
+	}
+	return lastPayload, lastResp, lastUsed, nil
+}
+
+// routeOrder returns every non-exhausted pool route, starting at the most
+// recently successful one. Without a pool it returns the request's primary
+// route (which may be the legacy worker model).
+func (s *Server) routeOrder(primary Upstream) []routeChoice {
+	if len(s.cfg.Fallbacks) == 0 {
+		return []routeChoice{{Upstream: primary, index: -1}}
+	}
+	routes := make([]Upstream, 0, 1+len(s.cfg.Fallbacks))
+	routes = append(routes, Upstream{BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
+	routes = append(routes, s.cfg.Fallbacks...)
+
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	out := make([]routeChoice, 0, len(routes))
+	for offset := 0; offset < len(routes); offset++ {
+		idx := (s.activeRoute + offset) % len(routes)
+		if !s.exhaustedRoute[idx] {
+			out = append(out, routeChoice{Upstream: routes[idx], index: idx})
+		}
+	}
+	return out
+}
+
+func (s *Server) limitRoute(index int, permanent bool) {
+	if index < 0 {
+		return
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	if permanent {
+		s.exhaustedRoute[index] = true
+	}
+	for offset := 1; offset <= len(s.exhaustedRoute); offset++ {
+		next := (index + offset) % len(s.exhaustedRoute)
+		if !s.exhaustedRoute[next] {
+			s.activeRoute = next
+			return
+		}
+	}
+}
+
+func (s *Server) routeExhausted(index int) bool {
+	if index < 0 {
+		return false
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	return s.exhaustedRoute[index]
+}
+
+// exhaustProviderRoutes opens the circuit for every route on the exhausted
+// free provider. Daily allocations belong to the provider/account rather than
+// one model, so trying sibling models only wastes requests. A route on the
+// other provider remains available and receives the interrupted request.
+func (s *Server) exhaustProviderRoutes(current Upstream) {
+	if len(s.cfg.Fallbacks) == 0 {
+		return
+	}
+	routes := make([]Upstream, 0, 1+len(s.cfg.Fallbacks))
+	routes = append(routes, Upstream{BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
+	routes = append(routes, s.cfg.Fallbacks...)
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	for i, route := range routes {
+		if providerFamily(route.BaseURL) == providerFamily(current.BaseURL) && route.APIKey == current.APIKey {
+			s.exhaustedRoute[i] = true
+		}
+	}
+}
+
+func providerFamily(baseURL string) string {
+	base := strings.ToLower(strings.TrimRight(baseURL, "/"))
+	switch {
+	case strings.Contains(base, "openrouter.ai/"):
+		return "openrouter"
+	case strings.Contains(base, "opencode.ai/zen"):
+		return "opencode"
+	default:
+		return base
+	}
+}
+
+func (s *Server) promoteRoute(index int) {
+	if index < 0 {
+		return
+	}
+	s.poolMu.Lock()
+	s.activeRoute = index
+	s.poolMu.Unlock()
+}
+
+// waitOpenRouterSlot serializes this session's OpenRouter starts to the free
+// tier's documented requests-per-minute pace. Concurrent Claude subagents wait
+// here instead of bursting into avoidable 429 responses. Other ultra-zen
+// processes using the same account remain outside this limiter.
+func (s *Server) waitOpenRouterSlot(ctx context.Context, baseURL string) error {
+	if s.cfg.OpenRouterRPM <= 0 || !strings.Contains(strings.ToLower(baseURL), "openrouter.ai/") {
+		return nil
+	}
+	interval := time.Minute / time.Duration(s.cfg.OpenRouterRPM)
+	now := time.Now()
+	s.gateMu.Lock()
+	slot := now
+	if s.nextOpenRouter.After(slot) {
+		slot = s.nextOpenRouter
+	}
+	s.nextOpenRouter = slot.Add(interval)
+	s.gateMu.Unlock()
+	return sleepContext(ctx, time.Until(slot))
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func isFreeUsageLimit(body []byte) bool {
+	msg := strings.ToLower(string(body))
+	return strings.Contains(msg, "freeusagelimiterror") ||
+		strings.Contains(msg, "free usage limit") ||
+		strings.Contains(msg, "free allocation")
+}
+
+func isOpenRouterDailyLimit(body []byte) bool {
+	msg := strings.ToLower(string(body))
+	return strings.Contains(msg, "free-models-per-day") ||
+		strings.Contains(msg, "free models per day") ||
+		strings.Contains(msg, "unlock 1000 free model requests")
+}
+
+func parseRetryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds >= 0 {
+		return time.Duration(seconds * float64(time.Second))
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if delay := time.Until(when); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+// forwardTo marshals the OpenAI request and sends it to one gateway route,
+// returning the marshalled payload and raw upstream response.
+func (s *Server) forwardTo(ctx context.Context, upstream Upstream, oreq *openAIRequest) (payload []byte, resp *http.Response, err error) {
 	payload, err = json.Marshal(oreq)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal request: %w", err)
 	}
-	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.BaseURL+"/chat/completions", bytes.NewReader(payload))
+	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream.BaseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, nil, err
 	}
-	upstreamReq.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
+	upstreamReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	upstreamReq.Header.Set("Content-Type", "application/json")
 	resp, err = httpClient().Do(upstreamReq)
 	return payload, resp, err
