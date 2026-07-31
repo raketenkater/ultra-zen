@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/raketenkater/ultra-zen/internal/session"
@@ -348,6 +349,30 @@ func applyResumeOverrides(recorded, overrides []string) []string {
 	return out
 }
 
+// replayLaunchArgs returns the exact recorded command shape. Older TUI
+// records have an empty LaunchArgs field, so reconstruct at least the model,
+// provider, worker and port from their structured fields.
+func replayLaunchArgs(rec session.Record) ([]string, error) {
+	launchArgs := stripResumeArgs(rec.LaunchArgs)
+	if len(launchArgs) > 0 {
+		return launchArgs, nil
+	}
+	if rec.Model == "" {
+		return nil, fmt.Errorf("session %s has no recorded launch to reproduce", rec.SessionID)
+	}
+	launchArgs = []string{rec.Model}
+	if rec.Provider != "" {
+		launchArgs = append(launchArgs, "--provider", rec.Provider)
+	}
+	if rec.WorkerModel != "" {
+		launchArgs = append(launchArgs, "--worker", rec.WorkerModel)
+	}
+	if rec.Port != 0 {
+		launchArgs = append(launchArgs, "--port", strconv.Itoa(rec.Port))
+	}
+	return launchArgs, nil
+}
+
 func cmdSessionsList() {
 	cacheDir := sessionCacheDir()
 	workDir, err := os.Getwd()
@@ -396,13 +421,10 @@ func cmdSessionResume(target string, overrides []string) {
 		fmt.Printf("[ultra-zen] Session %s, workflow %s (%s): %d completed agents will replay from cache.\n",
 			rec.SessionID, wf.RunID, wf.Name, cached)
 	}
-	launchArgs := stripResumeArgs(rec.LaunchArgs)
-	if len(launchArgs) == 0 {
-		if rec.Model == "" {
-			fmt.Fprintf(os.Stderr, "Error: session %s has no recorded launch to reproduce\n", rec.SessionID)
-			os.Exit(1)
-		}
-		launchArgs = []string{rec.Model}
+	launchArgs, err := replayLaunchArgs(rec)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 	if len(overrides) > 0 {
 		launchArgs = applyResumeOverrides(launchArgs, overrides)

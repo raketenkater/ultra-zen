@@ -18,16 +18,18 @@ import (
 
 // Config holds the gateway target and credentials for the proxy.
 type Config struct {
+	Provider         string // provider name for the primary route
 	BaseURL          string // e.g. https://opencode.ai/zen/go/v1
 	APIKey           string
-	Model            string        // the Zen model id to forward orchestrator requests to
-	WorkerModel      string        // if set, background sub-agents use this cheaper model
-	Fallbacks        []Upstream    // ordered free-model fallbacks; replaces worker routing when set
-	OpenRouterRPM    int           // session-wide request pace for OpenRouter free models
-	RateLimitRetries int           // full-pool retries after temporary 429s; zero uses the default
-	RateLimitBackoff time.Duration // initial temporary-429 backoff; zero uses the default
-	Port             int           // local listen port
-	Models           []ModelInfo   // full model list advertised at /v1/models
+	Model            string         // the Zen model id to forward orchestrator requests to
+	WorkerModel      string         // if set, background sub-agents use this cheaper model
+	Fallbacks        []Upstream     // ordered free-model fallbacks; replaces worker routing when set
+	OpenRouterRPM    int            // session-wide request pace for OpenRouter free models
+	RateLimitRetries int            // full-pool retries after temporary 429s; zero uses the default
+	RateLimitBackoff time.Duration  // initial temporary-429 backoff; zero uses the default
+	Port             int            // local listen port
+	Models           []ModelInfo    // full model list advertised at /v1/models
+	OnUnavailable    func(Upstream) // called after an explicit per-model access denial
 }
 
 // Upstream identifies one model and the endpoint/key that serves it. Fallbacks
@@ -35,9 +37,10 @@ type Config struct {
 // model rotate to an explicitly selected OpenRouter free model without
 // restarting Claude Code.
 type Upstream struct {
-	BaseURL string
-	APIKey  string
-	Model   string
+	Provider string
+	BaseURL  string
+	APIKey   string
+	Model    string
 }
 
 // ModelInfo is a minimal model entry for /v1/models advertising.
@@ -207,7 +210,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		oreq.MaxTokens = maxOutputTokens
 	}
 
-	primary := Upstream{BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model}
+	primary := Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model}
 	payload, resp, used, err := s.forwardWithRateLimit(r.Context(), primary, oreq)
 	if err != nil {
 		writeError(w, 502, "api_error", "gateway request failed: "+err.Error())
@@ -337,6 +340,20 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			if callErr != nil {
 				return nil, nil, Upstream{}, callErr
 			}
+			if candidate.StatusCode == http.StatusForbidden {
+				body, _ := io.ReadAll(candidate.Body)
+				candidate.Body.Close()
+				candidate.Body = io.NopCloser(bytes.NewReader(body))
+				if isModelAccessDenied(body) {
+					s.limitRoute(choice.index, true)
+					if s.cfg.OnUnavailable != nil {
+						s.cfg.OnUnavailable(choice.Upstream)
+					}
+					lastPayload, lastBody, lastResp, lastUsed = p, body, candidate, choice.Upstream
+					log.Printf("ultra-zen proxy: model unavailable for this account: %s; retiring route (%s)", choice.Model, truncate(string(body), 200))
+					continue
+				}
+			}
 			if candidate.StatusCode != http.StatusTooManyRequests {
 				s.promoteRoute(choice.index)
 				return p, candidate, choice.Upstream, nil
@@ -396,7 +413,7 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 		return []routeChoice{{Upstream: primary, index: -1}}
 	}
 	routes := make([]Upstream, 0, 1+len(s.cfg.Fallbacks))
-	routes = append(routes, Upstream{BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
+	routes = append(routes, Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
 	routes = append(routes, s.cfg.Fallbacks...)
 
 	s.poolMu.Lock()
@@ -447,19 +464,22 @@ func (s *Server) exhaustProviderRoutes(current Upstream) {
 		return
 	}
 	routes := make([]Upstream, 0, 1+len(s.cfg.Fallbacks))
-	routes = append(routes, Upstream{BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
+	routes = append(routes, Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
 	routes = append(routes, s.cfg.Fallbacks...)
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
 	for i, route := range routes {
-		if providerFamily(route.BaseURL) == providerFamily(current.BaseURL) && route.APIKey == current.APIKey {
+		if providerFamily(route) == providerFamily(current) && route.APIKey == current.APIKey {
 			s.exhaustedRoute[i] = true
 		}
 	}
 }
 
-func providerFamily(baseURL string) string {
-	base := strings.ToLower(strings.TrimRight(baseURL, "/"))
+func providerFamily(upstream Upstream) string {
+	if upstream.Provider != "" {
+		return upstream.Provider
+	}
+	base := strings.ToLower(strings.TrimRight(upstream.BaseURL, "/"))
 	switch {
 	case strings.Contains(base, "openrouter.ai/"):
 		return "openrouter"
@@ -517,7 +537,15 @@ func isFreeUsageLimit(body []byte) bool {
 	msg := strings.ToLower(string(body))
 	return strings.Contains(msg, "freeusagelimiterror") ||
 		strings.Contains(msg, "free usage limit") ||
-		strings.Contains(msg, "free allocation")
+		strings.Contains(msg, "free allocation") ||
+		strings.Contains(msg, "insufficient_quota") ||
+		strings.Contains(msg, "exceeded your current quota")
+}
+
+func isModelAccessDenied(body []byte) bool {
+	msg := strings.ToLower(string(body))
+	return strings.Contains(msg, "does not have access to this model") ||
+		strings.Contains(msg, "model access denied")
 }
 
 func isOpenRouterDailyLimit(body []byte) bool {

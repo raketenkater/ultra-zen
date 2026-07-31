@@ -62,6 +62,7 @@ func cmdKeys(args []string) {
 		if err := keys.Save(provider, value); err != nil {
 			die(fmt.Errorf("save key for %s: %w", provider, err))
 		}
+		_ = models.ClearUnavailable(provider)
 		fmt.Printf("stored key for %s (%s)\n", provider, keys.Path())
 	case args[0] == "clear" && len(args) == 2:
 		provider := args[1]
@@ -72,6 +73,7 @@ func cmdKeys(args []string) {
 		if err := keys.Save(provider, ""); err != nil {
 			die(fmt.Errorf("clear key for %s: %w", provider, err))
 		}
+		_ = models.ClearUnavailable(provider)
 		fmt.Printf("cleared key for %s\n", provider)
 	case args[0] == "path":
 		fmt.Println(keys.Path())

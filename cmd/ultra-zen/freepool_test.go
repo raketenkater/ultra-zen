@@ -111,6 +111,17 @@ func TestApplySavedFreePoolHonorsExplicitOverrides(t *testing.T) {
 	}
 }
 
+func TestTUILaunchArgsRecordFinalProviderAndPool(t *testing.T) {
+	got := tuiLaunchArgs("zai-org/GLM-5.2", "modelscope", "", modelFlag{
+		"modelscope:zai-org/GLM-5.2",
+		"opencode-go:deepseek-free",
+	}, 0, 20)
+	want := "zai-org/GLM-5.2,--provider,modelscope,--free-model,modelscope:zai-org/GLM-5.2,--free-model,opencode-go:deepseek-free"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs = %v, want %s", got, want)
+	}
+}
+
 func TestLoadTUIProviderOpenRouter(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("OPENROUTER_API_KEY", "")

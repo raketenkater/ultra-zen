@@ -185,6 +185,12 @@ ModelScope's international (`.ai`) and China (`.cn`) sites use separate
 accounts and tokens. Ultra-zen detects both endpoints automatically. An
 international account must also be linked at
 https://modelscope.ai/my/settings/account before API-Inference can be used.
+ModelScope sometimes advertises account-gated models without an access flag.
+If inference explicitly returns “does not have access to this model”,
+ultra-zen retires that route, continues on the next provider, and records the
+denial in `~/.config/ultra-zen/unavailable-models.json` so the model is hidden
+from later TUI/catalog loads. Replacing the provider key clears those cached
+denials and checks the new account afresh.
 
 ModelScope's API-Inference serves open-source models (DeepSeek-V4, GLM-5.x,
 Qwen 3.5, MiniMax) free of charge, but it is a non-commercial, non-profit
@@ -219,6 +225,11 @@ and asks Claude to call `Workflow({ resumeFromRunId: ... })` as its opening
 turn — cached agents skip a model call; anything still in flight when the
 session stopped re-runs.
 
+Interactive launches record the finalized TUI model, provider, worker/pool,
+and relevant pacing/port flags. Selecting the TUI's Resume row therefore
+reopens the recorded provider directly instead of opening another picker or
+falling back to the default provider.
+
 ### Resilient free-model pool
 
 `--free-model <provider:model>` creates an ordered, cross-provider free-model
@@ -252,7 +263,8 @@ The pool replaces the worker/thinker split for that session: main-loop,
 background-agent, and fast-tier requests all share the same active route.
 Daily/free-allocation exhaustion is provider-wide: OpenRouter's
 `free-models-per-day` opens the circuit for every OpenRouter free route, while
-Zen's `FreeUsageLimitError` opens it for every opencode free route. The
+Zen's `FreeUsageLimitError` and another provider's `insufficient_quota` open it
+for every route using that provider/account. The
 interrupted request is replayed immediately on the other provider, with its
 full Claude Code conversation intact. Temporary per-model `429` responses can
 still try a sibling model, honor `Retry-After` when present, and otherwise use

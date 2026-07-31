@@ -284,7 +284,7 @@ func ListFreeTierProvider(httpClient *http.Client, provider, apiKey string) ([]M
 	for _, base := range bases {
 		list, err := ListFreeTier(httpClient, base, apiKey)
 		if err == nil {
-			return list, nil
+			return FilterUnavailable(provider, list), nil
 		}
 		failures = append(failures, err.Error())
 	}

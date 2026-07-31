@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/raketenkater/ultra-zen/internal/keys"
+	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
 // keyManager is the screen that lists every provider and lets the user set,
@@ -90,6 +91,7 @@ func (m *keyManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if err := keys.Save(provider, editor.value); err != nil {
 			m.err = err.Error()
 		} else {
+			_ = models.ClearUnavailable(provider)
 			m.err = ""
 		}
 		refresh := m.list.SetItems(buildKeyItems())
@@ -115,6 +117,7 @@ func (m *keyManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err := keys.Save(item.p, ""); err != nil {
 					m.err = err.Error()
 				} else {
+					_ = models.ClearUnavailable(item.p)
 					m.err = ""
 				}
 				cmd := m.list.SetItems(buildKeyItems())

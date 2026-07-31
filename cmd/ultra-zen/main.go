@@ -68,6 +68,27 @@ func applySavedFreePool(freeModels modelFlag, modelID string, cliWorkerRequested
 	return freeModels, len(freeModels) > 0
 }
 
+// tuiLaunchArgs records the finalized interactive choice rather than the raw
+// argv that opened the picker. Without this, a TUI launch records no model and
+// resume either opens the picker again or replays the model on the wrong
+// default provider.
+func tuiLaunchArgs(model, provider, worker string, freeModels modelFlag, port, openRouterRPM int) []string {
+	args := []string{model, "--provider", provider}
+	if worker != "" {
+		args = append(args, "--worker", worker)
+	}
+	for _, route := range freeModels {
+		args = append(args, "--free-model", route)
+	}
+	if port != 0 {
+		args = append(args, "--port", strconv.Itoa(port))
+	}
+	if openRouterRPM != 20 {
+		args = append(args, "--openrouter-rpm", strconv.Itoa(openRouterRPM))
+	}
+	return args
+}
+
 // splitFreeModelSpec accepts provider-qualified free routes while keeping bare
 // OpenRouter model IDs backward compatible. The BYO-key providers
 // (modelscope/groq/cerebras/huggingface/cohere) mirror models.FreeTierProviders;
@@ -481,6 +502,7 @@ func main() {
 	}
 
 	var tuiFreePool []tui.FreeRoute
+	launchedFromTUI := false
 	if modelID == "" {
 		var workerPick, resumeID, tuiProvider string
 		var quit bool
@@ -494,6 +516,7 @@ func main() {
 		if quit || modelID == "" {
 			return
 		}
+		launchedFromTUI = true
 		if tuiProvider != "" && (tuiProvider != *provider || len(list) == 0 || key == "") {
 			var err error
 			list, key, err = loadTUIProvider(httpClient, tuiProvider, *authPath, *openRouterKey, *apiKey)
@@ -638,7 +661,7 @@ func main() {
 	}
 
 	seenRoutes := map[string]bool{selected.Base + "\x00" + selected.ID: true}
-	addRoute := func(model *models.Model, routeKey string) {
+	addRoute := func(provider string, model *models.Model, routeKey string) {
 		if model == nil || !model.Free {
 			return
 		}
@@ -648,9 +671,10 @@ func main() {
 		}
 		seenRoutes[key] = true
 		fallbackRoutes = append(fallbackRoutes, proxy.Upstream{
-			BaseURL: model.Base,
-			APIKey:  routeKey,
-			Model:   model.ID,
+			Provider: provider,
+			BaseURL:  model.Base,
+			APIKey:   routeKey,
+			Model:    model.ID,
 		})
 	}
 
@@ -661,23 +685,23 @@ func main() {
 	if automaticPool && *workerModel == "" && selected.Free {
 		if selected.Base == models.OpenRouterBase {
 			if err := ensureOpenRouter(false); err == nil && selected.ID != "openrouter/free" {
-				addRoute(models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+				addRoute("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
 			}
 			if err := ensureZen(); err == nil {
 				free := freeTierModels(zenList)
 				for i := range free {
-					addRoute(&free[i], zenPoolKey)
+					addRoute("opencode-go", &free[i], zenPoolKey)
 				}
 			}
 		} else {
 			if err := ensureZen(); err == nil {
 				free := freeTierModels(zenList)
 				for i := range free {
-					addRoute(&free[i], zenPoolKey)
+					addRoute("opencode-go", &free[i], zenPoolKey)
 				}
 			}
 			if err := ensureOpenRouter(false); err == nil {
-				addRoute(models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+				addRoute("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
 			}
 		}
 	} else if explicitFreePool {
@@ -695,7 +719,7 @@ func main() {
 				if fallback == nil || !fallback.Free {
 					die(fmt.Errorf("OpenRouter free fallback %q not found; run `ultra-zen --list --provider openrouter`", id))
 				}
-				addRoute(fallback, openRouterPoolKey)
+				addRoute("openrouter", fallback, openRouterPoolKey)
 			case "opencode-go":
 				if err := ensureZen(); err != nil {
 					die(fmt.Errorf("load opencode Zen free fallback %q: %w", id, err))
@@ -704,7 +728,7 @@ func main() {
 				if fallback == nil || !fallback.Free {
 					die(fmt.Errorf("opencode Zen free fallback %q not found; run `ultra-zen --list`", id))
 				}
-				addRoute(fallback, zenPoolKey)
+				addRoute("opencode-go", fallback, zenPoolKey)
 			case "modelscope", "groq", "cerebras", "huggingface", "cohere":
 				if err := ensureFreeTier(poolProvider); err != nil {
 					die(fmt.Errorf("load %s free fallback %q: %w", poolProvider, id, err))
@@ -713,7 +737,7 @@ func main() {
 				if fallback == nil || !fallback.Free {
 					die(fmt.Errorf("%s free fallback %q not found; run `ultra-zen --list --provider %s`", poolProvider, id, poolProvider))
 				}
-				addRoute(fallback, freeTierKeys[poolProvider])
+				addRoute(poolProvider, fallback, freeTierKeys[poolProvider])
 			case "codex":
 				die(fmt.Errorf("codex model %q cannot be used as a free fallback; codex endpoints are subscription-backed", id))
 			default:
@@ -737,6 +761,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	srv := proxy.New(proxy.Config{
+		Provider:      *provider,
 		BaseURL:       selected.Base,
 		APIKey:        key,
 		Model:         selected.ID,
@@ -745,6 +770,11 @@ func main() {
 		OpenRouterRPM: *openRouterRPM,
 		Port:          *port,
 		Models:        modelInfos,
+		OnUnavailable: func(route proxy.Upstream) {
+			if err := models.MarkUnavailable(route.Provider, route.Model); err != nil {
+				log.Printf("ultra-zen: could not remember unavailable %s model %s: %v", route.Provider, route.Model, err)
+			}
+		},
 	})
 	if err := srv.Start(ctx); err != nil {
 		die(fmt.Errorf("start proxy: %w", err))
@@ -789,7 +819,11 @@ func main() {
 	args := claude.Args(selected.ID, hookBin+" workflow-hook", claudeArgs)
 
 	cacheDir := sessionCacheDir()
-	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *port, originalArgs)
+	sessionLaunchArgs := originalArgs
+	if launchedFromTUI {
+		sessionLaunchArgs = tuiLaunchArgs(selected.ID, *provider, *workerModel, freeModels, *port, *openRouterRPM)
+	}
+	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *port, sessionLaunchArgs)
 	if sessionErr != nil {
 		cancel()
 		die(fmt.Errorf("resume: %w", sessionErr))
@@ -822,7 +856,7 @@ func main() {
 	runErr := cmd.Run()
 	// Record on exit as well as on launch: the workflow run ID is assigned
 	// inside Claude Code, so only now is the resume handle complete.
-	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *port, originalArgs)
+	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *port, sessionLaunchArgs)
 	if runErr != nil {
 		cancel()
 		if exitErr, ok := runErr.(*exec.ExitError); ok {

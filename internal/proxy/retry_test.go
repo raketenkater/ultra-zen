@@ -362,6 +362,104 @@ func TestDailyLimitSwitchesProvider(t *testing.T) {
 	}
 }
 
+func TestInsufficientQuotaSkipsProviderSiblings(t *testing.T) {
+	var firstCalls, siblingCalls, otherCalls int
+	modelScope := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Model == "first" {
+			firstCalls++
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}`))
+			return
+		}
+		siblingCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"wrong"}}]}`))
+	}))
+	defer modelScope.Close()
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer other.Close()
+
+	srv := New(Config{
+		Provider: "modelscope",
+		BaseURL:  modelScope.URL,
+		APIKey:   "ms-key",
+		Model:    "first",
+		Fallbacks: []Upstream{
+			{Provider: "modelscope", BaseURL: modelScope.URL, APIKey: "ms-key", Model: "sibling"},
+			{Provider: "opencode-go", BaseURL: other.URL, APIKey: "zen-key", Model: "zen-free"},
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+		`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || firstCalls != 1 || siblingCalls != 0 || otherCalls != 1 {
+		t.Fatalf("status=%d calls first=%d sibling=%d other=%d", resp.StatusCode, firstCalls, siblingCalls, otherCalls)
+	}
+}
+
+func TestUnavailableModelIsRetiredAndReported(t *testing.T) {
+	var deniedCalls, fallbackCalls int
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deniedCalls++
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":{"message":"your current account does not have access to this model"}}`))
+	}))
+	defer denied.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer fallback.Close()
+
+	var unavailable Upstream
+	srv := New(Config{
+		Provider: "modelscope",
+		BaseURL:  denied.URL,
+		APIKey:   "ms-key",
+		Model:    "gated-model",
+		Fallbacks: []Upstream{{
+			Provider: "opencode-go", BaseURL: fallback.URL, APIKey: "zen-key", Model: "zen-free",
+		}},
+		OnUnavailable: func(route Upstream) { unavailable = route },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d", i+1, resp.StatusCode)
+		}
+	}
+	if deniedCalls != 1 || fallbackCalls != 2 {
+		t.Fatalf("calls denied=%d fallback=%d", deniedCalls, fallbackCalls)
+	}
+	if unavailable.Provider != "modelscope" || unavailable.Model != "gated-model" {
+		t.Fatalf("unavailable callback = %+v", unavailable)
+	}
+}
+
 // TestRepairUnresolvedToolCalls verifies that an assistant message ending in
 // tool_calls gets a stub tool result inserted, so the gateway (which 400s a
 // dangling tool_calls turn) sees a complete round-trip.

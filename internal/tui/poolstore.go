@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
 func freePoolPath() string {
@@ -35,7 +37,7 @@ func normalizeFreePool(routes []FreeRoute) []FreeRoute {
 	for _, route := range routes {
 		route.Provider = strings.TrimSpace(route.Provider)
 		route.Model = strings.TrimSpace(route.Model)
-		if !validPoolProvider(route.Provider) || route.Model == "" {
+		if !validPoolProvider(route.Provider) || route.Model == "" || models.IsUnavailable(route.Provider, route.Model) {
 			continue
 		}
 		key := selKey(route.Provider, route.Model)

@@ -111,6 +111,24 @@ func TestApplyResumeOverridesReplacesExistingValue(t *testing.T) {
 	}
 }
 
+func TestReplayLegacyTUISessionRestoresProvider(t *testing.T) {
+	rec := session.Record{
+		SessionID:   "072e63a1-819a-4682-a742-559695c3cd76",
+		Provider:    "modelscope",
+		Model:       "zai-org/GLM-5.2",
+		WorkerModel: "worker",
+		Port:        8787,
+	}
+	got, err := replayLaunchArgs(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "zai-org/GLM-5.2,--provider,modelscope,--worker,worker,--port,8787"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("replayLaunchArgs = %v, want %s", got, want)
+	}
+}
+
 func TestBuildResumeOptionNilWithoutARecordedSession(t *testing.T) {
 	restoreHome := setTempHome(t)
 	defer restoreHome()

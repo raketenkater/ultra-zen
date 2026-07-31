@@ -273,6 +273,7 @@ func loadProvider(provider string) fallbackLoaded {
 		}
 		list, err = models.ListFreeTierProvider(client, provider, key)
 	}
+	list = models.FilterUnavailable(provider, list)
 	return fallbackLoaded{provider: provider, models: list, key: key, err: err}
 }
 
@@ -521,6 +522,7 @@ func (m *fallbackManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.states[provider] = &providerState{status: statusError, err: compactError(err.Error())}
 			return m, tea.Batch(cmd, m.rebuildList())
 		}
+		_ = models.ClearUnavailable(provider)
 		if editor.value == "" {
 			m.states[provider] = &providerState{status: statusKeyless}
 			return m, tea.Batch(cmd, m.rebuildList())
