@@ -70,6 +70,47 @@ func TestFreeRouteStringRoundTrips(t *testing.T) {
 	}
 }
 
+func TestApplySavedFreePoolToDirectLaunch(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	want := []tui.FreeRoute{
+		{Provider: "openrouter", Model: "vendor/a:free"},
+		{Provider: "opencode-go", Model: "zen-free"},
+	}
+	if err := tui.SaveFreePool(want); err != nil {
+		t.Fatal(err)
+	}
+	got, requested := applySavedFreePool(nil, "primary-model", false)
+	if !requested {
+		t.Fatal("saved pool was not enabled")
+	}
+	if strings.Join(got, ",") != "openrouter:vendor/a:free,opencode-go:zen-free" {
+		t.Fatalf("saved pool = %v", got)
+	}
+}
+
+func TestApplySavedFreePoolHonorsExplicitOverrides(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := tui.SaveFreePool([]tui.FreeRoute{{Provider: "openrouter", Model: "saved:free"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	explicit := modelFlag{"groq:explicit"}
+	got, requested := applySavedFreePool(explicit, "primary-model", false)
+	if !requested || len(got) != 1 || got[0] != explicit[0] {
+		t.Fatalf("explicit pool was replaced: %v, requested=%v", got, requested)
+	}
+
+	got, requested = applySavedFreePool(nil, "primary-model", true)
+	if requested || len(got) != 0 {
+		t.Fatalf("saved pool overrode --worker: %v, requested=%v", got, requested)
+	}
+
+	got, requested = applySavedFreePool(nil, "", false)
+	if requested || len(got) != 0 {
+		t.Fatalf("interactive launch loaded pool before TUI: %v, requested=%v", got, requested)
+	}
+}
+
 func TestLoadTUIProviderOpenRouter(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("OPENROUTER_API_KEY", "")

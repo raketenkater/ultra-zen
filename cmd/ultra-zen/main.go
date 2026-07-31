@@ -55,6 +55,19 @@ func (f *modelFlag) Set(value string) error {
 	return nil
 }
 
+// applySavedFreePool makes the TUI's last saved rotation the default for a
+// direct model launch too. Explicit --free-model and --worker flags remain
+// authoritative; an interactive launch gets the same state from tui.Run.
+func applySavedFreePool(freeModels modelFlag, modelID string, cliWorkerRequested bool) (modelFlag, bool) {
+	if len(freeModels) > 0 || modelID == "" || cliWorkerRequested {
+		return freeModels, len(freeModels) > 0
+	}
+	for _, route := range tui.LoadFreePool() {
+		_ = freeModels.Set(route.String())
+	}
+	return freeModels, len(freeModels) > 0
+}
+
 // splitFreeModelSpec accepts provider-qualified free routes while keeping bare
 // OpenRouter model IDs backward compatible. The BYO-key providers
 // (modelscope/groq/cerebras/huggingface/cohere) mirror models.FreeTierProviders;
@@ -134,7 +147,7 @@ func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, ap
 		list, err := models.List(client, key)
 		return list, key, err
 	default:
-		def, ok := models.FreeTierProviders[provider]
+		_, ok := models.FreeTierProviders[provider]
 		if !ok {
 			return nil, "", fmt.Errorf("unknown TUI provider %q", provider)
 		}
@@ -142,7 +155,7 @@ func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, ap
 		if key == "" {
 			return nil, "", fmt.Errorf("%s key is no longer available", provider)
 		}
-		list, err := models.ListFreeTier(client, def.Base, key)
+		list, err := models.ListFreeTierProvider(client, provider, key)
 		return list, key, err
 	}
 }
@@ -328,7 +341,7 @@ func main() {
 		}
 	}
 
-	freePoolRequested := len(freeModels) > 0
+	freeModels, freePoolRequested := applySavedFreePool(freeModels, modelID, cliWorkerRequested)
 	// A free pool can be the complete launch specification: the first model is
 	// the primary and the remainder are ordered fallbacks on OpenRouter.
 	if modelID == "" && freePoolRequested {
@@ -372,7 +385,7 @@ func main() {
 		}
 		key = k
 		var err error
-		list, err = models.ListFreeTier(httpClient, def.Base, key)
+		list, err = models.ListFreeTierProvider(httpClient, *provider, key)
 		if err != nil {
 			die(fmt.Errorf("%s: %w", *provider, err))
 		}
@@ -580,7 +593,7 @@ func main() {
 			return fmt.Errorf("no key for %s; set %s or --api-key", p, def.EnvKey)
 		}
 		freeTierKeys[p] = k
-		list, err := models.ListFreeTier(httpClient, def.Base, k)
+		list, err := models.ListFreeTierProvider(httpClient, p, k)
 		if err != nil {
 			return err
 		}

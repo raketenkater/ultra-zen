@@ -19,14 +19,15 @@ import (
 
 // Base URLs for the supported providers.
 const (
-	GoBase          = "https://opencode.ai/zen/go/v1"
-	MainBase        = "https://opencode.ai/zen/v1"
-	OpenRouterBase  = "https://openrouter.ai/api/v1"
-	GroqBase        = "https://api.groq.com/openai/v1"
-	CerebrasBase    = "https://api.cerebras.ai/v1"
-	HuggingFaceBase = "https://router.huggingface.co/v1"
-	CohereBase      = "https://api.cohere.ai/compatibility/v1"
-	ModelScopeBase  = "https://api-inference.modelscope.cn/v1"
+	GoBase           = "https://opencode.ai/zen/go/v1"
+	MainBase         = "https://opencode.ai/zen/v1"
+	OpenRouterBase   = "https://openrouter.ai/api/v1"
+	GroqBase         = "https://api.groq.com/openai/v1"
+	CerebrasBase     = "https://api.cerebras.ai/v1"
+	HuggingFaceBase  = "https://router.huggingface.co/v1"
+	CohereBase       = "https://api.cohere.ai/compatibility/v1"
+	ModelScopeBase   = "https://api-inference.modelscope.ai/v1"
+	ModelScopeCNBase = "https://api-inference.modelscope.cn/v1"
 )
 
 // FreeTierProvider describes a BYO-key OpenAI-compatible endpoint that offers
@@ -52,7 +53,7 @@ var FreeTierProviders = map[string]FreeTierProvider{
 	"cerebras":    {Base: CerebrasBase, EnvKey: "CEREBRAS_API_KEY", KeyHint: "https://cloud.cerebras.ai/platform/apikeys"},
 	"huggingface": {Base: HuggingFaceBase, EnvKey: "HF_TOKEN", KeyHint: "https://huggingface.co/settings/tokens"},
 	"cohere":      {Base: CohereBase, EnvKey: "COHERE_API_KEY", KeyHint: "https://dashboard.cohere.com/api-keys"},
-	"modelscope":  {Base: ModelScopeBase, EnvKey: "MODELSCOPE_API_KEY", KeyHint: "https://modelscope.cn/my/apiToken"},
+	"modelscope":  {Base: ModelScopeBase, EnvKey: "MODELSCOPE_API_KEY", KeyHint: "https://modelscope.ai/my/myaccesstoken"},
 }
 
 // ProviderKey resolves the API key ultra-zen uses for a free-pool provider,
@@ -264,6 +265,30 @@ func ListFreeTier(httpClient *http.Client, base, apiKey string) ([]Model, error)
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+// ListFreeTierProvider loads a named BYO-key provider. ModelScope operates two
+// independent sites whose tokens are not interchangeable, so try the
+// international endpoint first and then China. The successful base is kept on
+// each Model, ensuring subsequent proxy requests use the matching site.
+func ListFreeTierProvider(httpClient *http.Client, provider, apiKey string) ([]Model, error) {
+	def, ok := FreeTierProviders[provider]
+	if !ok {
+		return nil, fmt.Errorf("unknown free-tier provider %q", provider)
+	}
+	bases := []string{def.Base}
+	if provider == "modelscope" {
+		bases = append(bases, ModelScopeCNBase)
+	}
+	var failures []string
+	for _, base := range bases {
+		list, err := ListFreeTier(httpClient, base, apiKey)
+		if err == nil {
+			return list, nil
+		}
+		failures = append(failures, err.Error())
+	}
+	return nil, fmt.Errorf("%s endpoints failed: %s", provider, strings.Join(failures, "; "))
 }
 
 // Find returns the model with the given id, or nil.

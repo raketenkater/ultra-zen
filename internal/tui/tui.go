@@ -202,6 +202,7 @@ type model struct {
 	freePool  []FreeRoute      // configured rotation pool (nil = auto-discover)
 	prevStep  step             // step to restore when a sub-screen closes
 	resume    *ResumeOption
+	poolErr   string
 }
 
 func (m model) Init() tea.Cmd {
@@ -349,6 +350,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.fallbacks.done {
 			m.freePool = m.fallbacks.routes()
 			m.quit = m.quit || m.fallbacks.quit
+			if !m.fallbacks.quit {
+				if err := SaveFreePool(m.freePool); err != nil {
+					m.poolErr = err.Error()
+				} else {
+					m.poolErr = ""
+				}
+			}
 			m.catalog = m.fallbacks
 			m.fallbacks = nil
 			m.step = m.prevStep
@@ -448,6 +456,9 @@ func (m model) View() string {
 	case stepCombo:
 		b += subtitleStyle.Render("  all configured providers — select a model, combo, or free cycle") + "\n\n"
 		b += m.list.View() + "\n"
+		if m.poolErr != "" {
+			b += mutedStyle.Render("  could not save free cycle: "+m.poolErr) + "\n"
+		}
 		b += mutedStyle.Render("  / filter · Enter select · k keys · f pool · Ctrl+C quit")
 	case stepOrchestrator:
 		b += subtitleStyle.Render("  "+m.subtitle+" — pick orchestrator (main model)") + "\n\n"
@@ -565,7 +576,8 @@ type Result struct {
 // empty Choice, so the caller can reopen that session instead of launching a
 // fresh one.
 func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
-	catalog := newFallbackManager("")
+	savedPool := LoadFreePool()
+	catalog := newFallbackManager("", savedPool)
 	catalog.allModelsProvider = provider
 	if len(ms) > 0 {
 		catalog.seedProvider(provider, ms)
@@ -578,6 +590,7 @@ func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
 		hasCombos: true,
 		catalog:   &catalog,
 		resume:    resume,
+		freePool:  savedPool,
 	}
 	items := m.startItems()
 

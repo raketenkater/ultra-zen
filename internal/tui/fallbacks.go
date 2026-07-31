@@ -267,11 +267,11 @@ func loadProvider(provider string) fallbackLoaded {
 	case "opencode-go":
 		list, err = models.ListZenFree(client, key)
 	default:
-		def, ok := models.FreeTierProviders[provider]
+		_, ok := models.FreeTierProviders[provider]
 		if !ok {
 			return fallbackLoaded{provider: provider, err: errUnknownProvider(provider)}
 		}
-		list, err = models.ListFreeTier(client, def.Base, key)
+		list, err = models.ListFreeTierProvider(client, provider, key)
 	}
 	return fallbackLoaded{provider: provider, models: list, key: key, err: err}
 }

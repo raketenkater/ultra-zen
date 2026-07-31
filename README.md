@@ -125,7 +125,10 @@ configured free provider as their live catalogs load. Selecting one switches
 the backend automatically; `--provider` is not required. The first row is
 **Free cycle**: Enter configures its ordered routes, Esc saves the pool, and
 Enter on the now-ready Free cycle row launches from its first route. Use `f`
-to edit the pool and `k` to add provider keys at any time.
+to edit the pool and `k` to add provider keys at any time. The ordered cycle is
+stored at `~/.config/ultra-zen/free-pool.json`, restored after a restart, and
+also applies to direct `ultra-zen <model>` launches. An explicit
+`--free-model` or `--worker` flag overrides the saved cycle.
 
 ### Backends
 
@@ -170,13 +173,18 @@ Zen. Each needs its own personal API key — set the provider's env var or pass
 | `cerebras`    | `CEREBRAS_API_KEY`  | https://cloud.cerebras.ai/platform/apikeys           |
 | `huggingface` | `HF_TOKEN`          | https://huggingface.co/settings/tokens               |
 | `cohere`      | `COHERE_API_KEY`    | https://dashboard.cohere.com/api-keys                |
-| `modelscope`  | `MODELSCOPE_API_KEY` | https://modelscope.cn/my/apiToken                    |
+| `modelscope`  | `MODELSCOPE_API_KEY` | https://modelscope.ai/my/myaccesstoken               |
 
 ```bash
 ultra-zen --provider groq
 ultra-zen --provider huggingface --api-key hf_xxx
 ultra-zen --provider modelscope                # Alibaba ModelScope free tier
 ```
+
+ModelScope's international (`.ai`) and China (`.cn`) sites use separate
+accounts and tokens. Ultra-zen detects both endpoints automatically. An
+international account must also be linked at
+https://modelscope.ai/my/settings/account before API-Inference can be used.
 
 ModelScope's API-Inference serves open-source models (DeepSeek-V4, GLM-5.x,
 Qwen 3.5, MiniMax) free of charge, but it is a non-commercial, non-profit
@@ -224,8 +232,9 @@ In the interactive selector, choose the first **Free cycle** row (or press
 `f`) to build the same ordered pool. Enter toggles a model, `r` clears the
 pool, and Esc saves and returns. Press Enter on **Free cycle ready** to launch.
 The pool remains selected if you reopen the screen and replaces a combo's
-legacy worker model for that session. Press `k` to add or change provider keys
-without leaving the selector.
+legacy worker model. It is saved on Esc, restored on the next launch, and used
+for both TUI and direct model launches. Press `r` then Esc to clear the saved
+cycle. Press `k` to add or change provider keys without leaving the selector.
 
 ```bash
 # Explicit OpenRouter + opencode Zen provider pool (no positional model needed)

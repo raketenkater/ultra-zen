@@ -76,6 +76,7 @@ func TestKeyManagerEscFromCombo(t *testing.T) {
 // panic when the picker renders again — same nil-deref class as the key
 // manager crash (step left at stepFallbacks with a nil manager).
 func TestFallbackManagerOpenCloseDoesNotPanic(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := newTestModel()
 
 	fm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
@@ -96,6 +97,24 @@ func TestFallbackManagerOpenCloseDoesNotPanic(t *testing.T) {
 		t.Fatal("step still stepFallbacks after close; View() would panic on nil manager")
 	}
 	_ = mm.View() // must not panic
+}
+
+func TestFallbackManagerSavesPoolOnClose(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := newTestModel()
+	m.freePool = []FreeRoute{{Provider: "openrouter", Model: "saved:free"}}
+	fm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	mm := fm.(model)
+
+	updated, _ := mm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mm = updated.(model)
+	if mm.poolErr != "" {
+		t.Fatalf("save error = %q", mm.poolErr)
+	}
+	got := LoadFreePool()
+	if len(got) != 1 || got[0] != m.freePool[0] {
+		t.Fatalf("saved pool = %v, want %v", got, m.freePool)
+	}
 }
 
 // Opening the fallback screen and pressing Enter (toggle) must not panic even
