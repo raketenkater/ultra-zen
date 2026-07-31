@@ -105,6 +105,48 @@ func freeTierModels(list []models.Model) []models.Model {
 	return models.SortByRecent(free, models.LoadRecent())
 }
 
+// loadTUIProvider switches the primary backend when the all-provider start
+// screen selects a model outside the provider main initially loaded. The TUI
+// only offers providers whose credentials were discovered, so this path never
+// opens another prompt; it resolves the same flag/env/store/auth precedence as
+// the normal startup path and verifies the model list again before launch.
+func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string) ([]models.Model, string, error) {
+	switch {
+	case provider == "openrouter":
+		key := models.ProviderKey(provider, openRouterFlag, "")
+		if key == "" {
+			return nil, "", fmt.Errorf("OpenRouter key is no longer available")
+		}
+		list, err := models.ListOpenRouter(client, key)
+		return list, key, err
+	case provider == "opencode-go":
+		key := keys.Load("opencode-go")
+		if key == "" {
+			store, err := auth.Load(authPath)
+			if err != nil {
+				return nil, "", err
+			}
+			key, err = auth.KeyFor(store, "opencode-go")
+			if err != nil {
+				return nil, "", err
+			}
+		}
+		list, err := models.List(client, key)
+		return list, key, err
+	default:
+		def, ok := models.FreeTierProviders[provider]
+		if !ok {
+			return nil, "", fmt.Errorf("unknown TUI provider %q", provider)
+		}
+		key := models.ProviderKey(provider, apiFlag, "")
+		if key == "" {
+			return nil, "", fmt.Errorf("%s key is no longer available", provider)
+		}
+		list, err := models.ListFreeTier(client, def.Base, key)
+		return list, key, err
+	}
+}
+
 func main() {
 	// Subcommand dispatch (before flag parsing, which would choke on the
 	// subcommand). `workflow-hook` is invoked by Claude Code's PreToolUse hook
@@ -308,7 +350,7 @@ func main() {
 
 	// interactive is true when no model was named on the CLI, so it's safe to
 	// open a TUI prompt for a missing key rather than exiting.
-	interactive := modelID == ""
+	interactive := modelID == "" && !*listOnly
 
 	switch def, isFreeTier := models.FreeTierProviders[*provider]; {
 	case isFreeTier:
@@ -320,10 +362,10 @@ func main() {
 			k = keys.Load(*provider)
 		}
 		if k == "" && interactive {
-			k = tui.PromptKey(fmt.Sprintf("%s API key", *provider), "get one at "+def.KeyHint, true)
-			if k != "" {
-				_ = keys.Save(*provider, k) // remember for next time
-			}
+			// Open the complete launcher with an empty primary catalog. Its key
+			// manager can configure this or any other provider without requiring
+			// the user to know a CLI flag first.
+			break
 		}
 		if k == "" {
 			die(fmt.Errorf("%s requires an API key: set %s or pass --api-key\nGet one at %s", *provider, def.EnvKey, def.KeyHint))
@@ -343,10 +385,7 @@ func main() {
 			k = keys.Load("openrouter")
 		}
 		if k == "" && interactive {
-			k = tui.PromptKey("OpenRouter API key", "get one at https://openrouter.ai/keys", true)
-			if k != "" {
-				_ = keys.Save("openrouter", k) // remember for next time
-			}
+			break
 		}
 		if k == "" {
 			die(fmt.Errorf("OpenRouter requires an API key: set OPENROUTER_API_KEY or pass --openrouter-key\nGet one at https://openrouter.ai/keys"))
@@ -394,21 +433,11 @@ func main() {
 		}
 		store, err := auth.Load(*authPath)
 		if err != nil {
-			// opencode auth is missing. In interactive mode, offer OpenRouter
-			// as a no-opencode alternative instead of exiting.
+			// With no opencode login, still open the complete TUI. Background
+			// discovery will show every provider that already has a key, and k
+			// can configure one when none are present.
 			if interactive {
-				k := tui.PromptKey("No opencode login found. Paste an OpenRouter API key to use free models instead (Esc to cancel)",
-					"get one at https://openrouter.ai/keys · or run `opencode auth login` for Zen", true)
-				if k != "" {
-					*provider = "openrouter"
-					key = k
-					_ = keys.Save("openrouter", k) // remember for next time
-					list, err = models.ListOpenRouter(httpClient, key)
-					if err != nil {
-						die(err)
-					}
-					break
-				}
+				break
 			}
 			die(err)
 		}
@@ -423,7 +452,7 @@ func main() {
 	default:
 		die(fmt.Errorf("unknown provider %q", *provider))
 	}
-	if len(list) == 0 {
+	if len(list) == 0 && !interactive {
 		die(fmt.Errorf("no models available for provider %q", *provider))
 	}
 
@@ -440,10 +469,10 @@ func main() {
 
 	var tuiFreePool []tui.FreeRoute
 	if modelID == "" {
-		var workerPick, resumeID string
+		var workerPick, resumeID, tuiProvider string
 		var quit bool
 		res := tui.Run(list, *provider, buildResumeOption())
-		modelID, workerPick, resumeID, quit = res.Choice, res.Worker, res.ResumeSessionID, res.Quit
+		modelID, tuiProvider, workerPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.ResumeSessionID, res.Quit
 		tuiFreePool = res.FreePool
 		if resumeID != "" {
 			cmdSessionResume(resumeID, nil)
@@ -451,6 +480,14 @@ func main() {
 		}
 		if quit || modelID == "" {
 			return
+		}
+		if tuiProvider != "" && (tuiProvider != *provider || len(list) == 0 || key == "") {
+			var err error
+			list, key, err = loadTUIProvider(httpClient, tuiProvider, *authPath, *openRouterKey, *apiKey)
+			if err != nil {
+				die(fmt.Errorf("load TUI provider %s: %w", tuiProvider, err))
+			}
+			*provider = tuiProvider
 		}
 		// CLI --worker flag overrides TUI pick; TUI pick fills the default.
 		if *workerModel == "" && workerPick != "" && !freePoolRequested {

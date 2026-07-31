@@ -119,6 +119,14 @@ ultra-zen glm-5.1 --worker mini-max-m2.5
 Flags may come before or after the model argument. Put `--` before arguments
 that must be passed through unchanged to Claude Code.
 
+The default TUI is a complete launcher. Its first screen shows every model
+from the primary provider immediately, then adds models from every other
+configured free provider as their live catalogs load. Selecting one switches
+the backend automatically; `--provider` is not required. The first row is
+**Free cycle**: Enter configures its ordered routes, Esc saves the pool, and
+Enter on the now-ready Free cycle row launches from its first route. Use `f`
+to edit the pool and `k` to add provider keys at any time.
+
 ### Backends
 
 **opencode Zen** (default, `--provider opencode-go`): reads your opencode API
@@ -212,9 +220,10 @@ model is the primary when no positional model is supplied; otherwise the
 positional model stays primary and the `--free-model` entries are its
 fallbacks.
 
-In the interactive selector, press `f` to build the same ordered pool. Enter
-toggles a model, `r` clears the pool, and Esc returns to model selection. The
-pool remains selected if you reopen the screen; choosing it replaces a combo's
+In the interactive selector, choose the first **Free cycle** row (or press
+`f`) to build the same ordered pool. Enter toggles a model, `r` clears the
+pool, and Esc saves and returns. Press Enter on **Free cycle ready** to launch.
+The pool remains selected if you reopen the screen and replaces a combo's
 legacy worker model for that session. Press `k` to add or change provider keys
 without leaving the selector.
 

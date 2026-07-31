@@ -104,13 +104,10 @@ func List(httpClient *http.Client, apiKey string) ([]Model, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	goModels, err := fetchIDs(httpClient, GoBase, apiKey)
-	if err != nil {
-		return nil, fmt.Errorf("go tier: %w", err)
-	}
-	mainModels, err := fetchIDs(httpClient, MainBase, apiKey)
-	if err != nil {
-		return nil, fmt.Errorf("main tier: %w", err)
+	goModels, goErr := fetchIDs(httpClient, GoBase, apiKey)
+	mainModels, mainErr := fetchIDs(httpClient, MainBase, apiKey)
+	if goErr != nil && mainErr != nil {
+		return nil, fmt.Errorf("go tier: %v; main tier: %w", goErr, mainErr)
 	}
 
 	var out []Model

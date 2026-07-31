@@ -1,10 +1,18 @@
 package main
 
 import (
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/tui"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestSplitFreeModelSpec(t *testing.T) {
 	tests := []struct {
@@ -59,5 +67,41 @@ func TestFreeRouteStringRoundTrips(t *testing.T) {
 		if provider != r.Provider || model != r.Model {
 			t.Fatalf("round-trip %q = (%q, %q), want (%q, %q)", r.String(), provider, model, r.Provider, r.Model)
 		}
+	}
+}
+
+func TestLoadTUIProviderOpenRouter(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("OPENROUTER_API_KEY", "")
+	if err := keys.Save("openrouter", "stored-or-key"); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("Authorization"); got != "Bearer stored-or-key" {
+			t.Errorf("Authorization = %q", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"data":[{"id":"vendor/free:free"},{"id":"vendor/paid"}]}`)),
+			Request: req,
+		}, nil
+	})}
+	list, key, err := loadTUIProvider(client, "openrouter", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "stored-or-key" {
+		t.Fatalf("key = %q, want stored key", key)
+	}
+	if len(list) != 1 || list[0].ID != "vendor/free:free" {
+		t.Fatalf("models = %+v, want only free OpenRouter model", list)
+	}
+}
+
+func TestLoadTUIProviderRejectsUnknown(t *testing.T) {
+	if _, _, err := loadTUIProvider(http.DefaultClient, "unknown", "", "", ""); err == nil {
+		t.Fatal("unknown TUI provider was accepted")
 	}
 }

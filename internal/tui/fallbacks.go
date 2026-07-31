@@ -70,11 +70,14 @@ type fallbackManager struct {
 	selected     map[string]bool // "provider\x00model" -> in pool
 	order        []string        // selection order, keyed as above
 	primaryModel string          // the picker's already-chosen model (suppress dup)
-	listReady    bool
-	editor       *inlineKeyEditor
-	editing      string
-	done         bool
-	quit         bool
+	// allModelsProvider is set only on the background start-screen catalog.
+	// Its primary provider loads every model; the pool UI still shows only Free.
+	allModelsProvider string
+	listReady         bool
+	editor            *inlineKeyEditor
+	editing           string
+	done              bool
+	quit              bool
 }
 
 // fallbackLoaded is sent when a provider's model fetch (or key resolution)
@@ -138,8 +141,90 @@ func providerKey(p string) string {
 func (m *fallbackManager) Init() tea.Cmd {
 	cmds := make([]tea.Cmd, 0, len(poolProviders))
 	for _, p := range poolProviders {
-		cmds = append(cmds, fetchProvider(p))
+		if m.states[p].status == statusLoading {
+			cmds = append(cmds, m.fetch(p))
+		}
 	}
+	return tea.Batch(cmds...)
+}
+
+// seedProvider reuses the primary provider list that main already fetched, so
+// the start screen can show it immediately without a duplicate request.
+func (m *fallbackManager) seedProvider(provider string, list []models.Model) {
+	st := m.states[provider]
+	if st == nil {
+		return
+	}
+	st.status = statusReady
+	st.key = "available"
+	st.models = append(st.models[:0], list...)
+	if len(st.models) == 0 {
+		st.status = statusHidden
+	}
+	m.rebuildList()
+}
+
+type availableProviderModel struct {
+	Provider string
+	Model    models.Model
+}
+
+func (m *fallbackManager) availableModels() []availableProviderModel {
+	var out []availableProviderModel
+	for _, provider := range poolProviders {
+		st := m.states[provider]
+		if st == nil || st.status != statusReady {
+			continue
+		}
+		for _, model := range st.models {
+			out = append(out, availableProviderModel{Provider: provider, Model: model})
+		}
+	}
+	return out
+}
+
+func (m *fallbackManager) loading() bool {
+	for _, provider := range poolProviders {
+		if st := m.states[provider]; st != nil && st.status == statusLoading {
+			return true
+		}
+	}
+	return false
+}
+
+// availableRoutes returns every discovered free model, not just selected pool
+// members. The parent selector uses this catalog to put all configured
+// providers on its opening screen.
+func (m *fallbackManager) availableRoutes() []FreeRoute {
+	var out []FreeRoute
+	for _, provider := range poolProviders {
+		st := m.states[provider]
+		if st == nil || st.status != statusReady {
+			continue
+		}
+		for _, model := range st.models {
+			if model.Free {
+				out = append(out, FreeRoute{Provider: provider, Model: model.ID})
+			}
+		}
+	}
+	return out
+}
+
+// refreshCredentials retries providers that were missing a key or failed to
+// load. It is called after the key manager closes so newly stored keys appear
+// on the start screen immediately.
+func (m *fallbackManager) refreshCredentials() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, provider := range poolProviders {
+		st := m.states[provider]
+		if st == nil || (st.status != statusKeyless && st.status != statusError) {
+			continue
+		}
+		m.states[provider] = &providerState{status: statusLoading}
+		cmds = append(cmds, m.fetch(provider))
+	}
+	m.rebuildList()
 	return tea.Batch(cmds...)
 }
 
@@ -150,6 +235,20 @@ func fetchProvider(provider string) tea.Cmd {
 	return func() tea.Msg {
 		return loadProvider(provider)
 	}
+}
+
+func (m *fallbackManager) fetch(provider string) tea.Cmd {
+	if provider == m.allModelsProvider && provider == "opencode-go" {
+		return func() tea.Msg {
+			key := providerKey(provider)
+			if key == "" {
+				return fallbackLoaded{provider: provider}
+			}
+			list, err := models.List(&http.Client{Timeout: 4 * time.Second}, key)
+			return fallbackLoaded{provider: provider, models: list, key: key, err: err}
+		}
+	}
+	return fetchProvider(provider)
 }
 
 func loadProvider(provider string) fallbackLoaded {
@@ -202,6 +301,9 @@ func (m *fallbackManager) rebuildList() tea.Cmd {
 			items = append(items, fallbackRow{provider: p, kind: rowNoKey})
 		case statusReady:
 			for _, model := range st.models {
+				if !model.Free {
+					continue
+				}
 				if model.ID == m.primaryModel {
 					continue // already the primary; don't offer as fallback
 				}
@@ -424,7 +526,7 @@ func (m *fallbackManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmd, m.rebuildList())
 		}
 		m.states[provider] = &providerState{status: statusLoading}
-		return m, tea.Batch(cmd, m.rebuildList(), fetchProvider(provider))
+		return m, tea.Batch(cmd, m.rebuildList(), m.fetch(provider))
 	}
 	switch msg := msg.(type) {
 	case fallbackLoaded:
@@ -459,7 +561,7 @@ func (m *fallbackManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.toggle()
 			case rowError:
 				m.states[item.provider] = &providerState{status: statusLoading}
-				return m, tea.Batch(m.rebuildList(), fetchProvider(item.provider))
+				return m, tea.Batch(m.rebuildList(), m.fetch(item.provider))
 			}
 			return m, nil
 		}
@@ -475,7 +577,7 @@ func (m *fallbackManager) View() string {
 	}
 	var b string
 	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  Free rotation pool — Enter toggle · x remove · r reset · Esc back") + "\n\n"
+	b += subtitleStyle.Render("  Free rotation pool — Enter toggle · x remove · r reset · Esc save & back") + "\n\n"
 	b += m.list.View() + "\n"
 	if len(m.order) > 0 {
 		b += mutedStyle.Render("  pool: "+strings.Join(m.orderKeys(), " → ")) + "\n"

@@ -145,3 +145,135 @@ func TestFallbackManagerReopensWithExistingPool(t *testing.T) {
 		t.Fatalf("reopened routes = %v, want %v", routes, m.freePool)
 	}
 }
+
+func newCatalogTestModel() model {
+	ms := []models.Model{
+		{ID: "zen-paid", Name: "zen-paid", Base: models.GoBase},
+		{ID: "zen-free", Name: "zen-free", Base: models.MainBase, Free: true},
+	}
+	catalog := newFallbackManager("")
+	catalog.seedProvider("opencode-go", ms)
+	catalog.applyLoad(fallbackLoaded{
+		provider: "openrouter",
+		key:      "or-key",
+		models: []models.Model{{
+			ID: "vendor/router-model:free", Name: "router", Base: models.OpenRouterBase, Free: true,
+		}},
+	})
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+		catalog:  &catalog,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+	return m
+}
+
+func TestStartScreenShowsCycleAndAllConfiguredProviderModels(t *testing.T) {
+	m := newCatalogTestModel()
+	foundCycle := false
+	modelsFound := map[string]bool{}
+	for _, item := range m.list.Items() {
+		switch item := item.(type) {
+		case cycleItem:
+			foundCycle = true
+		case modelItem:
+			modelsFound["opencode-go:"+item.m.ID] = true
+		case providerModelItem:
+			modelsFound[item.provider+":"+item.model.ID] = true
+		}
+	}
+	if !foundCycle {
+		t.Fatal("start screen has no Free cycle item")
+	}
+	for _, want := range []string{
+		"opencode-go:zen-paid",
+		"opencode-go:zen-free",
+		"openrouter:vendor/router-model:free",
+	} {
+		if !modelsFound[want] {
+			t.Errorf("start screen missing %s; found %v", want, modelsFound)
+		}
+	}
+}
+
+func TestSelectingDiscoveredModelReturnsItsProvider(t *testing.T) {
+	m := newCatalogTestModel()
+	for i, item := range m.list.Items() {
+		if route, ok := item.(providerModelItem); ok && route.provider == "openrouter" {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.choice != "vendor/router-model:free" || mm.choiceVia != "openrouter" {
+		t.Fatalf("selection = %s via %s, want OpenRouter model", mm.choice, mm.choiceVia)
+	}
+}
+
+func TestConfiguredCycleLaunchesItsFirstRoute(t *testing.T) {
+	m := newCatalogTestModel()
+	m.freePool = []FreeRoute{
+		{Provider: "openrouter", Model: "vendor/router-model:free"},
+		{Provider: "opencode-go", Model: "zen-free"},
+	}
+	m.list.SetItems(m.startItems())
+	for i, item := range m.list.Items() {
+		if _, ok := item.(cycleItem); ok {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.choice != m.freePool[0].Model || mm.choiceVia != m.freePool[0].Provider {
+		t.Fatalf("cycle launched %s via %s, want first route %+v", mm.choice, mm.choiceVia, m.freePool[0])
+	}
+	if mm.worker != "" {
+		t.Fatalf("cycle unexpectedly selected legacy worker %q", mm.worker)
+	}
+}
+
+func TestUnconfiguredCycleOpensPoolEditor(t *testing.T) {
+	m := newCatalogTestModel()
+	for i, item := range m.list.Items() {
+		if _, ok := item.(cycleItem); ok {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.fallbacks == nil || mm.step != stepFallbacks {
+		t.Fatal("unconfigured Free cycle did not open the pool editor")
+	}
+}
+
+func TestCatalogRefreshPreservesHighlightedStartItem(t *testing.T) {
+	m := newCatalogTestModel()
+	for i, item := range m.list.Items() {
+		if combo, ok := item.(comboItem); ok && combo.manual {
+			m.list.Select(i)
+			break
+		}
+	}
+	m.catalog.applyLoad(fallbackLoaded{
+		provider: "groq",
+		key:      "groq-key",
+		models: []models.Model{{
+			ID: "new-groq-model", Base: models.GroqBase, Free: true,
+		}},
+	})
+	m.rebuildStart()
+	combo, ok := m.list.SelectedItem().(comboItem)
+	if !ok || !combo.manual {
+		t.Fatalf("async provider load moved selection to %#v", m.list.SelectedItem())
+	}
+}

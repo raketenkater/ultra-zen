@@ -6,6 +6,8 @@
 package tui
 
 import (
+	"fmt"
+
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -77,6 +79,61 @@ type comboItem struct {
 	manual bool
 }
 
+// cycleItem makes provider-aware free rotation a first-class launch choice
+// instead of a hidden hotkey. Enter opens the pool editor.
+type cycleItem struct {
+	available int
+	selected  int
+	first     string
+	loading   bool
+}
+
+func (i cycleItem) Title() string {
+	if i.selected > 0 {
+		return fmt.Sprintf("Free cycle ready — %d routes", i.selected)
+	}
+	return "Free cycle — configure provider rotation →"
+}
+func (i cycleItem) Description() string {
+	if i.selected > 0 {
+		return "Enter launch from " + i.first + " · f edits the pool"
+	}
+	if i.available == 0 {
+		if i.loading {
+			return "loading configured free providers · Enter to view live status"
+		}
+		return "no provider models available yet · Enter to add keys"
+	}
+	return fmt.Sprintf("%d free models discovered · OpenRouter, OpenCode Zen, and BYO free tiers", i.available)
+}
+func (i cycleItem) FilterValue() string { return "free cycle pool rotation providers" }
+
+// providerModelItem is a model discovered by the background provider catalog.
+// Selecting it returns the provider as well as the ID, allowing main to switch
+// primary backends without a CLI --provider flag.
+type providerModelItem struct {
+	provider string
+	model    models.Model
+}
+
+func (i providerModelItem) Title() string {
+	title := i.model.ID
+	if i.model.Free {
+		title += "  (free)"
+	}
+	return title
+}
+func (i providerModelItem) Description() string {
+	tier := "model"
+	if i.model.Free {
+		tier = "free"
+	}
+	return i.provider + " " + tier + " · provider discovered automatically"
+}
+func (i providerModelItem) FilterValue() string {
+	return i.provider + " " + i.model.ID
+}
+
 func (i comboItem) Title() string {
 	if i.manual {
 		return "Pick models manually →"
@@ -131,6 +188,8 @@ type model struct {
 	list      list.Model
 	all       []models.Model // for rebuilding lists between steps
 	choice    string
+	provider  string
+	choiceVia string
 	worker    string
 	resumeID  string
 	quit      bool
@@ -139,11 +198,114 @@ type model struct {
 	hasCombos bool
 	keys      *keyManager      // non-nil while the key manager screen is open
 	fallbacks *fallbackManager // non-nil while the fallback pool screen is open
+	catalog   *fallbackManager // background free-provider discovery
 	freePool  []FreeRoute      // configured rotation pool (nil = auto-discover)
 	prevStep  step             // step to restore when a sub-screen closes
+	resume    *ResumeOption
 }
 
-func (m model) Init() tea.Cmd { return nil }
+func (m model) Init() tea.Cmd {
+	if m.catalog != nil {
+		return m.catalog.Init()
+	}
+	return nil
+}
+
+func (m *model) openFallbacks() tea.Cmd {
+	if m.catalog != nil {
+		m.fallbacks = m.catalog
+		m.catalog = nil
+		m.fallbacks.primaryModel = m.choice
+		m.fallbacks.rebuildList()
+	} else {
+		fm := newFallbackManager(m.choice, m.freePool)
+		m.fallbacks = &fm
+	}
+	m.prevStep = m.step
+	m.step = stepFallbacks
+	return m.fallbacks.Init()
+}
+
+func (m *model) startItems() []list.Item {
+	var routes []FreeRoute
+	var catalogModels []availableProviderModel
+	loading := false
+	if m.catalog != nil {
+		routes = m.catalog.availableRoutes()
+		catalogModels = m.catalog.availableModels()
+		loading = m.catalog.loading()
+	}
+	cycle := cycleItem{available: len(routes), selected: len(m.freePool), loading: loading}
+	if len(m.freePool) > 0 {
+		cycle.first = m.freePool[0].String()
+	}
+	items := []list.Item{cycle}
+	if m.resume != nil {
+		items = append([]list.Item{resumeItem{opt: *m.resume}}, items...)
+	}
+	combos := buildComboItems(m.all)
+	for _, item := range combos {
+		if combo, ok := item.(comboItem); ok && !combo.manual {
+			items = append(items, combo)
+		}
+	}
+	// Every model from the initially selected provider is directly launchable;
+	// the manual row remains for the legacy orchestrator/worker flow.
+	items = append(items, buildModelItems(m.all)...)
+	local := make(map[string]bool, len(m.all))
+	for _, model := range m.all {
+		local[model.ID] = true
+	}
+	for _, option := range catalogModels {
+		if option.Provider == m.provider && local[option.Model.ID] {
+			continue
+		}
+		items = append(items, providerModelItem{provider: option.Provider, model: option.Model})
+	}
+	items = append(items, comboItem{manual: true})
+	return items
+}
+
+func (m *model) rebuildStart() tea.Cmd {
+	if m.step != stepCombo {
+		return nil
+	}
+	index := m.list.Index()
+	want := startItemKey(m.list.SelectedItem())
+	cmd := m.list.SetItems(m.startItems())
+	if want != "" {
+		for i, item := range m.list.Items() {
+			if startItemKey(item) == want {
+				m.list.Select(i)
+				return cmd
+			}
+		}
+	}
+	if count := len(m.list.Items()); count > 0 {
+		m.list.Select(min(index, count-1))
+	}
+	return cmd
+}
+
+func startItemKey(item list.Item) string {
+	switch item := item.(type) {
+	case cycleItem:
+		return "cycle"
+	case resumeItem:
+		return "resume\x00" + item.opt.SessionID
+	case comboItem:
+		if item.manual {
+			return "manual"
+		}
+		return "combo\x00" + item.combo.Orchestrator + "\x00" + item.combo.Worker
+	case modelItem:
+		return "model\x00" + item.m.Base + "\x00" + item.m.ID
+	case providerModelItem:
+		return "provider\x00" + item.provider + "\x00" + item.model.ID
+	default:
+		return ""
+	}
+}
 
 func (m *model) enterOrchestratorStep() {
 	m.step = stepOrchestrator
@@ -160,6 +322,12 @@ func (m *model) enterWorkerStep() {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Provider discovery continues while the start screen or key manager is
+	// visible. When the pool editor is open it owns these messages instead.
+	if loaded, ok := msg.(fallbackLoaded); ok && m.fallbacks == nil && m.catalog != nil {
+		catalogCmd := m.catalog.applyLoad(loaded)
+		return m, tea.Batch(catalogCmd, m.rebuildStart())
+	}
 	// While the key manager is open, it owns all input.
 	if m.keys != nil {
 		km, cmd := m.keys.Update(msg)
@@ -168,6 +336,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quit = m.quit || m.keys.quit
 			m.keys = nil
 			m.step = m.prevStep // return to the picker screen
+			if m.catalog != nil {
+				cmd = tea.Batch(cmd, m.catalog.refreshCredentials(), m.rebuildStart())
+			}
 		}
 		return m, cmd
 	}
@@ -178,8 +349,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.fallbacks.done {
 			m.freePool = m.fallbacks.routes()
 			m.quit = m.quit || m.fallbacks.quit
+			m.catalog = m.fallbacks
 			m.fallbacks = nil
 			m.step = m.prevStep
+			cmd = tea.Batch(cmd, m.rebuildStart())
 		}
 		return m, cmd
 	}
@@ -200,11 +373,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "f":
 			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker {
-				fm := newFallbackManager(m.choice, m.freePool)
-				m.fallbacks = &fm
-				m.prevStep = m.step
-				m.step = stepFallbacks
-				return m, m.fallbacks.Init() // kick off async provider fetches
+				return m, m.openFallbacks()
 			}
 		case "ctrl+c":
 			m.quit = true
@@ -221,18 +390,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			switch m.step {
 			case stepCombo:
+				if item, ok := m.list.SelectedItem().(cycleItem); ok {
+					if item.selected > 0 && len(m.freePool) > 0 {
+						m.choice = m.freePool[0].Model
+						m.choiceVia = m.freePool[0].Provider
+						m.worker = ""
+						return m, tea.Quit
+					}
+					return m, m.openFallbacks()
+				}
+				if item, ok := m.list.SelectedItem().(modelItem); ok {
+					m.choice = item.m.ID
+					m.choiceVia = m.provider
+					m.worker = ""
+					return m, tea.Quit
+				}
+				if item, ok := m.list.SelectedItem().(providerModelItem); ok {
+					m.choice = item.model.ID
+					m.choiceVia = item.provider
+					m.worker = ""
+					return m, tea.Quit
+				}
 				if item, ok := m.list.SelectedItem().(comboItem); ok {
 					if item.manual {
 						m.enterOrchestratorStep()
 						return m, nil
 					}
 					m.choice = item.combo.Orchestrator
+					m.choiceVia = m.provider
 					m.worker = item.combo.Worker
 					return m, tea.Quit
 				}
 			case stepOrchestrator:
 				if item, ok := m.list.SelectedItem().(modelItem); ok {
 					m.choice = item.m.ID
+					m.choiceVia = m.provider
 					m.enterWorkerStep()
 					return m, nil
 				}
@@ -254,7 +446,7 @@ func (m model) View() string {
 	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
 	switch m.step {
 	case stepCombo:
-		b += subtitleStyle.Render("  "+m.subtitle+" — pick a combo, or choose manually") + "\n\n"
+		b += subtitleStyle.Render("  all configured providers — select a model, combo, or free cycle") + "\n\n"
 		b += m.list.View() + "\n"
 		b += mutedStyle.Render("  / filter · Enter select · k keys · f pool · Ctrl+C quit")
 	case stepOrchestrator:
@@ -356,6 +548,7 @@ func providerSubtitle(provider string) string {
 // rotation pool configured via the 'f' screen (nil = auto-discover).
 type Result struct {
 	Choice          string
+	Provider        string
 	Worker          string
 	ResumeSessionID string
 	Quit            bool
@@ -372,20 +565,21 @@ type Result struct {
 // empty Choice, so the caller can reopen that session instead of launching a
 // fresh one.
 func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
-	comboItems := buildComboItems(ms)
-	// If the only combo item is the manual fall-through, skip straight to
-	// manual selection — there are no combos worth showing.
-	startStep := stepCombo
-	var items []list.Item
-	if len(comboItems) <= 1 {
-		startStep = stepOrchestrator
-		items = buildModelItems(ms)
-	} else {
-		items = comboItems
+	catalog := newFallbackManager("")
+	catalog.allModelsProvider = provider
+	if len(ms) > 0 {
+		catalog.seedProvider(provider, ms)
 	}
-	if resume != nil {
-		items = append([]list.Item{resumeItem{opt: *resume}}, items...)
+	m := model{
+		all:       ms,
+		provider:  provider,
+		subtitle:  providerSubtitle(provider),
+		step:      stepCombo,
+		hasCombos: true,
+		catalog:   &catalog,
+		resume:    resume,
 	}
+	items := m.startItems()
 
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
 	l.Title = ""
@@ -393,13 +587,8 @@ func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(false)
 
-	p := tea.NewProgram(model{
-		list:      l,
-		all:       ms,
-		subtitle:  providerSubtitle(provider),
-		step:      startStep,
-		hasCombos: startStep == stepCombo,
-	})
+	m.list = l
+	p := tea.NewProgram(m)
 	res, err := p.Run()
 	if err != nil {
 		return Result{}
@@ -414,5 +603,5 @@ func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
 	if mm.quit || mm.choice == "" {
 		return Result{Quit: mm.quit, FreePool: mm.freePool}
 	}
-	return Result{Choice: mm.choice, Worker: mm.worker, FreePool: mm.freePool}
+	return Result{Choice: mm.choice, Provider: mm.choiceVia, Worker: mm.worker, FreePool: mm.freePool}
 }
