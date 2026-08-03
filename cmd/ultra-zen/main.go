@@ -542,6 +542,35 @@ func main() {
 		*workerModel = ""
 	}
 	selected := models.Find(list, modelID)
+	if selected == nil && len(freeModels) > 0 {
+		// The configured primary is no longer served by its provider (e.g. a
+		// stale saved pool route). Promote the first still-available route
+		// from the pool instead of aborting the launch; the dead route is
+		// pruned from the saved pool below.
+		for _, raw := range freeModels {
+			poolProvider, poolModel, err := splitFreeModelSpec(raw)
+			if err != nil {
+				die(err)
+			}
+			plist, pkey := list, key
+			if poolProvider != *provider {
+				plist, pkey, err = loadTUIProvider(httpClient, poolProvider, *authPath, *openRouterKey, *apiKey)
+				if err != nil {
+					continue
+				}
+			}
+			candidate := models.Find(plist, poolModel)
+			if candidate == nil || !candidate.Free {
+				continue
+			}
+			warn("primary model %q is no longer available; promoting pool route %s", modelID, raw)
+			list, key = plist, pkey
+			*provider = poolProvider
+			selected = candidate
+			modelID = candidate.ID
+			break
+		}
+	}
 	if selected == nil {
 		die(fmt.Errorf("model %q not found; run `ultra-zen --list` to see available models", modelID))
 	}
@@ -678,6 +707,12 @@ func main() {
 		})
 	}
 
+	// staleRoutes remembers pool entries that are permanently gone from their
+	// provider's live catalog. They are skipped with a warning instead of
+	// aborting the launch, and pruned from the saved pool afterwards so the
+	// next launch starts clean.
+	var staleRoutes []string
+
 	// With no explicit remainder (including a one-model --free-model launch),
 	// discover both providers from credentials already present on the machine.
 	// No extra credential prompt is introduced for an automatic alternate.
@@ -713,29 +748,38 @@ func main() {
 			switch poolProvider {
 			case "openrouter":
 				if err := ensureOpenRouter(true); err != nil {
-					die(fmt.Errorf("load OpenRouter free fallback %q: %w", id, err))
+					warn("skip OpenRouter free fallback %q: %v", id, err)
+					continue
 				}
 				fallback := models.Find(openRouterList, id)
 				if fallback == nil || !fallback.Free {
-					die(fmt.Errorf("OpenRouter free fallback %q not found; run `ultra-zen --list --provider openrouter`", id))
+					warn("OpenRouter free fallback %q is no longer available; skipping", id)
+					staleRoutes = append(staleRoutes, raw)
+					continue
 				}
 				addRoute("openrouter", fallback, openRouterPoolKey)
 			case "opencode-go":
 				if err := ensureZen(); err != nil {
-					die(fmt.Errorf("load opencode Zen free fallback %q: %w", id, err))
+					warn("skip opencode Zen free fallback %q: %v", id, err)
+					continue
 				}
 				fallback := models.Find(zenList, id)
 				if fallback == nil || !fallback.Free {
-					die(fmt.Errorf("opencode Zen free fallback %q not found; run `ultra-zen --list`", id))
+					warn("opencode Zen free fallback %q is no longer available; skipping", id)
+					staleRoutes = append(staleRoutes, raw)
+					continue
 				}
 				addRoute("opencode-go", fallback, zenPoolKey)
 			case "modelscope", "groq", "cerebras", "huggingface", "cohere":
 				if err := ensureFreeTier(poolProvider); err != nil {
-					die(fmt.Errorf("load %s free fallback %q: %w", poolProvider, id, err))
+					warn("skip %s free fallback %q: %v", poolProvider, id, err)
+					continue
 				}
 				fallback := models.Find(freeTierLists[poolProvider], id)
 				if fallback == nil || !fallback.Free {
-					die(fmt.Errorf("%s free fallback %q not found; run `ultra-zen --list --provider %s`", poolProvider, id, poolProvider))
+					warn("%s free fallback %q is no longer available; skipping", poolProvider, id)
+					staleRoutes = append(staleRoutes, raw)
+					continue
 				}
 				addRoute(poolProvider, fallback, freeTierKeys[poolProvider])
 			case "codex":
@@ -743,6 +787,24 @@ func main() {
 			default:
 				die(fmt.Errorf("unknown free fallback provider %q", poolProvider))
 			}
+		}
+	}
+
+	// Refresh the saved pool on every launch: drop routes that no longer exist
+	// in a provider's live catalog so a dead entry can never block a launch.
+	if len(staleRoutes) > 0 {
+		dead := make(map[string]bool, len(staleRoutes))
+		for _, r := range staleRoutes {
+			dead[r] = true
+		}
+		var keep []tui.FreeRoute
+		for _, route := range tui.LoadFreePool() {
+			if !dead[route.String()] {
+				keep = append(keep, route)
+			}
+		}
+		if err := tui.SaveFreePool(keep); err != nil {
+			warn("could not prune stale routes from saved free pool: %v", err)
 		}
 	}
 
@@ -892,6 +954,12 @@ func waitForHealth(base string, timeout time.Duration) error {
 func die(err error) {
 	fmt.Fprintf(os.Stderr, "ultra-zen: %v\n", err)
 	os.Exit(1)
+}
+
+// warn reports a non-fatal problem to stderr (e.g. a stale free-pool route
+// that is skipped instead of aborting the launch).
+func warn(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ultra-zen: "+format+"\n", args...)
 }
 
 // redirectProxyLog points the standard logger (used by internal/proxy via
