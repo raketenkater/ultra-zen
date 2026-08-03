@@ -88,9 +88,15 @@ func LoadCombos() []Combo {
 }
 
 // RecordCombo moves the (orch, worker) pairing to the front and persists it.
+// A worker identical to the orchestrator is recorded as no worker: the two
+// would render as the same row in the picker and the model row already covers
+// that case.
 func RecordCombo(orchestrator, worker string) {
 	if orchestrator == "" {
 		return
+	}
+	if worker == orchestrator {
+		worker = ""
 	}
 	combos := LoadCombos()
 	out := make([]Combo, 0, len(combos)+1)

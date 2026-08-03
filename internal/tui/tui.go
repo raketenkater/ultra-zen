@@ -251,8 +251,26 @@ func (m *model) startItems() []list.Item {
 		}
 	}
 	// Every model from the initially selected provider is directly launchable;
-	// the manual row remains for the legacy orchestrator/worker flow.
-	items = append(items, buildModelItems(m.all)...)
+	// the manual row remains for the legacy orchestrator/worker flow. On the
+	// opencode Zen provider the free models are rotation-only (they back the
+	// Free cycle and the proxy fallback pool), so the start screen leads with
+	// the paid go-tier models; the manual flow and Claude Code's /model list
+	// still reach the free ones.
+	paidAvailable := false
+	if m.provider == "opencode-go" {
+		for _, model := range m.all {
+			if !model.Free {
+				paidAvailable = true
+				break
+			}
+		}
+	}
+	for _, item := range buildModelItems(m.all) {
+		if mi, ok := item.(modelItem); ok && paidAvailable && mi.m.Free {
+			continue
+		}
+		items = append(items, item)
+	}
 	local := make(map[string]bool, len(m.all))
 	for _, model := range m.all {
 		local[model.ID] = true
@@ -507,17 +525,22 @@ func buildModelItems(ms []models.Model) []list.Item {
 
 // buildComboItems returns recent combos first, then recommended combos whose
 // models are actually available, then the manual fall-through. Only combos
-// whose orchestrator (and worker, if set) exist in ms are shown.
+// whose orchestrator (and worker, if set) exist in ms are shown. A combo with
+// an empty or self-paired worker renders identically to the model row itself,
+// so only real orchestrator+worker pairings become rows.
 func buildComboItems(ms []models.Model) []list.Item {
 	avail := make(map[string]bool, len(ms))
 	for _, m := range ms {
 		avail[m.ID] = true
 	}
 	comboOK := func(c models.Combo) bool {
+		if c.Worker == "" || c.Worker == c.Orchestrator {
+			return false
+		}
 		if !avail[c.Orchestrator] {
 			return false
 		}
-		return c.Worker == "" || avail[c.Worker]
+		return avail[c.Worker]
 	}
 	seen := make(map[string]bool)
 	key := func(c models.Combo) string { return c.Orchestrator + "|" + c.Worker }

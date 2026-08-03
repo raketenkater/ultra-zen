@@ -716,8 +716,10 @@ func main() {
 	// With no explicit remainder (including a one-model --free-model launch),
 	// discover both providers from credentials already present on the machine.
 	// No extra credential prompt is introduced for an automatic alternate.
+	// Free models are rotation: they back a paid primary as fallbacks, and a
+	// free primary gets the other providers' free routes.
 	automaticPool := !explicitFreePool || len(freeModels) == 0
-	if automaticPool && *workerModel == "" && selected.Free {
+	if automaticPool && *workerModel == "" {
 		if selected.Base == models.OpenRouterBase {
 			if err := ensureOpenRouter(false); err == nil && selected.ID != "openrouter/free" {
 				addRoute("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)

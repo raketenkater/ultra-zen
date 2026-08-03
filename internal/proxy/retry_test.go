@@ -496,3 +496,97 @@ func TestRepairKeepsResolved(t *testing.T) {
 		t.Fatalf("expected no change, got %d messages: %+v", len(out), out)
 	}
 }
+
+// TestErrorBodyWith200Rotates verifies that a gateway which serves an error
+// object with HTTP 200 (e.g. ModelScope's insufficient_quota) rotates to the
+// next route instead of handing Claude Code an empty success.
+func TestErrorBodyWith200Rotates(t *testing.T) {
+	var errorCalls, fallbackCalls int
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		errorCalls++
+		w.Write([]byte(`{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}`))
+	}))
+	defer errSrv.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer fallback.Close()
+
+	srv := New(Config{
+		Provider: "modelscope",
+		BaseURL:  errSrv.URL,
+		APIKey:   "ms-key",
+		Model:    "gated-model",
+		Fallbacks: []Upstream{{
+			Provider: "opencode-go", BaseURL: fallback.URL, APIKey: "zen-key", Model: "zen-free",
+		}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+		`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 from fallback", resp.StatusCode)
+	}
+	if errorCalls != 1 || fallbackCalls != 1 {
+		t.Fatalf("calls error=%d fallback=%d", errorCalls, fallbackCalls)
+	}
+}
+
+// TestDegenerate200IsRetiredAndReported verifies that an empty completion
+// (choices:null served with HTTP 200) retires the route permanently, reports
+// it via OnUnavailable, and rotates to the fallback.
+func TestDegenerate200IsRetiredAndReported(t *testing.T) {
+	var emptyCalls int
+	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		emptyCalls++
+		w.Write([]byte(`{"id":"","object":"","created":0,"model":"dud","choices":null,"usage":{"prompt_tokens":0,"completion_tokens":0}}`))
+	}))
+	defer empty.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer fallback.Close()
+
+	var unavailable Upstream
+	srv := New(Config{
+		Provider: "modelscope",
+		BaseURL:  empty.URL,
+		APIKey:   "ms-key",
+		Model:    "dud-model",
+		Fallbacks: []Upstream{{
+			Provider: "opencode-go", BaseURL: fallback.URL, APIKey: "zen-key", Model: "zen-free",
+		}},
+		OnUnavailable: func(route Upstream) { unavailable = route },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d", i+1, resp.StatusCode)
+		}
+	}
+	if emptyCalls != 1 {
+		t.Fatalf("dud route called %d times, want 1 (retired after first failure)", emptyCalls)
+	}
+	if unavailable.Provider != "modelscope" || unavailable.Model != "dud-model" {
+		t.Fatalf("unavailable callback = %+v", unavailable)
+	}
+}

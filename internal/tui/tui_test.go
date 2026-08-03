@@ -213,12 +213,45 @@ func TestStartScreenShowsCycleAndAllConfiguredProviderModels(t *testing.T) {
 	}
 	for _, want := range []string{
 		"opencode-go:zen-paid",
-		"opencode-go:zen-free",
 		"openrouter:vendor/router-model:free",
 	} {
 		if !modelsFound[want] {
 			t.Errorf("start screen missing %s; found %v", want, modelsFound)
 		}
+	}
+	// Free models are rotation-only on the Zen provider (paid alternatives
+	// exist), so they must not appear as directly launchable rows.
+	if modelsFound["opencode-go:zen-free"] {
+		t.Error("free model rows must not appear on the Zen start screen when paid models exist")
+	}
+}
+
+func TestStartScreenShowsFreeModelsWhenNoPaidTier(t *testing.T) {
+	ms := []models.Model{
+		{ID: "only-free", Name: "only-free", Base: models.MainBase, Free: true},
+	}
+	catalog := newFallbackManager("")
+	catalog.seedProvider("opencode-go", ms)
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+		catalog:  &catalog,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+	found := false
+	for _, item := range m.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "only-free" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("free model must stay launchable when no paid tier exists")
 	}
 }
 

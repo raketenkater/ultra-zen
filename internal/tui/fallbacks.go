@@ -245,7 +245,7 @@ func (m *fallbackManager) fetch(provider string) tea.Cmd {
 				return fallbackLoaded{provider: provider}
 			}
 			list, err := models.List(&http.Client{Timeout: 4 * time.Second}, key)
-			return fallbackLoaded{provider: provider, models: list, key: key, err: err}
+			return fallbackLoaded{provider: provider, models: models.FilterUnavailable(provider, list), key: key, err: err}
 		}
 	}
 	return fetchProvider(provider)

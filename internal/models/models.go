@@ -123,11 +123,11 @@ func List(httpClient *http.Client, apiKey string) ([]Model, error) {
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Free != out[j].Free {
-			return out[i].Free // free tier first, paid go-tier second
+			return !out[i].Free // paid go-tier first, free tier second
 		}
 		return out[i].Name < out[j].Name
 	})
-	return out, nil
+	return FilterUnavailable("opencode-go", out), nil
 }
 
 // ListZenFree fetches only opencode's main free tier. It is used when Zen is
@@ -148,7 +148,7 @@ func ListZenFree(httpClient *http.Client, apiKey string) ([]Model, error) {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return FilterUnavailable("opencode-go", out), nil
 }
 
 func fetchIDs(c *http.Client, base, key string) ([]string, error) {
@@ -215,7 +215,7 @@ func ListOpenRouter(httpClient *http.Client, apiKey string) ([]Model, error) {
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
 	})
-	return out, nil
+	return FilterUnavailable("openrouter", out), nil
 }
 
 // ListCodex fetches the model list from a local Codex-compatible endpoint

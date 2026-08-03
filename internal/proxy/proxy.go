@@ -340,6 +340,41 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			if callErr != nil {
 				return nil, nil, Upstream{}, callErr
 			}
+			if candidate.StatusCode == http.StatusOK {
+				// Peek the body so a gateway error or empty completion served
+				// with HTTP 200 rotates to the next route instead of producing
+				// an empty assistant turn. The prefix is rewound, so a real
+				// completion/stream is passed through untouched.
+				prefix := make([]byte, 64*1024)
+				n, _ := io.ReadFull(candidate.Body, prefix)
+				prefix = prefix[:n]
+				candidate.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), candidate.Body))
+				switch classifyUpstreamBody(prefix) {
+				case bodyError:
+					if isFreeUsageLimit(prefix) {
+						s.exhaustProviderRoutes(choice.Upstream)
+					} else if isModelAccessDenied(prefix) {
+						s.limitRoute(choice.index, true)
+						if s.cfg.OnUnavailable != nil {
+							s.cfg.OnUnavailable(choice.Upstream)
+						}
+					} else {
+						s.limitRoute(choice.index, false)
+					}
+					log.Printf("ultra-zen proxy: upstream error body on %s: %s; rotating", choice.Model, truncate(string(prefix), 200))
+					lastPayload, lastBody, lastResp, lastUsed = p, prefix, candidate, choice.Upstream
+					candidate.Body.Close()
+					continue
+				case bodyDegenerate:
+					s.limitRoute(choice.index, true)
+					if s.cfg.OnUnavailable != nil {
+						s.cfg.OnUnavailable(choice.Upstream)
+					}
+					log.Printf("ultra-zen proxy: empty completion from %s; retiring route (%s)", choice.Model, truncate(string(prefix), 200))
+					candidate.Body.Close()
+					continue
+				}
+			}
 			if candidate.StatusCode == http.StatusForbidden {
 				body, _ := io.ReadAll(candidate.Body)
 				candidate.Body.Close()
@@ -538,14 +573,48 @@ func isFreeUsageLimit(body []byte) bool {
 	return strings.Contains(msg, "freeusagelimiterror") ||
 		strings.Contains(msg, "free usage limit") ||
 		strings.Contains(msg, "free allocation") ||
+		strings.Contains(msg, "gousagelimiterror") ||
 		strings.Contains(msg, "insufficient_quota") ||
 		strings.Contains(msg, "exceeded your current quota")
+}
+
+// classifyUpstreamBody peeks at a 200 response body prefix and decides whether
+// it is a usable completion, an upstream error object, or a degenerate
+// completion with no output at all. Several gateways (e.g. ModelScope) return
+// error objects and empty completions with HTTP 200; without this check the
+// proxy would hand Claude Code an empty assistant turn instead of rotating.
+const (
+	bodyOK int = iota
+	bodyError
+	bodyDegenerate
+)
+
+func classifyUpstreamBody(prefix []byte) int {
+	if len(prefix) == 0 {
+		return bodyDegenerate
+	}
+	compact := strings.ReplaceAll(strings.ToLower(string(prefix)), " ", "")
+	if strings.HasPrefix(compact, "data:") || strings.HasPrefix(compact, "event:") || strings.HasPrefix(compact, "[") {
+		return bodyOK // SSE stream or JSON-array framing
+	}
+	switch {
+	case strings.Contains(compact, `"error":{`) && !strings.Contains(compact, `"choices":`):
+		return bodyError
+	case strings.Contains(compact, `"choices":null`) || strings.Contains(compact, `"choices":[]`):
+		return bodyDegenerate
+	default:
+		return bodyOK
+	}
 }
 
 func isModelAccessDenied(body []byte) bool {
 	msg := strings.ToLower(string(body))
 	return strings.Contains(msg, "does not have access to this model") ||
-		strings.Contains(msg, "model access denied")
+		strings.Contains(msg, "model access denied") ||
+		// opencode Zen gates some models by region/account opt-in; the gateway
+		// answers 403 with a RegionError body.
+		strings.Contains(msg, "requires explicit opt in") ||
+		strings.Contains(msg, "only available hosted in")
 }
 
 func isOpenRouterDailyLimit(body []byte) bool {
