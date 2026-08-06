@@ -4,6 +4,16 @@ set -euo pipefail
 # ultra-zen installer — single-command setup
 # Usage: curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
 
+# Clean up the temp dir on any exit. TMPDIR is a global (set during main) so
+# this fires reliably even after main() returns — referencing an unset local
+# under `set -u` would error on every exit.
+cleanup() {
+    if [ "${TMPDIR_SET:-false}" = true ]; then
+        rm -rf "$TMPDIR"
+    fi
+}
+trap cleanup EXIT
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -18,6 +28,10 @@ BINDIR="${ULTRA_ZEN_BINDIR:-}"
 VERSION="${ULTRA_ZEN_VERSION:-latest}"
 INSTALL_DIR=""
 NEEDS_SUDO=false
+# Global (not function-local) so the EXIT trap below can reference it even
+# after main() returns; under `set -u` a trap on an unset local would error.
+TMPDIR=""
+TMPDIR_SET=false
 
 log_info()  { echo -e "${GREEN}→${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}!${NC} $1"; }
@@ -96,7 +110,7 @@ resolve_version() {
 main() {
     log_step "ultra-zen installer"
 
-    local platform version tarball url tmpdir
+    local platform version tarball url
 
     platform=$(detect_platform)
     version=$(resolve_version)
@@ -109,13 +123,15 @@ main() {
     tarball="${BINARY}_${version}_${platform}.tar.gz"
     url="https://github.com/${REPO}/releases/download/${version}/${tarball}"
 
-    # Create temp dir
-    tmpdir=$(mktemp -d)
-    trap 'rm -rf "$tmpdir"' EXIT
+    # Create temp dir. The temp path is stored in globals so the EXIT trap can
+    # remove it even after main() returns; the trap itself is installed once at
+    # the top of the script (see below).
+    TMPDIR=$(mktemp -d)
+    TMPDIR_SET=true
 
     # Download
     log_step "Downloading ${tarball}..."
-    if ! curl -fsSL --progress-bar -o "${tmpdir}/${tarball}" "$url"; then
+    if ! curl -fsSL --progress-bar -o "${TMPDIR}/${tarball}" "$url"; then
         log_error "Download failed: ${url}"
         log_info "The release may not yet have binaries for your platform."
         log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
@@ -124,12 +140,12 @@ main() {
 
     # Extract
     log_step "Extracting..."
-    tar -xzf "${tmpdir}/${tarball}" -C "${tmpdir}"
+    tar -xzf "${TMPDIR}/${tarball}" -C "${TMPDIR}"
 
     # Verify binary exists
-    if [ ! -f "${tmpdir}/${BINARY}" ]; then
+    if [ ! -f "${TMPDIR}/${BINARY}" ]; then
         log_error "Binary not found in archive. Contents:"
-        ls -la "${tmpdir}/"
+        ls -la "${TMPDIR}/"
         exit 1
     fi
 
@@ -137,10 +153,10 @@ main() {
     log_step "Installing to ${INSTALL_DIR}..."
     if [ "$NEEDS_SUDO" = true ]; then
         log_info "Need sudo for ${INSTALL_DIR}"
-        sudo cp "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        sudo cp "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
         sudo chmod +x "${INSTALL_DIR}/${BINARY}"
     else
-        cp "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+        cp "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
         chmod +x "${INSTALL_DIR}/${BINARY}"
     fi
 
