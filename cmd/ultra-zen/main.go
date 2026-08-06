@@ -39,6 +39,18 @@ import (
 // Version is set at build time via -ldflags. Falls back to "dev" in local builds.
 var Version = "dev"
 
+// autoSourceMaxRoutes caps how many routes a single provider contributes to the
+// automatic free pool. A daily free allocation is account-wide (the proxy
+// retires a provider's routes together on exhaustion), so sibling models only
+// help against per-model failures; an uncapped catalog would bury the
+// cross-provider routes that actually survive an exhausted account.
+const autoSourceMaxRoutes = 3
+
+// autoSourceOrder is the display order for probing other BYO free-tier
+// providers during automatic pool discovery (after the active provider, Zen,
+// and OpenRouter). Only providers with an already-stored key are ever loaded.
+var autoSourceOrder = []string{"modelscope", "groq", "cerebras", "huggingface", "cohere"}
+
 // modelFlag is a repeatable, comma-friendly model list. Keeping each selected
 // model explicit makes a free pool deterministic while still allowing the
 // convenient `--free-model a,b,c` spelling.
@@ -718,32 +730,86 @@ func main() {
 	var staleRoutes []string
 
 	// With no explicit remainder (including a one-model --free-model launch),
-	// discover both providers from credentials already present on the machine.
-	// No extra credential prompt is introduced for an automatic alternate.
-	// Free models are rotation: they back a paid primary as fallbacks, and a
-	// free primary gets the other providers' free routes.
+	// discover free routes from every provider whose credentials already exist
+	// on the machine. No extra credential prompt is introduced for an automatic
+	// alternate. Free models are rotation: they back a paid primary as
+	// fallbacks, and a free primary gets the other providers' free routes.
+	//
+	// Each source contributes at most autoSourceMaxRoutes so a large catalog
+	// (e.g. OpenRouter's hundreds of :free models) cannot bury the cross-provider
+	// routes that actually survive an exhausted account. The active provider's
+	// own free catalog is probed first, then opencode Zen, then OpenRouter, then
+	// any other BYO free tier whose key is already stored. Every skipped source
+	// is reported so a silently empty pool is never launched without feedback.
 	automaticPool := !explicitFreePool || len(freeModels) == 0
 	if automaticPool && *workerModel == "" {
-		if selected.Base == models.OpenRouterBase {
+		var skipped []string
+		route := func(p string, model *models.Model, poolKey string) {
+			if model == nil || !model.Free {
+				return
+			}
+			addRoute(p, model, poolKey)
+		}
+
+		// 1. The active provider's own free catalog (BYO free tiers mark every
+		// model Free). The primary is excluded from its own provider's siblings.
+		own := freeTierModels(list)
+		for i := range own {
+			if i >= autoSourceMaxRoutes {
+				break
+			}
+			route(*provider, &own[i], key)
+		}
+		// When the active provider IS the source, its own siblings already filled
+		// up to autoSourceMaxRoutes — that alone is a pool, so stop early.
+
+		// 2. opencode Zen free tier (if not the active provider).
+		if *provider != "opencode-go" {
+			if err := ensureZen(); err == nil {
+				free := freeTierModels(zenList)
+				for i := range free {
+					if i >= autoSourceMaxRoutes {
+						break
+					}
+					route("opencode-go", &free[i], zenPoolKey)
+				}
+			} else {
+				skipped = append(skipped, "opencode Zen: "+err.Error())
+			}
+		}
+		// 3. OpenRouter free router (if not the active provider).
+		if *provider != "openrouter" {
 			if err := ensureOpenRouter(false); err == nil && selected.ID != "openrouter/free" {
-				addRoute("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+				route("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+			} else if err != nil {
+				skipped = append(skipped, "OpenRouter: "+err.Error())
 			}
-			if err := ensureZen(); err == nil {
-				free := freeTierModels(zenList)
-				for i := range free {
-					addRoute("opencode-go", &free[i], zenPoolKey)
+		}
+		// 4. Other BYO free tiers whose keys are already stored. Never prompts
+		// for a new credential — ProviderKey returns "" when no key exists.
+		for _, p := range autoSourceOrder {
+			if p == *provider || p == "opencode-go" || p == "openrouter" {
+				continue
+			}
+			if err := ensureFreeTier(p); err != nil {
+				skipped = append(skipped, p+": "+err.Error())
+				continue
+			}
+			free := freeTierModels(freeTierLists[p])
+			for i := range free {
+				if i >= autoSourceMaxRoutes {
+					break
 				}
+				route(p, &free[i], freeTierKeys[p])
 			}
-		} else {
-			if err := ensureZen(); err == nil {
-				free := freeTierModels(zenList)
-				for i := range free {
-					addRoute("opencode-go", &free[i], zenPoolKey)
-				}
+		}
+
+		// Report every skipped source so an empty pool is never silent.
+		if len(fallbackRoutes) == 0 && len(skipped) > 0 {
+			for _, s := range skipped {
+				warn("automatic free rotation unavailable — %s", s)
 			}
-			if err := ensureOpenRouter(false); err == nil {
-				addRoute("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
-			}
+			warn("no automatic free rotation configured; set an OpenRouter/Zen key or run the TUI 'f' (Free cycle) screen")
 		}
 	} else if explicitFreePool {
 		for _, raw := range freeModels {

@@ -45,8 +45,12 @@ type streamState struct {
 	started     bool
 	blockIndex  int
 	textOpen    bool
-	toolBlocks  map[int]int  // openai tool index -> anthropic block index
-	toolStarted map[int]bool
+	// toolBlocks/toolStarted are keyed by tool id (not openai index): some
+	// providers reuse index 0 for each new tool call, so keying by index would
+	// collapse a second subagent spawn into the first block and the agent
+	// overview would show one agent instead of many.
+	toolBlocks  map[string]int  // tool id -> anthropic block index
+	toolStarted map[string]bool
 	finish      string
 	output      int
 }
@@ -59,8 +63,8 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		w:           w,
 		flusher:     flusher,
 		model:       model,
-		toolBlocks:  make(map[int]int),
-		toolStarted: make(map[int]bool),
+		toolBlocks:  make(map[string]int),
+		toolStarted: make(map[string]bool),
 	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -152,12 +156,28 @@ func (s *streamState) emitToolDelta(tc streamTool) {
 		s.blockIndex++
 		s.textOpen = false
 	}
-	if !s.toolStarted[tc.Index] {
-		s.toolStarted[tc.Index] = true
-		s.toolBlocks[tc.Index] = s.blockIndex
+	// Key tool blocks by id, not index. OpenAI providers may announce multiple
+	// tool calls in one delta (indices 0..N) or reuse index 0 for each new call
+	// in a later chunk; keying by index would collapse distinct subagent spawns
+	// into one block and the agent overview would show one agent instead of many.
+	key := tc.ID
+	if key == "" {
+		// Some providers omit the id on argument-delta chunks. Fall back to the
+		// index so those deltas still reach a block started by an id'd chunk.
+		key = fmt.Sprintf("idx%d", tc.Index)
+	}
+	if !s.toolStarted[key] {
+		s.toolStarted[key] = true
+		// Advance the block index for this new tool block. Without this, two
+		// tool_use blocks emitted back-to-back (no intervening text block) both
+		// get the same index — Anthropic requires sequential, unique content
+		// block indices, and Claude Code keys its agent-overview tracking on
+		// block id + index.
+		s.toolBlocks[key] = s.blockIndex
+		s.blockIndex++
 		s.writeEvent("content_block_start", map[string]any{
 			"type":  "content_block_start",
-			"index": s.blockIndex,
+			"index": s.toolBlocks[key],
 			"content_block": map[string]any{
 				"type":  "tool_use",
 				"id":    tc.ID,
@@ -169,7 +189,7 @@ func (s *streamState) emitToolDelta(tc streamTool) {
 	if tc.Function.Arguments != "" {
 		s.writeEvent("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
-			"index": s.toolBlocks[tc.Index],
+			"index": s.toolBlocks[key],
 			"delta": map[string]any{"type": "input_json_delta", "partial_json": tc.Function.Arguments},
 		})
 	}
@@ -186,9 +206,9 @@ func (s *streamState) finishStream() {
 		s.textOpen = false
 		s.blockIndex++
 	}
-	for idx, started := range s.toolStarted {
+	for key, started := range s.toolStarted {
 		if started {
-			s.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.toolBlocks[idx]})
+			s.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.toolBlocks[key]})
 		}
 	}
 	stop := mapStopReason(s.finish)
