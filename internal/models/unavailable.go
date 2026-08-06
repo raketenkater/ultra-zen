@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/raketenkater/ultra-zen/internal/flock"
 )
 
 // unavailableModel is a provider/model pair that the provider advertised but
@@ -141,6 +143,11 @@ func MarkUnavailable(provider, model string) error {
 	}
 	unavailableMu.Lock()
 	defer unavailableMu.Unlock()
+	// Cross-process lock: another concurrent ultra-zen session may be
+	// read-modify-writing this same file right now. flock serializes the whole
+	// load-modify-save cycle so neither session's update is lost.
+	guard := flock.Lock(unavailablePath())
+	defer guard.Close()
 	entries := loadUnavailableLocked()
 	entries[unavailableKey(provider, model)] = unavailableModel{
 		Provider: provider,
@@ -156,6 +163,8 @@ func ClearUnavailable(provider string) error {
 	provider = strings.TrimSpace(provider)
 	unavailableMu.Lock()
 	defer unavailableMu.Unlock()
+	guard := flock.Lock(unavailablePath())
+	defer guard.Close()
 	entries := loadUnavailableLocked()
 	for key, entry := range entries {
 		if entry.Provider == provider {

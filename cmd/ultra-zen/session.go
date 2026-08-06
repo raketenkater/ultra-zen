@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/raketenkater/ultra-zen/internal/session"
@@ -349,11 +348,30 @@ func applyResumeOverrides(recorded, overrides []string) []string {
 	return out
 }
 
+// stripLaunchPort removes --port N / --port=N from a recorded launch so a
+// resume always binds a fresh free port. Replaying an explicit --port onto a
+// still-live session would fail with "address already in use" and kill the
+// resume; the default is port 0 (OS-assigned) which can never collide.
+func stripLaunchPort(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--port" && i+1 < len(args):
+			i++ // also drop the value
+		case args[i] == "--port":
+		case strings.HasPrefix(args[i], "--port="):
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return out
+}
+
 // replayLaunchArgs returns the exact recorded command shape. Older TUI
 // records have an empty LaunchArgs field, so reconstruct at least the model,
 // provider, worker and port from their structured fields.
 func replayLaunchArgs(rec session.Record) ([]string, error) {
-	launchArgs := stripResumeArgs(rec.LaunchArgs)
+	launchArgs := stripLaunchPort(stripResumeArgs(rec.LaunchArgs))
 	if len(launchArgs) > 0 {
 		return launchArgs, nil
 	}
@@ -367,9 +385,9 @@ func replayLaunchArgs(rec session.Record) ([]string, error) {
 	if rec.WorkerModel != "" {
 		launchArgs = append(launchArgs, "--worker", rec.WorkerModel)
 	}
-	if rec.Port != 0 {
-		launchArgs = append(launchArgs, "--port", strconv.Itoa(rec.Port))
-	}
+	// The recorded --port is deliberately not replayed: resume should always
+	// bind a fresh OS-assigned free port so it can never collide with a
+	// still-live session that was launched with an explicit --port.
 	return launchArgs, nil
 }
 

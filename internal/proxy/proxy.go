@@ -544,24 +544,22 @@ func (s *Server) promoteRoute(index int) {
 	s.poolMu.Unlock()
 }
 
-// waitOpenRouterSlot serializes this session's OpenRouter starts to the free
-// tier's documented requests-per-minute pace. Concurrent Claude subagents wait
-// here instead of bursting into avoidable 429 responses. Other ultra-zen
-// processes using the same account remain outside this limiter.
+// waitOpenRouterSlot serializes OpenRouter starts to the free tier's documented
+// requests-per-minute pace. The pace is account-shared: a flock-protected file
+// keyed by API key holds the next committed slot, so concurrent ultra-zen
+// processes using the same account collectively respect the real RPM instead of
+// each pacing independently at NxRPM. Concurrent Claude subagents also wait
+// here instead of bursting into avoidable 429 responses.
 func (s *Server) waitOpenRouterSlot(ctx context.Context, baseURL string) error {
 	if s.cfg.OpenRouterRPM <= 0 || !strings.Contains(strings.ToLower(baseURL), "openrouter.ai/") {
 		return nil
 	}
 	interval := time.Minute / time.Duration(s.cfg.OpenRouterRPM)
-	now := time.Now()
+	// The in-process gate keeps this Server's own starts ordered even when the
+	// pace file is unavailable; the shared file provides cross-process pacing.
 	s.gateMu.Lock()
-	slot := now
-	if s.nextOpenRouter.After(slot) {
-		slot = s.nextOpenRouter
-	}
-	s.nextOpenRouter = slot.Add(interval)
-	s.gateMu.Unlock()
-	return sleepContext(ctx, time.Until(slot))
+	defer s.gateMu.Unlock()
+	return waitAccountOpenRouterSlot(ctx, interval, s.cfg.APIKey)
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {

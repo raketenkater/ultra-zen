@@ -111,6 +111,27 @@ func TestApplyResumeOverridesReplacesExistingValue(t *testing.T) {
 	}
 }
 
+func TestStripLaunchPort(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"bare flag", []string{"glm-5.1", "--port", "8787"}, []string{"glm-5.1"}},
+		{"equals form", []string{"glm-5.1", "--port=8787", "--worker", "w"}, []string{"glm-5.1", "--worker", "w"}},
+		{"no port", []string{"glm-5.1", "--worker", "w"}, []string{"glm-5.1", "--worker", "w"}},
+		{"port at end", []string{"glm-5.1", "--port"}, []string{"glm-5.1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripLaunchPort(tc.in)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("stripLaunchPort(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReplayLegacyTUISessionRestoresProvider(t *testing.T) {
 	rec := session.Record{
 		SessionID:   "072e63a1-819a-4682-a742-559695c3cd76",
@@ -123,7 +144,10 @@ func TestReplayLegacyTUISessionRestoresProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "zai-org/GLM-5.2,--provider,modelscope,--worker,worker,--port,8787"
+	// The recorded --port is deliberately NOT replayed: a resume always binds a
+	// fresh OS-assigned free port so it can never collide with a still-live
+	// session launched with an explicit --port.
+	want := "zai-org/GLM-5.2,--provider,modelscope,--worker,worker"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("replayLaunchArgs = %v, want %s", got, want)
 	}

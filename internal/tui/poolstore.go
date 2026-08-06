@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/raketenkater/ultra-zen/internal/flock"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
@@ -58,6 +59,8 @@ func LoadFreePool() []FreeRoute {
 	if path == "" {
 		return nil
 	}
+	guard := flock.Lock(path)
+	defer guard.Close()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
