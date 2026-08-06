@@ -68,6 +68,13 @@ func (r *openAIResponse) toAnthropic(model string) *anthropicResponse {
 	}
 	choice := r.Choices[0]
 	resp.StopReason = mapStopReason(choice.FinishReason)
+	// Tool-block-aware stop_reason: when the gateway emitted tool_calls but the
+	// finish_reason is missing/"stop", Claude Code must still see stop_reason
+	// "tool_use" or it will never execute the pending tool call (breaking
+	// subagent spawn / MCP research). This mirrors the stream path.
+	if len(choice.Message.ToolCalls) > 0 && resp.StopReason != "tool_use" {
+		resp.StopReason = "tool_use"
+	}
 
 	if choice.Message.Content != "" {
 		resp.Content = append(resp.Content, anthropicContentBlock{Type: "text", Text: choice.Message.Content})

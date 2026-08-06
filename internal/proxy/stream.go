@@ -195,6 +195,16 @@ func (s *streamState) finishStream() {
 	if stop == "" {
 		stop = "end_turn"
 	}
+	// Tool-block-aware stop_reason: if the upstream emitted tool_use blocks but
+	// never delivered a final finish_reason chunk (some gateways end with a
+	// usage-only chunk or just [DONE]), force stop_reason to "tool_use".
+	// Otherwise Claude Code treats the turn as finished and never executes the
+	// pending tool call — breaking subagent spawn (agent overview) and MCP
+	// research calls. The same guard applies when a gateway sends
+	// finish_reason="stop" despite emitting tool_calls.
+	if len(s.toolStarted) > 0 && stop != "tool_use" {
+		stop = "tool_use"
+	}
 	s.writeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},

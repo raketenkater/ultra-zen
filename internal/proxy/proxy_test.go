@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -128,5 +129,54 @@ func TestMapStopReason(t *testing.T) {
 		if got := mapStopReason(in); got != want {
 			t.Fatalf("mapStopReason(%q)=%q want %q", in, got, want)
 		}
+	}
+}
+
+// TestStreamStopReasonToolUseWhenToolEmitted verifies the stream path stays
+// tool-aware: an SSE stream that emits tool_calls deltas but never a final
+// finish_reason chunk (the gateway ends with a usage-only chunk or [DONE]) must
+// produce an Anthropic message_delta with stop_reason="tool_use". Otherwise
+// Claude Code treats the turn as finished and never runs the subagent/ MCP call.
+func TestStreamStopReasonToolUseWhenToolEmitted(t *testing.T) {
+	sse := "data: " + `{"id":"c1","choices":[{"delta":{"role":"assistant","content":""}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"tu1","type":"function","function":{"name":"spawn_agent","arguments":"{}"}}]}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "text/event-stream")
+	if err := streamTranslate(rec, strings.NewReader(sse), "claude-sonnet"); err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, `"stop_reason":"tool_use"`) {
+		t.Fatalf("message_delta missing stop_reason=tool_use; got: %s", out)
+	}
+	if !strings.Contains(out, `"type":"tool_use"`) || !strings.Contains(out, `"name":"spawn_agent"`) {
+		t.Fatalf("tool_use content block missing; got: %s", out)
+	}
+}
+
+// TestToAnthropicToolUseWithMissingFinishReason covers the case that breaks
+// subagent spawn / MCP research: a gateway emits tool_calls but finishes with
+// stop (or omits finish_reason). The stop_reason must still be "tool_use" or
+// Claude Code never executes the pending tool call.
+func TestToAnthropicToolUseWithMissingFinishReason(t *testing.T) {
+	for name, raw := range map[string]string{
+		"stop_with_tool_calls":   `{"id":"c1","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"tu1","function":{"name":"spawn_agent","arguments":"{}"}}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+		"empty_finish_tool_calls": `{"id":"c1","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"tu1","function":{"name":"spawn_agent","arguments":"{}"}}]},"finish_reason":""}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var o openAIResponse
+			if err := json.Unmarshal([]byte(raw), &o); err != nil {
+				t.Fatal(err)
+			}
+			a := o.toAnthropic("claude-sonnet")
+			if a.StopReason != "tool_use" {
+				t.Fatalf("stop_reason=%q, want tool_use (pending tool call must run)", a.StopReason)
+			}
+			if len(a.Content) != 1 || a.Content[0].Type != "tool_use" {
+				t.Fatalf("content wrong: %+v", a.Content)
+			}
+		})
 	}
 }
