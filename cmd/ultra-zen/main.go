@@ -496,7 +496,11 @@ func main() {
 			if m.Free {
 				tag = " (free)"
 			}
-			fmt.Printf("%2d. %-28s  %s%s\n", i+1, m.ID, m.Base, tag)
+			ctx := ""
+			if m.ContextLength > 0 {
+				ctx = fmt.Sprintf("  [%dk]", m.ContextLength/1024)
+			}
+			fmt.Printf("%2d. %-28s  %s%s%s\n", i+1, m.ID, m.Base, tag, ctx)
 		}
 		return
 	}
@@ -871,7 +875,7 @@ func main() {
 		cancel()
 	}()
 
-	env := claude.Env(srv.BaseURL(), selected.ID)
+	env := claude.Env(srv.BaseURL(), selected.ID, selected.ContextLength)
 
 	// Resolve the ultra-zen binary path so the Workflow PreToolUse hook can
 	// invoke `ultra-zen workflow-hook` by absolute path (works even if ultra-zen

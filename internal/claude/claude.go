@@ -18,11 +18,26 @@ import (
 // JavaScript's maximum safe timer value: ~24.8 days, effectively no deadline.
 const noTimeoutMS = 2147483647
 
+// contextWindowDefault is the context length assumed when the gateway's model
+// metadata doesn't include one. 200k is Claude Code's default assumption for
+// custom endpoints; it's generous for Zen models (which are typically 128k-262k)
+// but safe — the autocompact percentage scales it down.
+const contextWindowDefault = 200_000
+
 // Env returns the child environment that points Claude Code at the local proxy.
 // Every inference tier maps to the same model so background/subagent work stays
 // on the selected Zen model. The real ANTHROPIC_API_KEY is dropped so the dummy
 // auth token + base URL take effect.
-func Env(proxyURL, model string) []string {
+//
+// contextLength is the model's real context window in tokens as reported by the
+// gateway's GET /models endpoint. It sets CLAUDE_MAX_SESSION_TOKENS so Claude
+// Code knows the actual window and can compute the autocompact threshold
+// correctly. When zero (gateway didn't report it), a safe default is used.
+func Env(proxyURL, model string, contextLength int) []string {
+	maxTokens := contextLength
+	if maxTokens <= 0 {
+		maxTokens = contextWindowDefault
+	}
 	var env []string
 	for _, kv := range os.Environ() {
 		key, _, _ := strings.Cut(kv, "=")
@@ -32,7 +47,7 @@ func Env(proxyURL, model string) []string {
 			"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
 			"API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT", "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS",
 			"CLAUDE_ENABLE_BYTE_WATCHDOG", "CLAUDE_ENABLE_STREAM_WATCHDOG",
-			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
+			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_MAX_SESSION_TOKENS":
 			continue
 		}
 		env = append(env, kv)
@@ -50,13 +65,14 @@ func Env(proxyURL, model string) []string {
 		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",
 		"CLAUDE_ENABLE_STREAM_WATCHDOG=0",
 		"API_FORCE_IDLE_TIMEOUT=0",
-		// Behind a custom base URL Claude Code assumes a 200k window and won't
-		// auto-compact until ~92% (~184k tokens). The Zen gateway models have a
-		// smaller real context, so the conversation overflows and the gateway
-		// fails the request ("Upstream request failed" / context_length). Compact
-		// early at a conservative percentage so agents never overflow. A user-set
-		// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE in the environment still takes precedence.
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "60"),
+		// Set the real context window so Claude Code's autocompaction engine
+		// knows exactly when to compact. Without this Claude Code defaults to a
+		// 200k assumption, so the conversation overflows the gateway's real limit
+		// and fails with "context_length" before compation ever triggers. The
+		// percentage override compacts earlier than the default ~92% to leave
+		// headroom for tool-call overhead that the tokeniser doesn't count.
+		fmt.Sprintf("CLAUDE_MAX_SESSION_TOKENS=%d", maxTokens),
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70"),
 	)
 }
 
@@ -80,8 +96,13 @@ func envOr(key, def string) string {
 // SettingsJSON returns the settings payload passed via --settings. hookCmd is
 // the command to run for the Workflow PreToolUse hook (typically the absolute
 // path to the ultra-zen binary plus "workflow-hook").
+//
+// The payload carries the ultracode flag. --settings replaces the project
+// .claude/settings.json for this session, so if ultracode is not emitted here a
+// project that opts in via its settings file would launch without it.
 func SettingsJSON(hookCmd string) string {
 	settings := map[string]any{
+		"ultracode": true,
 		"hooks": map[string]any{
 			"PreToolUse": []map[string]any{
 				{
@@ -150,18 +171,32 @@ func workflowPromptArgs(userArgs []string) []string {
 // built-in WebSearch/WebFetch tools are Anthropic server-side tools that
 // cannot run against the local proxy, so we disable WebSearch and wire a
 // no-key DuckDuckGo MCP in its place (when uvx is available). This keeps
-// Ultracode workflows and agents able to do online research. If the user
-// supplies their own --mcp-config or --disallowedTools we leave theirs alone.
+// Ultracode workflows and agents able to do online research.
+//
+// uvxPresent reports whether the uvx runner (which executes the no-key
+// DuckDuckGo MCP server) is on PATH. It is a var so tests can stub it; the
+// production value is exec.LookPath.
+var uvxPresent = func() bool {
+	_, err := exec.LookPath("uvx")
+	return err == nil
+}
+
+// The three flags are treated as one coherent block: WebSearch is only
+// disabled when a working replacement (the DDG MCP) is actually wired in.
+// Without uvx there is no replacement, so disabling WebSearch would leave web
+// research silently unavailable — in that case we leave WebSearch as-is and
+// return nothing. User-supplied --disallowedTools, --mcp-config, or
+// --allowedTools/--allowed-tools always win over these defaults.
 func researchArgs(userArgs []string) []string {
+	if hasArg(userArgs, "--mcp-config") {
+		return nil
+	}
+	if !uvxPresent() {
+		return nil
+	}
 	var out []string
 	if !hasArg(userArgs, "--disallowedTools") {
 		out = append(out, "--disallowedTools", "WebSearch")
-	}
-	if hasArg(userArgs, "--mcp-config") {
-		return out
-	}
-	if _, err := exec.LookPath("uvx"); err != nil {
-		return out
 	}
 	cfg := `{"mcpServers":{"ddg-search":{"command":"uvx","args":["duckduckgo-mcp-server"]}}}`
 	out = append(out, "--mcp-config", cfg)

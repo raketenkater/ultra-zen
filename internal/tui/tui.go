@@ -48,26 +48,31 @@ var (
 )
 
 func (i modelItem) Description() string {
+	var tier string
 	switch i.m.Base {
 	case baseOpenRouter:
-		return "OpenRouter free"
+		tier = "OpenRouter free"
 	case baseModelScope:
-		return "ModelScope free"
+		tier = "ModelScope free"
 	case baseGroq:
-		return "Groq free"
+		tier = "Groq free"
 	case baseCerebras:
-		return "Cerebras free"
+		tier = "Cerebras free"
 	case baseHuggingFace:
-		return "HuggingFace free"
+		tier = "HuggingFace free"
 	case baseCohere:
-		return "Cohere free"
-	}
-	switch {
-	case i.m.Free:
-		return "zen free tier"
+		tier = "Cohere free"
 	default:
-		return "opencode-go tier"
+		if i.m.Free {
+			tier = "zen free tier"
+		} else {
+			tier = "opencode-go tier"
+		}
 	}
+	if i.m.ContextLength > 0 {
+		tier += fmt.Sprintf(" · %dk ctx", i.m.ContextLength/1024)
+	}
+	return tier
 }
 func (i modelItem) FilterValue() string { return i.m.ID }
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ultra-zen installer — single-command setup
-# Usage: curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
 
 # Colors
 RED='\033[0;31m'

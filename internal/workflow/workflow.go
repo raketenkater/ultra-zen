@@ -23,8 +23,11 @@ const NoTimeoutMS = 2147483647
 
 // SystemPrompt is the belt-and-suspenders instruction appended to the session
 // system prompt. It asks the model to set stallMs itself; the hook rewriter
-// makes it deterministic.
-const SystemPrompt = "You are using a slow remote model through ultra-zen. Never abort a model request or agent merely because it is quiet while processing a prompt. For every Workflow tool script, set stallMs: 2147483647 in every agent() options object. This is required even for foreground agents and retries."
+// makes it deterministic. It also directs agents to the DuckDuckGo MCP for web
+// research instead of the Anthropic-only WebSearch tool (which is disabled on
+// the local ultra-zen proxy), so delegated research is never routed around a
+// denied tool.
+const SystemPrompt = "You are using a slow remote model through ultra-zen. Never abort a model request or agent merely because it is quiet while processing a prompt. For every Workflow tool script, set stallMs: 2147483647 in every agent() options object. This is required even for foreground agents and retries. For web research, use the DuckDuckGo MCP tools mcp__ddg-search__search and mcp__ddg-search__fetch_content. Do not use or mention the built-in WebSearch tool — it is disabled in this environment."
 
 // HookInput is the JSON Claude Code sends to a PreToolUse hook on stdin.
 type HookInput struct {

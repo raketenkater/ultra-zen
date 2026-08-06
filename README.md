@@ -46,7 +46,7 @@ ultra-zen
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
 ```
 
 Or with Go:
@@ -71,8 +71,8 @@ make build
   from `~/.local/share/opencode/auth.json` (or `~/.config/opencode/auth.json`).
 - **OpenRouter API key** (for `--provider openrouter`):
   get one at [openrouter.ai/keys](https://openrouter.ai/keys).
-- **uvx** (optional) for web research — `ultra-zen` wires a no-key DuckDuckGo
-  MCP in place of the Anthropic-only `WebSearch` tool.
+- **uvx** (optional) for web research — when present, `ultra-zen` wires a
+  no-key DuckDuckGo MCP and disables the Anthropic-only `WebSearch` tool.
 
 ### API keys
 
@@ -350,9 +350,13 @@ A `PreToolUse` hook rewrites Workflow `agent()` scripts to set `stallMs` to
 the maximum safe value, so background fan-out never aborts a quiet model.
 
 ### Web research
-The Anthropic-only `WebSearch` tool is disabled and replaced with a
-DuckDuckGo MCP (`mcp__ddg-search__search`, `mcp__ddg-search__fetch_content`)
-when `uvx` is present.
+The Anthropic-only `WebSearch` tool cannot run against the local proxy, so
+when `uvx` is present it is disabled and replaced with a no-key DuckDuckGo MCP
+(`mcp__ddg-search__search`, `mcp__ddg-search__fetch_content`). The three flags
+(`--disallowedTools WebSearch`, `--mcp-config`, `--allowedTools`) are emitted
+together as one block, so without `uvx` the built-in `WebSearch` is left
+untouched rather than disabling web research entirely. Your own
+`--disallowedTools` / `--mcp-config` / `--allowedTools` args always win.
 
 ## Project layout
 

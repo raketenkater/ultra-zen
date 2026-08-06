@@ -91,10 +91,11 @@ func ProviderKey(provider, flagKey, zenKey string) string {
 
 // Model is one selectable model.
 type Model struct {
-	ID   string // gateway model id, e.g. "glm-5.1"
-	Name string // human-friendly name
-	Base string // gateway base URL this model lives on
-	Free bool   // whether the model is a *-free variant
+	ID            string // gateway model id, e.g. "glm-5.1"
+	Name          string // human-friendly name
+	Base          string // gateway base URL this model lives on
+	Free          bool   // whether the model is a *-free variant
+	ContextLength int    // maximum context length in tokens (0 = unknown)
 }
 
 // List fetches all usable models for the given API key: every model on the
@@ -105,21 +106,21 @@ func List(httpClient *http.Client, apiKey string) ([]Model, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	goModels, goErr := fetchIDs(httpClient, GoBase, apiKey)
-	mainModels, mainErr := fetchIDs(httpClient, MainBase, apiKey)
+	goEntries, goErr := fetchEntries(httpClient, GoBase, apiKey)
+	mainEntries, mainErr := fetchEntries(httpClient, MainBase, apiKey)
 	if goErr != nil && mainErr != nil {
 		return nil, fmt.Errorf("go tier: %v; main tier: %w", goErr, mainErr)
 	}
 
 	var out []Model
-	for _, id := range goModels {
-		out = append(out, Model{ID: id, Name: pretty(id), Base: GoBase, Free: false})
+	for _, e := range goEntries {
+		out = append(out, Model{ID: e.ID, Name: pretty(e.ID), Base: GoBase, Free: false, ContextLength: e.ContextLength})
 	}
-	for _, id := range mainModels {
-		if !strings.HasSuffix(id, "-free") {
+	for _, e := range mainEntries {
+		if !strings.HasSuffix(e.ID, "-free") {
 			continue
 		}
-		out = append(out, Model{ID: id, Name: pretty(id), Base: MainBase, Free: true})
+		out = append(out, Model{ID: e.ID, Name: pretty(e.ID), Base: MainBase, Free: true, ContextLength: e.ContextLength})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Free != out[j].Free {
@@ -137,21 +138,29 @@ func ListZenFree(httpClient *http.Client, apiKey string) ([]Model, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	ids, err := fetchIDs(httpClient, MainBase, apiKey)
+	entries, err := fetchEntries(httpClient, MainBase, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("main free tier: %w", err)
 	}
 	var out []Model
-	for _, id := range ids {
-		if strings.HasSuffix(id, "-free") {
-			out = append(out, Model{ID: id, Name: pretty(id), Base: MainBase, Free: true})
+	for _, e := range entries {
+		if strings.HasSuffix(e.ID, "-free") {
+			out = append(out, Model{ID: e.ID, Name: pretty(e.ID), Base: MainBase, Free: true, ContextLength: e.ContextLength})
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return FilterUnavailable("opencode-go", out), nil
 }
 
-func fetchIDs(c *http.Client, base, key string) ([]string, error) {
+// apiModelEntry is one model returned by the gateway's GET /models endpoint.
+// We read context_length from the metadata so autocompaction can be set from
+// the model's real context window instead of a hardcoded guess.
+type apiModelEntry struct {
+	ID            string `json:"id"`
+	ContextLength int    `json:"context_length"`
+}
+
+func fetchEntries(c *http.Client, base, key string) ([]apiModelEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
 		return nil, err
@@ -167,18 +176,25 @@ func fetchIDs(c *http.Client, base, key string) ([]string, error) {
 		return nil, fmt.Errorf("GET %s/models: %s: %s", base, resp.Status, strings.TrimSpace(string(body)))
 	}
 	var payload struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []apiModelEntry `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("parse models: %w", err)
 	}
-	ids := make([]string, 0, len(payload.Data))
-	for _, m := range payload.Data {
-		ids = append(ids, m.ID)
+	sort.SliceStable(payload.Data, func(i, j int) bool { return payload.Data[i].ID < payload.Data[j].ID })
+	return payload.Data, nil
+}
+
+// fetchIDs is kept for tests that only need ID strings.
+func fetchIDs(c *http.Client, base, key string) ([]string, error) {
+	entries, err := fetchEntries(c, base, key)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(ids)
+	ids := make([]string, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
 	return ids, nil
 }
 
@@ -197,18 +213,19 @@ func ListOpenRouter(httpClient *http.Client, apiKey string) ([]Model, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	ids, err := fetchIDs(httpClient, OpenRouterBase, apiKey)
+	entries, err := fetchEntries(httpClient, OpenRouterBase, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("openrouter: %w", err)
 	}
 	var out []Model
-	for _, id := range ids {
-		if strings.Contains(id, ":free") || id == "openrouter/free" {
+	for _, e := range entries {
+		if strings.Contains(e.ID, ":free") || e.ID == "openrouter/free" {
 			out = append(out, Model{
-				ID:   id,
-				Name: pretty(id),
-				Base: OpenRouterBase,
-				Free: true,
+				ID:            e.ID,
+				Name:          pretty(e.ID),
+				Base:          OpenRouterBase,
+				Free:          true,
+				ContextLength: e.ContextLength,
 			})
 		}
 	}
@@ -226,17 +243,18 @@ func ListCodex(httpClient *http.Client, baseURL, apiKey string) ([]Model, error)
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	ids, err := fetchIDs(httpClient, baseURL, apiKey)
+	entries, err := fetchEntries(httpClient, baseURL, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("codex: %w", err)
 	}
 	var out []Model
-	for _, id := range ids {
+	for _, e := range entries {
 		out = append(out, Model{
-			ID:   id,
-			Name: pretty(id),
-			Base: baseURL,
-			Free: false, // subscription-backed, not free-tier
+			ID:            e.ID,
+			Name:          pretty(e.ID),
+			Base:          baseURL,
+			Free:          false, // subscription-backed, not free-tier
+			ContextLength: e.ContextLength,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -253,13 +271,13 @@ func ListFreeTier(httpClient *http.Client, base, apiKey string) ([]Model, error)
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	ids, err := fetchIDs(httpClient, base, apiKey)
+	entries, err := fetchEntries(httpClient, base, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", base, err)
 	}
 	var out []Model
-	for _, id := range ids {
-		out = append(out, Model{ID: id, Name: pretty(id), Base: base, Free: true})
+	for _, e := range entries {
+		out = append(out, Model{ID: e.ID, Name: pretty(e.ID), Base: base, Free: true, ContextLength: e.ContextLength})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
