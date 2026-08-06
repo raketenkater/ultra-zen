@@ -149,7 +149,11 @@ func (m *fallbackManager) Init() tea.Cmd {
 }
 
 // seedProvider reuses the primary provider list that main already fetched, so
-// the start screen can show it immediately without a duplicate request.
+// the start screen can show it immediately without a duplicate request. An
+// empty seed list is NOT silently hidden: it keeps the provider fetchable so
+// Init/refresh can retry it, instead of leaving the provider permanently
+// skipped (the statusHidden trap that hid every free model after a transient
+// empty catalog).
 func (m *fallbackManager) seedProvider(provider string, list []models.Model) {
 	st := m.states[provider]
 	if st == nil {
@@ -159,7 +163,7 @@ func (m *fallbackManager) seedProvider(provider string, list []models.Model) {
 	st.key = "available"
 	st.models = append(st.models[:0], list...)
 	if len(st.models) == 0 {
-		st.status = statusHidden
+		st.status = statusLoading
 	}
 	m.rebuildList()
 }
@@ -211,14 +215,38 @@ func (m *fallbackManager) availableRoutes() []FreeRoute {
 	return out
 }
 
-// refreshCredentials retries providers that were missing a key or failed to
-// load. It is called after the key manager closes so newly stored keys appear
-// on the start screen immediately.
+// statusRows returns an informative row for every pool provider that has not
+// reached statusReady, so the start screen explains what is loading, which
+// provider needs a key, and which errored — instead of silently omitting them.
+func (m *fallbackManager) statusRows() []list.Item {
+	var out []list.Item
+	for _, provider := range poolProviders {
+		st := m.states[provider]
+		if st == nil {
+			continue
+		}
+		switch st.status {
+		case statusLoading:
+			out = append(out, providerStatusItem{provider: provider, kind: "loading"})
+		case statusKeyless:
+			out = append(out, providerStatusItem{provider: provider, kind: "keyless"})
+		case statusError:
+			out = append(out, providerStatusItem{provider: provider, kind: "error", detail: st.err})
+		}
+	}
+	return out
+}
+
+// refreshCredentials retries providers that were missing a key, failed to
+// load, or were left statusLoading (e.g. an empty seed that got retried). It is
+// called after the key manager closes so newly stored keys appear on the start
+// screen immediately. statusLoading providers are re-fetched so a transient
+// empty catalog recovers once credentials change.
 func (m *fallbackManager) refreshCredentials() tea.Cmd {
 	var cmds []tea.Cmd
 	for _, provider := range poolProviders {
 		st := m.states[provider]
-		if st == nil || (st.status != statusKeyless && st.status != statusError) {
+		if st == nil || (st.status != statusKeyless && st.status != statusError && st.status != statusLoading) {
 			continue
 		}
 		m.states[provider] = &providerState{status: statusLoading}

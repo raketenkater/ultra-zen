@@ -504,7 +504,9 @@ func (s *Server) exhaustProviderRoutes(current Upstream) {
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
 	for i, route := range routes {
-		if providerFamily(route) == providerFamily(current) && route.APIKey == current.APIKey {
+		if providerFamily(route) == providerFamily(current) &&
+			siteOf(route) == siteOf(current) &&
+			route.APIKey == current.APIKey {
 			s.exhaustedRoute[i] = true
 		}
 	}
@@ -523,6 +525,14 @@ func providerFamily(upstream Upstream) string {
 	default:
 		return base
 	}
+}
+
+// siteOf normalizes the upstream's base URL to its site, so a daily-limit
+// exhaust on one provider site (e.g. api-inference.modelscope.ai) does not
+// retire a healthy sibling site's route (e.g. api-inference.modelscope.cn),
+// which uses an independent allocation even though it shares Provider+APIKey.
+func siteOf(upstream Upstream) string {
+	return strings.ToLower(strings.TrimRight(upstream.BaseURL, "/"))
 }
 
 func (s *Server) promoteRoute(index int) {
@@ -589,21 +599,83 @@ const (
 	bodyDegenerate
 )
 
+// classifyUpstreamBody peeks at a 200 response body prefix and decides whether
+// it is a usable completion, an upstream error object, or a degenerate
+// completion with no output at all. Several gateways (e.g. ModelScope) return
+// error objects and empty completions with HTTP 200; without this check the
+// proxy would hand Claude Code an empty assistant turn instead of rotating.
+//
+// The classifier is deliberately structural rather than text-substring based.
+// Naive substring matching over the raw prefix misclassifies legitimate SSE
+// streams: gateways emit ": keep-alive" comment lines before the first real
+// data chunk, and a usage-only chunk can carry an empty "choices":[] or
+// "choices":null inside the first 64KB. Treating those as degenerate would
+// permanently retire a healthy free model (limitRoute permanent + OnUnavailable),
+// which is exactly what broke the free cycle in the field.
 func classifyUpstreamBody(prefix []byte) int {
 	if len(prefix) == 0 {
 		return bodyDegenerate
 	}
-	compact := strings.ReplaceAll(strings.ToLower(string(prefix)), " ", "")
-	if strings.HasPrefix(compact, "data:") || strings.HasPrefix(compact, "event:") || strings.HasPrefix(compact, "[") {
-		return bodyOK // SSE stream or JSON-array framing
+	// SSE streams are identified by their framing, not their chunk content.
+	// Strip leading SSE comment/keepalive lines (": keep-alive", blanks) so a
+	// stream that opens with keepalive comments is still recognized as a stream
+	// and treated as bodyOK no matter what a usage-only chunk inside it says.
+	trimmed := bytes.TrimLeft(prefix, " \t\r\n")
+	if bytes.HasPrefix(trimmed, []byte(":")) {
+		// Strip leading SSE comment/keepalive lines (": keep-alive", blanks) so
+		// a stream that opens with keepalive comments is recognized as a stream.
+		trimmed = stripSSEComments(trimmed)
 	}
-	switch {
-	case strings.Contains(compact, `"error":{`) && !strings.Contains(compact, `"choices":`):
-		return bodyError
-	case strings.Contains(compact, `"choices":null`) || strings.Contains(compact, `"choices":[]`):
-		return bodyDegenerate
-	default:
+	// SSE framing is bodyOK by construction: a real degenerate stream still
+	// emits data: lines, so never classify by the content of a chunk. JSON-array
+	// framing (OpenAI batch style) is likewise a usable response.
+	if bytes.HasPrefix(trimmed, []byte("data:")) ||
+		bytes.HasPrefix(trimmed, []byte("event:")) ||
+		bytes.HasPrefix(trimmed, []byte("[")) {
 		return bodyOK
+	}
+
+	// Non-streaming JSON: parse structurally. Only call it degenerate when the
+	// top-level choices is null/empty AND there is no top-level error object.
+	var payload struct {
+		Error   *json.RawMessage `json:"error"`
+		Choices json.RawMessage  `json:"choices"`
+	}
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		// Not JSON at all (or a fragment). Treat an explicit error-looking
+		// object as error, otherwise assume OK so we never retire on a guess.
+		lower := strings.ToLower(string(trimmed))
+		if strings.Contains(lower, `"error":`) && !strings.Contains(lower, `"choices":`) {
+			return bodyError
+		}
+		return bodyOK
+	}
+	if payload.Error != nil {
+		return bodyError
+	}
+	// choices == null, "[]", or absent => no output at all.
+	if len(payload.Choices) == 0 || string(payload.Choices) == "null" || string(payload.Choices) == "[]" {
+		return bodyDegenerate
+	}
+	return bodyOK
+}
+
+// stripSSEComments removes leading SSE comment lines (": keep-alive", blank
+// lines, ": openai beta") so classification sees the first real data line.
+func stripSSEComments(p []byte) []byte {
+	rest := p
+	for {
+		line, rem, ok := bytes.Cut(rest, []byte("\n"))
+		if !ok {
+			return rest
+		}
+		line = bytes.TrimRight(line, "\r")
+		trimmedLine := bytes.TrimLeft(line, " \t")
+		if bytes.HasPrefix(trimmedLine, []byte(":")) || len(bytes.TrimSpace(line)) == 0 {
+			rest = rem
+			continue
+		}
+		return rem
 	}
 }
 

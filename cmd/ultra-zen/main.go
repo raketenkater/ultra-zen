@@ -796,6 +796,37 @@ func main() {
 		}
 	}
 
+	// A free cycle must never collapse to a single provider (or zero routes):
+	// one daily-limit exhaust on that provider would leave routeOrder empty and
+	// the proxy would answer every request with the 429 "every configured free
+	// model is exhausted". When an explicit pool assembles to fewer than two
+	// distinct providers, fall back to automatic cross-provider discovery so the
+	// session always has an independent escape hatch.
+	if len(fallbackRoutes) > 0 {
+		providers := map[string]bool{}
+		for _, route := range fallbackRoutes {
+			providers[route.Provider] = true
+		}
+		if len(providers) < 2 && *workerModel == "" {
+			warn("free cycle has only %d provider(s) after filtering; adding auto-discovered free routes for resilience", len(providers))
+			// Mirror the automaticPool branch above: add openrouter/free (when
+			// the primary isn't already OpenRouter) plus the zen *-free list, so
+			// the pool spans at least two providers. Each addRoute dedups on
+			// base+model, so existing routes are not duplicated.
+			if selected.Base != models.OpenRouterBase {
+				if err := ensureOpenRouter(false); err == nil && selected.ID != "openrouter/free" {
+					addRoute("openrouter", models.Find(openRouterList, "openrouter/free"), openRouterPoolKey)
+				}
+			}
+			if err := ensureZen(); err == nil {
+				free := freeTierModels(zenList)
+				for i := range free {
+					addRoute("opencode-go", &free[i], zenPoolKey)
+				}
+			}
+		}
+	}
+
 	// Refresh the saved pool on every launch: drop routes that no longer exist
 	// in a provider's live catalog so a dead entry can never block a launch.
 	if len(staleRoutes) > 0 {

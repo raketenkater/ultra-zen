@@ -20,6 +20,14 @@ type unavailableModel struct {
 	DeniedAt time.Time `json:"denied_at"`
 }
 
+// unavailableTTL is how long a denial stays in effect. Free tiers reset their
+// daily allowances and per-account access on a ~daily cadence, so an entry
+// older than this no longer reflects the current state and is treated as
+// available again. Without expiry, a single transient denial (or a
+// misclassification) hides a model from the TUI catalog and prunes it from the
+// saved rotation pool forever — which is what broke the free cycle.
+const unavailableTTL = 24 * time.Hour
+
 var unavailableMu sync.Mutex
 
 func unavailablePath() string {
@@ -52,13 +60,24 @@ func loadUnavailableLocked() map[string]unavailableModel {
 	if json.Unmarshal(data, &entries) != nil {
 		return out
 	}
+	now := time.Now().UTC()
+	expired := false
 	for _, entry := range entries {
 		entry.Provider = strings.TrimSpace(entry.Provider)
 		entry.Model = strings.TrimSpace(entry.Model)
 		if entry.Provider == "" || entry.Model == "" {
 			continue
 		}
+		if entry.DeniedAt.IsZero() || now.Sub(entry.DeniedAt) > unavailableTTL {
+			expired = true // stale denial: no longer reflects the current state
+			continue
+		}
 		out[unavailableKey(entry.Provider, entry.Model)] = entry
+	}
+	// Persist the prune so the file doesn't accumulate expired entries that
+	// would trip over the TTL on every load.
+	if expired {
+		_ = saveUnavailableLocked(out)
 	}
 	return out
 }

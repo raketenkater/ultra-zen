@@ -139,6 +139,41 @@ func (i providerModelItem) FilterValue() string {
 	return i.provider + " " + i.model.ID
 }
 
+// providerStatusItem is an informative, non-selectable row on the start screen
+// for a free provider that hasn't produced a model list yet (loading, missing a
+// key, or erroring). Selecting it opens the key manager so the user can fix the
+// credential instead of seeing a blank list.
+type providerStatusItem struct {
+	provider string
+	kind     string // "loading" | "keyless" | "error"
+	detail   string
+}
+
+func (i providerStatusItem) Title() string {
+	switch i.kind {
+	case "loading":
+		return i.provider + " — loading free models…"
+	case "keyless":
+		return i.provider + " — no key (Enter to set)"
+	default:
+		return i.provider + " — unavailable (Enter to retry)"
+	}
+}
+func (i providerStatusItem) Description() string {
+	switch i.kind {
+	case "loading":
+		return "fetching the free-model catalog"
+	case "keyless":
+		return "a credential is required to use " + i.provider + " free models"
+	default:
+		if i.detail != "" {
+			return i.detail
+		}
+		return "free models could not be fetched"
+	}
+}
+func (i providerStatusItem) FilterValue() string { return i.provider + " status" }
+
 func (i comboItem) Title() string {
 	if i.manual {
 		return "Pick models manually →"
@@ -246,6 +281,14 @@ func (m *model) startItems() []list.Item {
 		cycle.first = m.freePool[0].String()
 	}
 	items := []list.Item{cycle}
+	// Providers that haven't produced a model list yet are still surfaced as
+	// status rows so the user sees free models exist but aren't ready — not a
+	// blank screen that implies no free provider is configured.
+	if m.catalog != nil {
+		for _, row := range m.catalog.statusRows() {
+			items = append(items, row)
+		}
+	}
 	if m.resume != nil {
 		items = append([]list.Item{resumeItem{opt: *m.resume}}, items...)
 	}
@@ -256,30 +299,20 @@ func (m *model) startItems() []list.Item {
 		}
 	}
 	// Every model from the initially selected provider is directly launchable;
-	// the manual row remains for the legacy orchestrator/worker flow. On the
-	// opencode Zen provider the free models are rotation-only (they back the
-	// Free cycle and the proxy fallback pool), so the start screen leads with
-	// the paid go-tier models; the manual flow and Claude Code's /model list
-	// still reach the free ones.
-	paidAvailable := false
-	if m.provider == "opencode-go" {
-		for _, model := range m.all {
-			if !model.Free {
-				paidAvailable = true
-				break
-			}
-		}
-	}
-	for _, item := range buildModelItems(m.all) {
-		if mi, ok := item.(modelItem); ok && paidAvailable && mi.m.Free {
-			continue
-		}
-		items = append(items, item)
-	}
+	// the manual row remains for the legacy orchestrator/worker flow. The free
+	// models on the primary provider are always shown (never hidden behind a
+	// paid-availability filter) so the free tier is a first-class choice, not
+	// something the user can only reach through the Free-cycle pool editor.
 	local := make(map[string]bool, len(m.all))
 	for _, model := range m.all {
 		local[model.ID] = true
 	}
+	for _, item := range buildModelItems(m.all) {
+		items = append(items, item)
+	}
+	// Free models from every other configured provider appear as their live
+	// catalogs load. Provider models that duplicate the primary catalog are
+	// skipped so each model shows once.
 	for _, option := range catalogModels {
 		if option.Provider == m.provider && local[option.Model.ID] {
 			continue
@@ -326,6 +359,8 @@ func startItemKey(item list.Item) string {
 		return "model\x00" + item.m.Base + "\x00" + item.m.ID
 	case providerModelItem:
 		return "provider\x00" + item.provider + "\x00" + item.model.ID
+	case providerStatusItem:
+		return "status\x00" + item.provider
 	default:
 		return ""
 	}
@@ -441,6 +476,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.choiceVia = item.provider
 					m.worker = ""
 					return m, tea.Quit
+				}
+				if _, ok := m.list.SelectedItem().(providerStatusItem); ok {
+					// Opening the key manager lets the user fix the credential;
+					// a retry of a failed fetch happens via refreshCredentials
+					// after the key manager closes.
+					km := newKeyManager()
+					m.keys = &km
+					m.prevStep = m.step
+					m.step = stepKeys
+					return m, nil
 				}
 				if item, ok := m.list.SelectedItem().(comboItem); ok {
 					if item.manual {

@@ -590,3 +590,74 @@ func TestDegenerate200IsRetiredAndReported(t *testing.T) {
 		t.Fatalf("unavailable callback = %+v", unavailable)
 	}
 }
+
+// TestClassifySSEKeepAliveIsNotDegenerate reproduces the field bug that killed
+// healthy free models: a gateway opening a stream with ": keep-alive" comments
+// then a usage-only chunk carrying an empty "choices" must be classified bodyOK,
+// not bodyDegenerate (which would permanently retire the route via OnUnavailable).
+func TestClassifySSEKeepAliveIsNotDegenerate(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{
+			name: "keep-alive comments then real data chunk",
+			body: ": keep-alive\n: keep-alive\ndata: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+			want: bodyOK,
+		},
+		{
+			name: "keep-alive then usage-only empty choices chunk",
+			body: ": keep-alive\ndata: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":10}}\n\ndata: [DONE]\n\n",
+			want: bodyOK,
+		},
+		{
+			name: "event framing with keep-alive prefix",
+			body: ": keep-alive\n: keep-alive\nevent: message\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+			want: bodyOK,
+		},
+		{
+			name: "plain choices-null JSON is still degenerate",
+			body: `{"id":"","object":"","created":0,"model":"dud","choices":null,"usage":{"prompt_tokens":0}}`,
+			want: bodyDegenerate,
+		},
+		{
+			name: "error object with empty choices is bodyError",
+			body: `{"error":{"code":"insufficient_quota","message":"quota"}}`,
+			want: bodyError,
+		},
+		{
+			name: "error object plus empty choices is bodyError not degenerate",
+			body: `{"error":{"message":"model access denied"},"choices":[]}`,
+			want: bodyError,
+		},
+		{
+			name: "real completion JSON is bodyOK",
+			body: `{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`,
+			want: bodyOK,
+		},
+		{
+			name: "empty prefix is degenerate",
+			body: "",
+			want: bodyDegenerate,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyUpstreamBody([]byte(tc.body)); got != tc.want {
+				t.Fatalf("classifyUpstreamBody = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClassifyUpstreamBodyWithKeepAliveInFullStream verifies the exact proxy-log
+// shape that retired laguna-s-2.1-free at 13:39:07: leading ": keep-alive" lines
+// then a real data chunk. The old classifier misread this as degenerate because
+// it compared the raw prefix against "data:" before stripping comments.
+func TestClassifyUpstreamBodyWithKeepAliveInFullStream(t *testing.T) {
+	body := []byte(": keep-alive\n: keep-alive\ndata: {\"id\":\"chatcmpl-x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n")
+	if got := classifyUpstreamBody(body); got != bodyOK {
+		t.Fatalf("classifyUpstreamBody(keepalive stream) = %d, want bodyOK", got)
+	}
+}

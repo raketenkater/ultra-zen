@@ -219,10 +219,11 @@ func TestStartScreenShowsCycleAndAllConfiguredProviderModels(t *testing.T) {
 			t.Errorf("start screen missing %s; found %v", want, modelsFound)
 		}
 	}
-	// Free models are rotation-only on the Zen provider (paid alternatives
-	// exist), so they must not appear as directly launchable rows.
-	if modelsFound["opencode-go:zen-free"] {
-		t.Error("free model rows must not appear on the Zen start screen when paid models exist")
+	// Free models must be visible on the Zen start screen even when paid
+	// alternatives exist — the free tier is a first-class launch choice, not
+	// something hidden behind the Free-cycle pool editor.
+	if !modelsFound["opencode-go:zen-free"] {
+		t.Error("free model rows must appear on the Zen start screen when paid models exist")
 	}
 }
 
