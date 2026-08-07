@@ -180,3 +180,111 @@ func TestToAnthropicToolUseWithMissingFinishReason(t *testing.T) {
 		})
 	}
 }
+
+// TestToolResultMissingIDGetsRepaired covers the gateway 400
+// "messages[N]: missing field tool_call_id": a tool_result block whose
+// tool_use_id is absent would serialize as a "tool" message with no
+// tool_call_id (the field is omitempty). It must adopt the pending
+// tool_call id from the preceding assistant turn.
+func TestToolResultMissingIDGetsRepaired(t *testing.T) {
+	req := &anthropicRequest{
+		Messages: []anthropicMsg{
+			{Role: "user", Content: json.RawMessage(`"run it"`)},
+			{Role: "assistant", Content: json.RawMessage(
+				`[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]`)},
+			{Role: "user", Content: json.RawMessage(
+				`[{"type":"tool_result","content":"files"}]`)},
+		},
+	}
+	o, err := req.toOpenAI("glm-5.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range o.Messages {
+		if m.Role == "tool" && m.ToolCallID == "" {
+			t.Fatalf("messages[%d] is a tool message with no tool_call_id: %+v", i, m)
+		}
+	}
+	last := o.Messages[len(o.Messages)-1]
+	if last.Role != "tool" || last.ToolCallID != "toolu_1" {
+		t.Fatalf("result did not adopt the pending id: %+v", last)
+	}
+	// The serialized body must actually carry the field.
+	body, err := json.Marshal(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"tool_call_id":"toolu_1"`) {
+		t.Fatalf("tool_call_id missing from body: %s", body)
+	}
+}
+
+// TestOrphanToolResultDemoted verifies a tool_result with no preceding
+// assistant tool_call (history compaction dropped it) becomes a user message
+// instead of an invalid tool turn.
+func TestOrphanToolResultDemoted(t *testing.T) {
+	req := &anthropicRequest{
+		Messages: []anthropicMsg{
+			{Role: "user", Content: json.RawMessage(
+				`[{"type":"tool_result","tool_use_id":"toolu_gone","content":"stale output"}]`)},
+		},
+	}
+	o, err := req.toOpenAI("glm-5.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Messages) != 1 {
+		t.Fatalf("expected 1 message, got %d: %+v", len(o.Messages), o.Messages)
+	}
+	if o.Messages[0].Role != "user" || o.Messages[0].Content != "stale output" {
+		t.Fatalf("orphan not demoted: %+v", o.Messages[0])
+	}
+}
+
+// TestUnknownToolResultIDAdoptsPending verifies a tool_result whose id does not
+// match the assistant's announced call still answers that call.
+func TestUnknownToolResultIDAdoptsPending(t *testing.T) {
+	req := &anthropicRequest{
+		Messages: []anthropicMsg{
+			{Role: "assistant", Content: json.RawMessage(
+				`[{"type":"tool_use","id":"toolu_a","name":"Read","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(
+				`[{"type":"tool_result","tool_use_id":"toolu_mismatch","content":"ok"}]`)},
+		},
+	}
+	o, err := req.toOpenAI("glm-5.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := o.Messages[len(o.Messages)-1]
+	if last.Role != "tool" || last.ToolCallID != "toolu_a" {
+		t.Fatalf("mismatched id not repaired: %+v", last)
+	}
+	if len(o.Messages) != 2 {
+		t.Fatalf("unexpected stub inserted: %+v", o.Messages)
+	}
+}
+
+// TestMultipleToolResultsKeepDistinctIDs verifies parallel tool calls answered
+// by results that all lack ids get one pending id each, not the same one.
+func TestMultipleToolResultsKeepDistinctIDs(t *testing.T) {
+	req := &anthropicRequest{
+		Messages: []anthropicMsg{
+			{Role: "assistant", Content: json.RawMessage(
+				`[{"type":"tool_use","id":"t1","name":"Bash","input":{}},` +
+					`{"type":"tool_use","id":"t2","name":"Bash","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(
+				`[{"type":"tool_result","content":"a"},{"type":"tool_result","content":"b"}]`)},
+		},
+	}
+	o, err := req.toOpenAI("glm-5.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o.Messages) != 3 {
+		t.Fatalf("expected assistant+2 tool messages, got %d: %+v", len(o.Messages), o.Messages)
+	}
+	if o.Messages[1].ToolCallID != "t1" || o.Messages[2].ToolCallID != "t2" {
+		t.Fatalf("ids not distributed in order: %+v %+v", o.Messages[1], o.Messages[2])
+	}
+}

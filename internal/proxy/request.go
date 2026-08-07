@@ -161,9 +161,95 @@ func (a *anthropicRequest) toOpenAI(model string) (*openAIRequest, error) {
 		req.ToolChoice = translateToolChoice(a.ToolChoice)
 	}
 
+	req.Messages = sanitizeToolMessages(req.Messages)
 	req.Messages = repairUnresolvedToolCalls(req.Messages)
 
 	return req, nil
+}
+
+// sanitizeToolMessages guarantees every "tool" message is a well-formed answer
+// to a tool_call that was actually announced earlier in the conversation.
+//
+// Two malformed shapes reach us from Claude Code and both make the gateway's
+// upstream provider reject the whole request:
+//
+//   - A tool_result block with a missing or empty tool_use_id. ToolCallID is
+//     omitempty, so it serializes as a "tool" message with no tool_call_id at
+//     all and the provider fails to deserialize the body:
+//     `messages[N]: missing field tool_call_id`.
+//   - A tool_result whose id matches no preceding assistant tool_call (history
+//     compaction dropped the assistant turn, or an agent loop was interrupted).
+//
+// Both are repaired by adopting the oldest still-unanswered tool_call id from
+// the most recent assistant tool_calls turn. If there is nothing to answer, the
+// result is demoted to a plain user message so its content is not lost.
+func sanitizeToolMessages(msgs []openAIMessage) []openAIMessage {
+	announced := map[string]bool{} // every tool_call id seen so far
+	var pending []string           // unanswered ids from the latest assistant turn
+
+	out := make([]openAIMessage, 0, len(msgs))
+	for i, m := range msgs {
+		switch {
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			calls := make([]openAITool, len(m.ToolCalls))
+			copy(calls, m.ToolCalls)
+			pending = pending[:0]
+			for j := range calls {
+				if calls[j].ID == "" {
+					calls[j].ID = fmt.Sprintf("call_%d_%d", i, j)
+				}
+				announced[calls[j].ID] = true
+				pending = append(pending, calls[j].ID)
+			}
+			m.ToolCalls = calls
+			out = append(out, m)
+
+		case m.Role == "tool":
+			if m.ToolCallID == "" || !announced[m.ToolCallID] {
+				if len(pending) == 0 {
+					// Nothing to answer — an orphan result. Keep the text as
+					// user content rather than emitting an invalid tool turn.
+					out = append(out, openAIMessage{Role: "user", Content: contentString(m.Content)})
+					continue
+				}
+				m.ToolCallID = pending[0]
+			}
+			pending = dropID(pending, m.ToolCallID)
+			out = append(out, m)
+
+		default:
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// dropID removes the first occurrence of id from ids.
+func dropID(ids []string, id string) []string {
+	for i, v := range ids {
+		if v == id {
+			return append(ids[:i:i], ids[i+1:]...)
+		}
+	}
+	return ids
+}
+
+// contentString renders an openAIMessage content value as plain text.
+func contentString(c any) string {
+	switch v := c.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case json.RawMessage:
+		return string(v)
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }
 
 // repairUnresolvedToolCalls makes every assistant tool_call round-trip
