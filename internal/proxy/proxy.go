@@ -775,7 +775,13 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, m
 		return
 	}
 	anthropic := oresp.toAnthropic(model)
-	out, _ := json.Marshal(anthropic)
+	out, err := json.Marshal(anthropic)
+	if err != nil {
+		// Never hand Claude Code a 200 with an empty body — it surfaces as an
+		// unexplained API error with no way to tell what went wrong.
+		writeError(w, 502, "api_error", "encode translated response: "+err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(out)

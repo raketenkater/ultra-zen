@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"strings"
 )
 
 // openAIResponse is the non-streaming Chat Completions response from the gateway.
@@ -85,13 +86,11 @@ func (r *openAIResponse) toAnthropic(model string) *anthropicResponse {
 		resp.Content = append(resp.Content, anthropicContentBlock{Type: "text", Text: choice.Message.Reasoning})
 	}
 	for _, tc := range choice.Message.ToolCalls {
-		var input json.RawMessage
-		// arguments is a JSON string; parse it to an object for Anthropic input.
-		if tc.Function.Arguments != "" {
-			input = json.RawMessage(tc.Function.Arguments)
-		} else {
-			input = json.RawMessage(`{}`)
-		}
+		// arguments is a JSON string; splice it in as the Anthropic input
+		// object. A model that hit max_tokens mid-arguments leaves it
+		// truncated ({"cmd": "l), and embedding that raw makes json.Marshal of
+		// the whole response fail — the client then gets an empty body.
+		input := toolInput(tc.Function.Arguments)
 		resp.Content = append(resp.Content, anthropicContentBlock{
 			Type:  "tool_use",
 			ID:    tc.ID,
@@ -103,6 +102,18 @@ func (r *openAIResponse) toAnthropic(model string) *anthropicResponse {
 		resp.Content = []anthropicContentBlock{{Type: "text", Text: ""}}
 	}
 	return resp
+}
+
+// toolInput turns an OpenAI tool-call arguments string into an Anthropic
+// tool_use input object. Anything that is not a valid JSON object — empty,
+// truncated, "null", or a bare scalar — degrades to {} so the response stays
+// serializable and the client still sees the tool call.
+func toolInput(args string) json.RawMessage {
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" || trimmed[0] != '{' || !json.Valid([]byte(trimmed)) {
+		return json.RawMessage(`{}`)
+	}
+	return json.RawMessage(trimmed)
 }
 
 // mapStopReason converts OpenAI finish_reason to Anthropic stop_reason.

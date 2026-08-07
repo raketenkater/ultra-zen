@@ -51,6 +51,14 @@ type streamState struct {
 	// overview would show one agent instead of many.
 	toolBlocks  map[string]int  // tool id -> anthropic block index
 	toolStarted map[string]bool
+	// idForIndex remembers the last tool id announced at each OpenAI stream
+	// index. The standard OpenAI shape sends id+name once and then bare
+	// argument fragments at the same index; without this, those fragments
+	// would key to a different bucket and open a phantom block.
+	idForIndex map[int]string
+	// toolOrder is toolBlocks' keys in creation order, so content_block_stop
+	// events are emitted deterministically in block-index order.
+	toolOrder []string
 	finish      string
 	output      int
 }
@@ -65,6 +73,7 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		model:       model,
 		toolBlocks:  make(map[string]int),
 		toolStarted: make(map[string]bool),
+		idForIndex:  make(map[int]string),
 	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -160,14 +169,27 @@ func (s *streamState) emitToolDelta(tc streamTool) {
 	// tool calls in one delta (indices 0..N) or reuse index 0 for each new call
 	// in a later chunk; keying by index would collapse distinct subagent spawns
 	// into one block and the agent overview would show one agent instead of many.
-	key := tc.ID
-	if key == "" {
-		// Some providers omit the id on argument-delta chunks. Fall back to the
-		// index so those deltas still reach a block started by an id'd chunk.
-		key = fmt.Sprintf("idx%d", tc.Index)
+	// Resolve the id: a chunk that carries one (re)binds the stream index; a
+	// bare argument-fragment chunk inherits the id last bound to its index.
+	// Falling straight through to an index-derived key here would open a
+	// second, phantom tool block with an empty id and name for every argument
+	// fragment — and Claude Code would then answer it with a tool_result whose
+	// tool_use_id is empty, which the gateway rejects outright.
+	id := tc.ID
+	if id != "" {
+		s.idForIndex[tc.Index] = id
+	} else if prev, ok := s.idForIndex[tc.Index]; ok {
+		id = prev
+	} else {
+		// A tool call whose id the provider never sends at all. Synthesize a
+		// stable one so the tool_use block Claude Code sees is answerable.
+		id = fmt.Sprintf("toolu_idx%d", tc.Index)
+		s.idForIndex[tc.Index] = id
 	}
+	key := id
 	if !s.toolStarted[key] {
 		s.toolStarted[key] = true
+		s.toolOrder = append(s.toolOrder, key)
 		// Advance the block index for this new tool block. Without this, two
 		// tool_use blocks emitted back-to-back (no intervening text block) both
 		// get the same index — Anthropic requires sequential, unique content
@@ -180,7 +202,7 @@ func (s *streamState) emitToolDelta(tc streamTool) {
 			"index": s.toolBlocks[key],
 			"content_block": map[string]any{
 				"type":  "tool_use",
-				"id":    tc.ID,
+				"id":    id,
 				"name":  tc.Function.Name,
 				"input": map[string]any{},
 			},
@@ -206,10 +228,10 @@ func (s *streamState) finishStream() {
 		s.textOpen = false
 		s.blockIndex++
 	}
-	for key, started := range s.toolStarted {
-		if started {
-			s.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.toolBlocks[key]})
-		}
+	// Close in creation order: map iteration would emit content_block_stop
+	// events in a random order from one run to the next.
+	for _, key := range s.toolOrder {
+		s.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.toolBlocks[key]})
 	}
 	stop := mapStopReason(s.finish)
 	if stop == "" {

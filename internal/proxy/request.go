@@ -7,6 +7,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -361,7 +362,12 @@ func translateMessage(m anthropicMsg) ([]openAIMessage, error) {
 		case "tool_use":
 			id := jsonString(b["id"])
 			name := jsonString(b["name"])
-			input, _ := json.Marshal(json.RawMessage(b["input"]))
+			// A tool_use with absent or non-object input marshals to "null",
+			// which providers reject as tool arguments; send {} instead.
+			input := []byte(`{}`)
+			if raw := bytes.TrimSpace(b["input"]); len(raw) > 0 && raw[0] == '{' && json.Valid(raw) {
+				input = raw
+			}
 			assistantToolCalls = append(assistantToolCalls, openAITool{
 				ID:   id,
 				Type: "function",

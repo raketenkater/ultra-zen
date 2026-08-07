@@ -288,3 +288,59 @@ func TestMultipleToolResultsKeepDistinctIDs(t *testing.T) {
 		t.Fatalf("ids not distributed in order: %+v %+v", o.Messages[1], o.Messages[2])
 	}
 }
+
+// TestTruncatedToolArgumentsStaySerializable covers a model that hit
+// max_tokens mid-arguments. Splicing the truncated fragment into the
+// Anthropic response made json.Marshal fail, and the client got a 200 with an
+// empty body instead of an error.
+func TestTruncatedToolArgumentsStaySerializable(t *testing.T) {
+	for _, args := range []string{`{"cmd": "l`, ``, `null`, `"scalar"`, `[1,2]`} {
+		r := &openAIResponse{}
+		r.Choices = append(r.Choices, struct {
+			Index        int `json:"index"`
+			Message      struct {
+				Role      string       `json:"role"`
+				Content   string       `json:"content"`
+				ToolCalls []openAITool `json:"tool_calls"`
+				Reasoning string       `json:"reasoning_content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		}{})
+		r.Choices[0].Message.ToolCalls = []openAITool{
+			{ID: "t1", Type: "function", Function: openAIToolFunc{Name: "Bash", Arguments: args}},
+		}
+		out, err := json.Marshal(r.toAnthropic("m"))
+		if err != nil {
+			t.Fatalf("arguments %q made the response unserializable: %v", args, err)
+		}
+		if !strings.Contains(string(out), `"input":{`) {
+			t.Fatalf("arguments %q produced a non-object input: %s", args, out)
+		}
+	}
+}
+
+// TestValidToolArgumentsPreserved verifies the sanitizer does not clobber
+// well-formed arguments.
+func TestValidToolArgumentsPreserved(t *testing.T) {
+	if got := string(toolInput(`{"command":"ls -la"}`)); got != `{"command":"ls -la"}` {
+		t.Fatalf("valid arguments altered: %s", got)
+	}
+}
+
+// TestToolUseWithoutInputSendsEmptyObject verifies a tool_use block with no
+// input field becomes "{}" arguments, not "null" (which providers reject).
+func TestToolUseWithoutInputSendsEmptyObject(t *testing.T) {
+	req := &anthropicRequest{
+		Messages: []anthropicMsg{
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"Bash"}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]`)},
+		},
+	}
+	o, err := req.toOpenAI("glm-5.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := o.Messages[0].ToolCalls[0].Function.Arguments; got != "{}" {
+		t.Fatalf("arguments = %q, want {}", got)
+	}
+}

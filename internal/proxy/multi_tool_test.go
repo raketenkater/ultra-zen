@@ -72,3 +72,53 @@ func TestStreamSecondToolInLaterChunk(t *testing.T) {
 		t.Errorf("second tool id tu1 never emitted as its own block")
 	}
 }
+
+// Standard OpenAI streaming shape: id+name arrive once, then bare argument
+// fragments at the same index. Those fragments must land in the block the
+// first chunk opened — not open a phantom block with an empty id, which
+// Claude Code would later answer with an empty tool_use_id.
+func TestStreamArgumentFragmentsStayInOneBlock(t *testing.T) {
+	sse := "data: " + `{"id":"c1","choices":[{"delta":{"role":"assistant"}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"tu0","type":"function","function":{"name":"Bash","arguments":""}}]}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\""}}]}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"ls\"}"}}]}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := streamTranslate(rec, strings.NewReader(sse), "m"); err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	blocks := collectBlocks(out)
+	if len(blocks) != 1 {
+		for i, b := range blocks {
+			cb := b["content_block"].(map[string]any)
+			t.Logf("block%d index=%v id=%q name=%q", i, b["index"], cb["id"], cb["name"])
+		}
+		t.Fatalf("expected 1 tool block, got %d", len(blocks))
+	}
+	if cb := blocks[0]["content_block"].(map[string]any); cb["id"] != "tu0" {
+		t.Fatalf("block id = %v, want tu0", cb["id"])
+	}
+	if !strings.Contains(out, `{\"cmd\"`) || !strings.Contains(out, `:\"ls\"}`) {
+		t.Fatalf("argument fragments lost: %s", out)
+	}
+}
+
+// A provider that never sends a tool id at all must still yield a tool_use
+// block with a non-empty, answerable id.
+func TestStreamToolWithoutIDGetsSyntheticID(t *testing.T) {
+	sse := "data: " + `{"id":"c1","choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"Bash","arguments":"{}"}}]}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := streamTranslate(rec, strings.NewReader(sse), "m"); err != nil {
+		t.Fatal(err)
+	}
+	blocks := collectBlocks(rec.Body.String())
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 tool block, got %d", len(blocks))
+	}
+	cb := blocks[0]["content_block"].(map[string]any)
+	if id, _ := cb["id"].(string); id == "" {
+		t.Fatalf("tool_use block emitted with an empty id: %+v", cb)
+	}
+}
