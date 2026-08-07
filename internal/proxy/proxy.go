@@ -29,6 +29,7 @@ type Config struct {
 	RateLimitBackoff time.Duration  // initial temporary-429 backoff; zero uses the default
 	Port             int            // local listen port
 	Models           []ModelInfo    // full model list advertised at /v1/models
+	Upstreams        []Upstream     // every known upstream route (primary + fallbacks); maps /model ids to gateways
 	OnUnavailable    func(Upstream) // called after an explicit per-model access denial
 }
 
@@ -68,6 +69,10 @@ type Server struct {
 	exhaustedRoute []bool
 	gateMu         sync.Mutex
 	nextOpenRouter time.Time
+	// modelRoute maps every id Claude Code's /model command can hand us (both
+	// the plain Zen id and the provider-qualified id) to the upstream that
+	// serves it. It is built once at New from cfg.Upstreams.
+	modelRoute map[string]Upstream
 }
 
 const (
@@ -83,6 +88,7 @@ func New(cfg Config) *Server {
 	s := &Server{
 		cfg:            cfg,
 		exhaustedRoute: make([]bool, 1+len(cfg.Fallbacks)),
+		modelRoute:     buildModelRoute(cfg),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", s.handleMessages)
@@ -176,6 +182,33 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
+// buildModelRoute maps model ids to the upstream that serves them so the
+// proxy can honor Claude Code's /model command (which sends the chosen id as
+// the request's "model" field). Keys are the plain Zen id ("deepseek-v4-flash")
+// and the provider-qualified id ("opencode-go/deepseek-v4-flash-free",
+// "openrouter/poolside/laguna-s-2.1:free"). Primary + fallback upstreams are
+// all registered; the primary's plain id maps to the primary route so the
+// default selection keeps working.
+func buildModelRoute(cfg Config) map[string]Upstream {
+	m := make(map[string]Upstream)
+	add := func(u Upstream) {
+		if u.Model == "" {
+			return
+		}
+		// Plain Zen id, and the provider-qualified spelling so both forms a
+		// /model switch might send resolve to the same upstream.
+		m[u.Model] = u
+		if u.Provider != "" {
+			m[u.Provider+"/"+u.Model] = u
+		}
+	}
+	add(Upstream{Provider: cfg.Provider, BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: cfg.Model})
+	for _, f := range cfg.Fallbacks {
+		add(f)
+	}
+	return m
+}
+
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -191,15 +224,29 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request_error", "invalid Anthropic request: "+err.Error())
 		return
 	}
-	// Legacy model routing: when a worker model is configured, background
-	// sub-agents use it. A fallback pool replaces this split and gives every
-	// Claude Code role the same resilient route, so a main-loop or subagent
-	// request can continue on the next free model without restarting the session.
-	model := s.cfg.Model
+	// Model routing. When Claude Code's /model command selects a model, the
+	// request body carries the chosen id; honor it by resolving to that model's
+	// upstream. When no /model switch is active, fall back to the launch-time
+	// split: an explicitly configured worker model serves background sub-agents
+	// (requests without interactive tools), the main model serves the rest. A
+	// fallback pool replaces the worker split and gives every role the same
+	// resilient route, so a main-loop or subagent request can continue on the
+	// next free model without restarting the session.
+	primary := Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model}
 	if len(s.cfg.Fallbacks) == 0 && s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
-		model = s.cfg.WorkerModel
+		// Background sub-agent: run on the worker unless the user explicitly
+		// selected a model via /model, which wins.
+		if u, ok := s.modelRoute[areq.Model]; ok {
+			primary = u
+		} else {
+			primary.Model = s.cfg.WorkerModel
+		}
+	} else if areq.Model != "" {
+		if u, ok := s.modelRoute[areq.Model]; ok {
+			primary = u
+		}
 	}
-	oreq, err := areq.toOpenAI(model)
+	oreq, err := areq.toOpenAI(primary.Model)
 	if err != nil {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
@@ -210,7 +257,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		oreq.MaxTokens = maxOutputTokens
 	}
 
-	primary := Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: model}
 	payload, resp, used, err := s.forwardWithRateLimit(r.Context(), primary, oreq)
 	if err != nil {
 		writeError(w, 502, "api_error", "gateway request failed: "+err.Error())
@@ -447,20 +493,55 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 	if len(s.cfg.Fallbacks) == 0 {
 		return []routeChoice{{Upstream: primary, index: -1}}
 	}
-	routes := make([]Upstream, 0, 1+len(s.cfg.Fallbacks))
-	routes = append(routes, Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
-	routes = append(routes, s.cfg.Fallbacks...)
+	// The pool is a fixed conceptual array: [cfg primary, fallback 0..n].
+	// Every route carries its canonical pool index so limit/exhaust marking
+	// stays aligned even when /model selects a fallback as this request's
+	// primary. exhaustedRoute is sized 1+len(Fallbacks) to match.
+	type entry struct {
+		u     Upstream
+		index int
+	}
+	pool := make([]entry, 0, 1+len(s.cfg.Fallbacks))
+	pool = append(pool, entry{Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model}, 0})
+	for i, f := range s.cfg.Fallbacks {
+		pool = append(pool, entry{f, 1 + i})
+	}
 
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
-	out := make([]routeChoice, 0, len(routes))
-	for offset := 0; offset < len(routes); offset++ {
-		idx := (s.activeRoute + offset) % len(routes)
+
+	out := make([]routeChoice, 0, len(pool))
+	seen := make(map[int]bool, len(pool))
+	// The request's primary (the /model-selected route when one is active)
+	// goes first, deduped against the pool so the same gateway isn't tried
+	// twice. Everything else is walked in activeRoute rotation order.
+	var primIdx = -1
+	for _, e := range pool {
+		if sameUpstream(e.u, primary) {
+			primIdx = e.index
+			break
+		}
+	}
+	if primIdx >= 0 && !s.exhaustedRoute[primIdx] {
+		out = append(out, routeChoice{Upstream: primary, index: primIdx})
+		seen[primIdx] = true
+	}
+	for offset := 0; offset < len(pool); offset++ {
+		idx := (s.activeRoute + offset) % len(pool)
+		if seen[idx] {
+			continue
+		}
 		if !s.exhaustedRoute[idx] {
-			out = append(out, routeChoice{Upstream: routes[idx], index: idx})
+			out = append(out, routeChoice{Upstream: pool[idx].u, index: idx})
 		}
 	}
 	return out
+}
+
+// sameUpstream reports whether two upstreams point at the same model on the
+// same gateway (ignoring the provider label, which may differ in spelling).
+func sameUpstream(a, b Upstream) bool {
+	return a.Model == b.Model && a.BaseURL == b.BaseURL && a.APIKey == b.APIKey
 }
 
 func (s *Server) limitRoute(index int, permanent bool) {

@@ -373,11 +373,39 @@ func (m *model) enterOrchestratorStep() {
 	m.list.ResetFilter()
 }
 
-func (m *model) enterWorkerStep() {
+func (m model) enterWorkerStep() (tea.Model, tea.Cmd) {
+	items := buildWorkerItems(m.all, m.choice)
+	if len(items) == 0 {
+		// The chosen orchestrator is the only model; there is no worker to
+		// pick. Launch immediately without one.
+		m.worker = ""
+		return m, tea.Quit
+	}
 	m.step = stepWorker
-	m.list.SetItems(buildModelItems(m.all))
+	m.list.SetItems(items)
 	m.list.ResetSelected()
 	m.list.ResetFilter()
+	return m, nil
+}
+
+// buildWorkerItems lists candidate worker models for the chosen orchestrator.
+// The orchestrator itself is excluded (selecting it as its own worker is a
+// no-op). Recently used models sort first, same as the main list.
+func buildWorkerItems(ms []models.Model, orchestrator string) []list.Item {
+	recent := models.LoadRecent()
+	ordered := models.SortByRecent(ms, recent)
+	isRecent := make(map[string]bool, len(recent))
+	for _, id := range recent {
+		isRecent[id] = true
+	}
+	items := make([]list.Item, 0, len(ordered))
+	for _, mdl := range ordered {
+		if mdl.ID == orchestrator {
+			continue
+		}
+		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID]})
+	}
+	return items
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -469,13 +497,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.choice = item.m.ID
 					m.choiceVia = m.provider
 					m.worker = ""
-					return m, tea.Quit
+					return m.enterWorkerStep()
 				}
 				if item, ok := m.list.SelectedItem().(providerModelItem); ok {
 					m.choice = item.model.ID
 					m.choiceVia = item.provider
 					m.worker = ""
-					return m, tea.Quit
+					return m.enterWorkerStep()
 				}
 				if _, ok := m.list.SelectedItem().(providerStatusItem); ok {
 					// Opening the key manager lets the user fix the credential;
@@ -501,8 +529,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item, ok := m.list.SelectedItem().(modelItem); ok {
 					m.choice = item.m.ID
 					m.choiceVia = m.provider
-					m.enterWorkerStep()
-					return m, nil
+					return m.enterWorkerStep()
 				}
 			case stepWorker:
 				if item, ok := m.list.SelectedItem().(modelItem); ok {

@@ -330,3 +330,110 @@ func TestCatalogRefreshPreservesHighlightedStartItem(t *testing.T) {
 		t.Fatalf("async provider load moved selection to %#v", m.list.SelectedItem())
 	}
 }
+
+// TestDirectModelSelectionPromptsWorker verifies that selecting a model from
+// the start screen now enters the worker step (Esc skips) instead of launching
+// immediately with an empty worker.
+func TestDirectModelSelectionPromptsWorker(t *testing.T) {
+	ms := []models.Model{
+		{ID: "big-thinker", Name: "big-thinker"},
+		{ID: "cheap-worker", Name: "cheap-worker"},
+	}
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+
+	// Select "big-thinker" from the start screen.
+	for i, item := range m.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "big-thinker" {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.choice != "big-thinker" {
+		t.Fatalf("choice = %q, want big-thinker", mm.choice)
+	}
+	if mm.step != stepWorker {
+		t.Fatalf("step = %v, want stepWorker (direct selection should prompt for worker)", mm.step)
+	}
+
+	// The worker list must not include the orchestrator itself.
+	found := false
+	for _, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "big-thinker" {
+			found = true
+		}
+	}
+	if found {
+		t.Fatal("worker list must exclude the orchestrator itself")
+	}
+
+	// Esc skips the worker and launches with empty worker.
+	updated, cmd := mm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mm = updated.(model)
+	if mm.worker != "" {
+		t.Fatalf("Esc should clear worker, got %q", mm.worker)
+	}
+	if cmd == nil {
+		t.Fatal("Esc should quit the picker (return tea.Quit)")
+	}
+}
+
+// TestWorkerSelectionSetsWorker verifies picking a worker from the worker step
+// sets m.worker and quits.
+func TestWorkerSelectionSetsWorker(t *testing.T) {
+	ms := []models.Model{
+		{ID: "orchestrator", Name: "orchestrator"},
+		{ID: "worker-model", Name: "worker-model"},
+	}
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+
+	// Select orchestrator -> enters worker step.
+	for i, item := range m.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "orchestrator" {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.step != stepWorker {
+		t.Fatalf("step = %v, want stepWorker", mm.step)
+	}
+
+	// Select the worker.
+	for i, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "worker-model" {
+			mm.list.Select(i)
+			break
+		}
+	}
+	updated, cmd := mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(model)
+	if mm.worker != "worker-model" {
+		t.Fatalf("worker = %q, want worker-model", mm.worker)
+	}
+	if cmd == nil {
+		t.Fatal("selecting a worker should quit the picker (return tea.Quit)")
+	}
+}

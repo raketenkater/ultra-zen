@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -120,9 +122,9 @@ func TestToAnthropicReasoningFallback(t *testing.T) {
 
 func TestMapStopReason(t *testing.T) {
 	cases := map[string]string{
-		"stop":       "end_turn",
-		"tool_calls": "tool_use",
-		"length":     "max_tokens",
+		"stop":          "end_turn",
+		"tool_calls":    "tool_use",
+		"length":        "max_tokens",
 		"content_filter": "end_turn",
 	}
 	for in, want := range cases {
@@ -162,7 +164,7 @@ func TestStreamStopReasonToolUseWhenToolEmitted(t *testing.T) {
 // Claude Code never executes the pending tool call.
 func TestToAnthropicToolUseWithMissingFinishReason(t *testing.T) {
 	for name, raw := range map[string]string{
-		"stop_with_tool_calls":   `{"id":"c1","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"tu1","function":{"name":"spawn_agent","arguments":"{}"}}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
+		"stop_with_tool_calls":    `{"id":"c1","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"tu1","function":{"name":"spawn_agent","arguments":"{}"}}]},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
 		"empty_finish_tool_calls": `{"id":"c1","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"tu1","function":{"name":"spawn_agent","arguments":"{}"}}]},"finish_reason":""}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -342,5 +344,179 @@ func TestToolUseWithoutInputSendsEmptyObject(t *testing.T) {
 	}
 	if got := o.Messages[0].ToolCalls[0].Function.Arguments; got != "{}" {
 		t.Fatalf("arguments = %q, want {}", got)
+	}
+}
+
+// TestModelSwitchSelectsUpstream verifies the modelRoute map resolves an
+// advertised model id (via /model) to the right upstream, including the
+// provider-qualified spelling.
+func TestModelSwitchSelectsUpstream(t *testing.T) {
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  "https://zen.example/v1",
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: "https://zen.example/v1", APIKey: "k", Model: "glm-5.2"},
+			{Provider: "openrouter", BaseURL: "https://openrouter.example/v1", APIKey: "or", Model: "poolside/laguna-s-2.1:free"},
+		},
+	}
+	s := New(cfg)
+
+	for _, tc := range []struct {
+		id       string
+		wantBase string
+		wantKey  string
+	}{
+		{"glm-5.2", "https://zen.example/v1", "k"},
+		{"opencode-go/glm-5.2", "https://zen.example/v1", "k"},
+		{"openrouter/poolside/laguna-s-2.1:free", "https://openrouter.example/v1", "or"},
+		{"deepseek-v4-flash", "https://zen.example/v1", "k"},
+	} {
+		u, ok := s.modelRoute[tc.id]
+		if !ok {
+			t.Fatalf("%q not in modelRoute", tc.id)
+		}
+		if u.BaseURL != tc.wantBase || u.APIKey != tc.wantKey {
+			t.Fatalf("%q -> %+v, want base=%q key=%q", tc.id, u, tc.wantBase, tc.wantKey)
+		}
+	}
+}
+
+// TestRouteOrderPutsSelectedFirst verifies that when /model selects a fallback,
+// routeOrder tries that upstream first without duplicating it in the pool.
+func TestRouteOrderPutsSelectedFirst(t *testing.T) {
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  "https://zen.example/v1",
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: "https://zen.example/v1", APIKey: "k", Model: "glm-5.2"},
+			{Provider: "openrouter", BaseURL: "https://openrouter.example/v1", APIKey: "or", Model: "poolside/laguna-s-2.1:free"},
+		},
+	}
+	s := New(cfg)
+
+	// Select glm-5.2 (a fallback) as the request's primary. The pool has 3
+	// entries (primary + 2 fallbacks), so 3 routes — but glm-5.2 first and
+	// only once.
+	sel := s.modelRoute["glm-5.2"]
+	routes := s.routeOrder(sel)
+	if len(routes) != 3 {
+		t.Fatalf("expected 3 distinct routes, got %d: %+v", len(routes), routes)
+	}
+	if routes[0].Upstream.Model != "glm-5.2" {
+		t.Fatalf("first route should be the selected model, got %+v", routes[0])
+	}
+	// glm-5.2 must appear exactly once (not duplicated from the pool).
+	var count int
+	for _, r := range routes {
+		if r.Upstream.Model == "glm-5.2" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("glm-5.2 appears %d times, want 1", count)
+	}
+}
+
+// TestHandleMessagesHonorsRequestModel runs the full /v1/messages handler
+// against a stub gateway and verifies the forwarded request uses the /model
+// selected upstream.
+func TestHandleMessagesHonorsRequestModel(t *testing.T) {
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var oreq openAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&oreq); err != nil {
+			t.Errorf("zen decode: %v", err)
+		}
+		if oreq.Model != "glm-5.2" {
+			t.Errorf("zen got model %q, want glm-5.2", oreq.Model)
+		}
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer zen.Close()
+	or := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"or"}}]}`))
+	}))
+	defer or.Close()
+
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  zen.URL,
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: zen.URL, APIKey: "k", Model: "glm-5.2"},
+			{Provider: "openrouter", BaseURL: or.URL, APIKey: "or", Model: "poolside/laguna-s-2.1:free"},
+		},
+	}
+	s := New(cfg)
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"ok"`) {
+		t.Fatalf("expected zen's response, got %s", rec.Body.String())
+	}
+}
+
+// TestModelSelectedRouteFallsBackOn429 verifies that when the /model-selected
+// upstream hits a temporary 429, the pool still rotates to a healthy fallback
+// instead of returning the 429 to Claude Code.
+func TestModelSelectedRouteFallsBackOn429(t *testing.T) {
+	var selCalls, fbCalls int
+	sel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		selCalls++
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
+	}))
+	defer sel.Close()
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fbCalls++
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"fallback-ok"}}]}`))
+	}))
+	defer fb.Close()
+
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  fb.URL,
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: sel.URL, APIKey: "k", Model: "glm-5.2"},
+			{Provider: "opencode-go", BaseURL: fb.URL, APIKey: "k", Model: "north-mini-code-free"},
+		},
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 after fallback, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fallback-ok") {
+		t.Fatalf("expected fallback response, got %s", rec.Body.String())
+	}
+	if selCalls == 0 || fbCalls == 0 {
+		t.Fatalf("expected selected (sel=%d) to fail and fallback (fb=%d) to serve", selCalls, fbCalls)
 	}
 }

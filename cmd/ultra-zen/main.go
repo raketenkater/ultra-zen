@@ -925,6 +925,10 @@ func main() {
 	// Start the proxy.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	upstreams := make([]proxy.Upstream, 0, 1+len(fallbackRoutes))
+	upstreams = append(upstreams, proxy.Upstream{Provider: *provider, BaseURL: selected.Base, APIKey: key, Model: selected.ID})
+	upstreams = append(upstreams, fallbackRoutes...)
+
 	srv := proxy.New(proxy.Config{
 		Provider:      *provider,
 		BaseURL:       selected.Base,
@@ -935,6 +939,7 @@ func main() {
 		OpenRouterRPM: *openRouterRPM,
 		Port:          *port,
 		Models:        modelInfos,
+		Upstreams:     upstreams,
 		OnUnavailable: func(route proxy.Upstream) {
 			if err := models.MarkUnavailable(route.Provider, route.Model); err != nil {
 				log.Printf("ultra-zen: could not remember unavailable %s model %s: %v", route.Provider, route.Model, err)
