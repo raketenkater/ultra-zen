@@ -318,3 +318,27 @@ func Find(list []Model, id string) *Model {
 	}
 	return nil
 }
+
+// BaseForProvider maps a provider name to the gateway base URL its catalog is
+// served from, so the re-availability poller knows which /models endpoint to
+// re-check when a denial may have lapsed. Returns "" for unknown providers.
+func BaseForProvider(provider string) string {
+	switch provider {
+	case "opencode-go":
+		return GoBase
+	case "openrouter":
+		return OpenRouterBase
+	case "groq":
+		return GroqBase
+	case "cerebras":
+		return CerebrasBase
+	case "huggingface":
+		return HuggingFaceBase
+	case "cohere":
+		return CohereBase
+	case "modelscope":
+		return ModelScopeBase
+	default:
+		return ""
+	}
+}

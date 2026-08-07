@@ -949,6 +949,11 @@ func main() {
 		die(err)
 	}
 
+	// Re-poll denied models while the session runs so a model that comes back
+	// (daily free limit reset, access restored) shows up again without waiting
+	// out the full 24h TTL in unavailable-models.json. Stops with ctx on exit.
+	models.StartRecheckPoller(ctx, httpClient, key)
+
 	if *proxyOnly {
 		fmt.Fprintf(os.Stderr, "ultra-zen proxy ready on %s (model=%s, upstream=%s)\n", srv.BaseURL(), selected.ID, selected.Base)
 		<-ctx.Done()

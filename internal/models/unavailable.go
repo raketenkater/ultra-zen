@@ -157,7 +157,7 @@ func MarkUnavailable(provider, model string) error {
 	return saveUnavailableLocked(entries)
 }
 
-// ClearUnavailable forgets access denials for provider. Setting or clearing a
+// ClearUnavailable clears access denials for provider. Setting or clearing a
 // provider key calls this so a different account gets a fresh catalog.
 func ClearUnavailable(provider string) error {
 	provider = strings.TrimSpace(provider)
@@ -171,6 +171,25 @@ func ClearUnavailable(provider string) error {
 			delete(entries, key)
 		}
 	}
+	return saveUnavailableLocked(entries)
+}
+
+// ClearUnavailableModel forgets a single denied provider/model pair. The
+// re-availability poller uses this to resurrect one model the moment its
+// provider lists it again, without clearing a whole provider's denials (which
+// would also hide unrelated, still-denied models).
+func ClearUnavailableModel(provider, model string) error {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		return fmt.Errorf("provider and model are required")
+	}
+	unavailableMu.Lock()
+	defer unavailableMu.Unlock()
+	guard := flock.Lock(unavailablePath())
+	defer guard.Close()
+	entries := loadUnavailableLocked()
+	delete(entries, unavailableKey(provider, model))
 	return saveUnavailableLocked(entries)
 }
 
