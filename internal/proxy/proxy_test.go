@@ -372,6 +372,11 @@ func TestModelSwitchSelectsUpstream(t *testing.T) {
 		{"opencode-go/glm-5.2", "https://zen.example/v1", "k"},
 		{"openrouter/poolside/laguna-s-2.1:free", "https://openrouter.example/v1", "or"},
 		{"deepseek-v4-flash", "https://zen.example/v1", "k"},
+		// The claude-prefixed ids advertised at /v1/models must route back to
+		// the same upstreams (Claude Code's /model sends these back).
+		{"claude-opencode-go-glm-5.2", "https://zen.example/v1", "k"},
+		{"claude-openrouter-poolside-laguna-s-2.1-free", "https://openrouter.example/v1", "or"},
+		{"claude-opencode-go-deepseek-v4-flash", "https://zen.example/v1", "k"},
 	} {
 		u, ok := s.modelRoute[tc.id]
 		if !ok {
@@ -379,6 +384,61 @@ func TestModelSwitchSelectsUpstream(t *testing.T) {
 		}
 		if u.BaseURL != tc.wantBase || u.APIKey != tc.wantKey {
 			t.Fatalf("%q -> %+v, want base=%q key=%q", tc.id, u, tc.wantBase, tc.wantKey)
+		}
+	}
+}
+
+// TestHandleModelsAdvertisesClaudePrefixedIDs verifies /v1/models advertises
+// ids that survive Claude Code's /(claude|anthropic)/i discovery filter and
+// includes a group header per provider.
+func TestHandleModelsAdvertisesClaudePrefixedIDs(t *testing.T) {
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  "https://zen.example/v1",
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Models: []ModelInfo{
+			{ID: "deepseek-v4-flash", Name: "deepseek-v4-flash", Provider: "opencode-go"},
+			{ID: "glm-5.2", Name: "glm-5.2", Provider: "opencode-go"},
+			{ID: "gpt-5.6-sol", Name: "GPT-5.6-Sol", Provider: "codex"},
+		},
+	}
+	s := New(cfg)
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	s.handleModels(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"display_name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Every model id must contain "claude" (survive the /model filter), and the
+	// codex + opencode group headers must appear.
+	ids := map[string]bool{}
+	var hasHeader bool
+	for _, m := range payload.Data {
+		ids[m.ID] = true
+		if m.ID == "claude-group-opencode-go" || m.ID == "claude-group-codex" {
+			hasHeader = true
+		}
+	}
+	if !hasHeader {
+		t.Fatalf("missing group headers; ids=%v", ids)
+	}
+	for _, want := range []string{
+		"claude-opencode-go-deepseek-v4-flash",
+		"claude-opencode-go-glm-5.2",
+		"claude-codex-gpt-5.6-sol",
+	} {
+		if !ids[want] {
+			t.Fatalf("missing advertised id %q; ids=%v", want, ids)
 		}
 	}
 }

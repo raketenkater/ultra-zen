@@ -47,7 +47,8 @@ func Env(proxyURL, model string, contextLength int) []string {
 			"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
 			"API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT", "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS",
 			"CLAUDE_ENABLE_BYTE_WATCHDOG", "CLAUDE_ENABLE_STREAM_WATCHDOG",
-			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_MAX_SESSION_TOKENS":
+			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_MAX_SESSION_TOKENS",
+			"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL":
 			continue
 		}
 		env = append(env, kv)
@@ -60,6 +61,14 @@ func Env(proxyURL, model string, contextLength int) []string {
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+model,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL="+model,
 		"ANTHROPIC_DEFAULT_OPUS_MODEL="+model,
+		// /model gateway discovery: Claude Code only fetches /v1/models from the
+		// proxy when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set AND the
+		// base URL is treated as first-party. The proxy URL (127.0.0.1) would
+		// fail the api.anthropic.com host check, so assume-first-party bypasses
+		// it. The proxy advertises claude-prefixed ids so the discovery filter
+		// (/(claude|anthropic)/i) keeps them.
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1",
+		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1",
 		fmt.Sprintf("API_TIMEOUT_MS=%d", noTimeoutMS),
 		fmt.Sprintf("CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=%d", noTimeoutMS),
 		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",

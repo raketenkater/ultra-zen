@@ -204,7 +204,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			seenProvider[m.Provider] = true
 			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider)))
 		}
-		models = append(models, entry(m.ID, m.Name))
+		// Advertise the claude-prefixed id so the /model gateway filter
+		// (/(claude|anthropic)/i) keeps it; the display name stays the human
+		// model name. The proxy routes the advertised id back to the real
+		// upstream model via modelRoute.
+		advertisedID := m.ID
+		if m.Provider != "" {
+			advertisedID = claudeModelID(m.Provider, m.ID)
+		}
+		models = append(models, entry(advertisedID, m.Name))
 	}
 	if len(models) == 0 {
 		models = append(models, entry(s.cfg.Model, ""))
@@ -222,6 +230,18 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
+}
+
+// claudeModelID produces the id ultra-zen advertises at /v1/models for a model.
+// Claude Code's /model gateway discovery filters advertised ids with
+// /(claude|anthropic)/i (verified in the installed binary), so a real model id
+// like "deepseek-v4-flash" would be silently dropped. Prefixing every
+// advertised id with "claude-" makes the whole catalog survive the filter. The
+// proxy's modelRoute maps these advertised ids back to the real upstream model.
+func claudeModelID(provider, model string) string {
+	// Sanitize: strip anything that would make a weird id (slashes, colons).
+	clean := strings.NewReplacer("/", "-", ":", "-", " ", "-").Replace(model)
+	return "claude-" + provider + "-" + clean
 }
 
 // groupTitle renders a provider name as a /v1/models group header title.
@@ -253,11 +273,13 @@ func buildModelRoute(cfg Config) map[string]Upstream {
 		if u.Model == "" {
 			return
 		}
-		// Plain Zen id, and the provider-qualified spelling so both forms a
-		// /model switch might send resolve to the same upstream.
+		// Plain Zen id, the provider-qualified spelling, and the claude-prefixed
+		// advertised id (what /v1/models shows and /model sends back) so every
+		// form a /model switch might send resolves to the same upstream.
 		m[u.Model] = u
 		if u.Provider != "" {
 			m[u.Provider+"/"+u.Model] = u
+			m[claudeModelID(u.Provider, u.Model)] = u
 		}
 	}
 	add(cfg.primaryUpstream())

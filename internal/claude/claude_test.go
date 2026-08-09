@@ -1,9 +1,46 @@
 package claude
 
 import (
+	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+// TestEnvGatewayDiscovery ensures Claude Code's /model gateway discovery is
+// enabled and the proxy URL is treated as first-party, so the /v1/models
+// catalog the proxy advertises is actually fetched.
+func TestEnvGatewayDiscovery(t *testing.T) {
+	// Run with a clean slate for the keys Env() overrides.
+	orig := map[string]string{}
+	for _, k := range []string{
+		"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "ANTHROPIC_API_KEY",
+	} {
+		orig[k] = os.Getenv(k)
+		defer os.Setenv(k, orig[k])
+		os.Unsetenv(k)
+	}
+
+	env := Env("http://127.0.0.1:1234", "deepseek-v4-flash", 200000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "1" {
+		t.Fatalf("gateway discovery not enabled: %q", got["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"])
+	}
+	if got["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"] != "1" {
+		t.Fatalf("assume-first-party not set: %q", got["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"])
+	}
+	if got["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:1234" {
+		t.Fatalf("base URL = %q", got["ANTHROPIC_BASE_URL"])
+	}
+	if _, leaked := got["ANTHROPIC_API_KEY"]; leaked {
+		t.Fatalf("real API key leaked into env")
+	}
+}
 
 func TestResearchArgs(t *testing.T) {
 	const mcpCfg = `{"mcpServers":{"ddg-search":{"command":"uvx","args":["duckduckgo-mcp-server"]}}}`

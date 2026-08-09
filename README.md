@@ -366,7 +366,19 @@ unchanged to ChatGPT models.
 
 The proxy advertises the full launch-provider model catalog at `/v1/models`, so
 Claude Code's `/model` command lists every model from the active provider (not
-just the selected one) and switches between them live.
+just the selected one) and switches between them live. Two things make that
+work:
+
+- **Gateway discovery is enabled** — ultra-zen injects
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` and
+  `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1`, which makes Claude Code fetch
+  `/v1/models` from the proxy even though it points at `127.0.0.1` instead of
+  `api.anthropic.com` (verified against the installed Claude Code binary).
+- **Advertised ids survive the picker filter** — Claude Code's `/model`
+  gateway discovery drops any id that doesn't match `/(claude|anthropic)/i`, so
+  the proxy advertises every model under a `claude-<provider>-<model>` id (e.g.
+  `claude-codex-gpt-5.6-sol`) and routes it back to the real upstream model.
+  The display name stays the human model name.
 
 Reasoning models emit their answer in `reasoning_content`; the proxy surfaces
 it as a text block so Claude Code never sees an empty message.
