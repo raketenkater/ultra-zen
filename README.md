@@ -149,18 +149,39 @@ spend $10 on free requests. See OpenRouter's current
 to 20 requests/minute; ultra-zen therefore paces one session to 20 RPM by
 default (`--openrouter-rpm 0` disables this).
 
-**Codex / ChatGPT subscription** (`--provider codex`): points at a local
-OpenAI-compatible endpoint backed by a ChatGPT Plus/Pro login — e.g.
-[ChatMock](https://github.com/RayBytes/ChatMock), which serves GPT-5 through the
-Codex OAuth client without an OpenAI API key. Start the endpoint, then:
+**Codex / ChatGPT subscription** (`--provider codex`): two backends, one flag.
 
-```bash
-export CODEX_BASE_URL=http://127.0.0.1:8000/v1
-ultra-zen --provider codex
-```
+1. **ChatGPT subscription (auto-detected)** — if you have the
+   [codex CLI](https://github.com/openai/codex) installed and logged in with a
+   ChatGPT Plus/Pro account, ultra-zen detects everything from
+   `~/.codex/auth.json` and talks directly to the ChatGPT backend (the OpenAI
+   Responses API). No URL, no key, no ChatMock:
 
-When run interactively, ultra-zen prompts for the key or URL if it isn't set,
-so you don't have to export anything up front.
+   ```bash
+   ultra-zen --provider codex          # auto-detect → pick a GPT model
+   ultra-zen --list --provider codex   # GPT-5.6-sol, GPT-5.5, GPT-5.4, …
+   ```
+
+   The model catalog is fetched live from `chatgpt.com/backend-api/codex/models`
+   with the account's bearer token, falling back to the codex CLI's own
+   `models_cache.json` if the endpoint is unreachable. Expiring access tokens
+   are refreshed automatically through the same OAuth flow the codex CLI uses,
+   and `auth.json` is rewritten atomically so the CLI stays in sync. The TUI's
+   start screen shows a **Codex (ChatGPT sub)** row whenever the login is
+   detected.
+
+2. **Local endpoint** — point at an OpenAI-compatible endpoint backed by a
+   ChatGPT login, e.g. [ChatMock](https://github.com/RayBytes/ChatMock), which
+   serves GPT-5 through the Codex OAuth client without an OpenAI API key:
+
+   ```bash
+   export CODEX_BASE_URL=http://127.0.0.1:8000/v1
+   ultra-zen --provider codex
+   ```
+
+When run interactively with neither a codex login nor a URL set, ultra-zen
+prompts for the endpoint URL. The explicit local endpoint always wins over
+auto-detection, so `CODEX_BASE_URL` / `--codex-url` are authoritative when set.
 
 **Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere|modelscope`):
 BYO-key OpenAI-compatible endpoints with their own free tiers, beyond opencode
@@ -312,6 +333,10 @@ cannot be combined with an explicit `--free-model` pool.
 - **free tier** (`https://opencode.ai/zen/v1`) — `*-free` models.
 - **OpenRouter** (`https://openrouter.ai/api/v1`) — `:free` models and
   `openrouter/free`.
+- **Codex / ChatGPT subscription** (`https://chatgpt.com/backend-api/codex`) —
+  the auto-detected backend's `GET /models` catalog (falling back to the codex
+  CLI's `models_cache.json`), listing the models a ChatGPT Plus/Pro account can
+  serve.
 
 Free pools keep the selected primary plus ordered OpenRouter routes in the
 local proxy. The proxy rotates only on rate-limit responses; ordinary invalid
@@ -328,6 +353,20 @@ The proxy (`internal/proxy`) translates both directions:
 | `tool_choice`                    | `tool_choice`                    |
 | `stop_reason`                    | `finish_reason`                  |
 | SSE `message_start`…`message_stop` | SSE `data:` chunks             |
+
+For the auto-detected **ChatGPT subscription** backend, the proxy additionally
+bridges to the **OpenAI Responses API**: chat-completions requests are
+translated to `{model, input, instructions, tools, stream}` (the codex backend
+requires `stream:true` and rejects `store`/`max_output_tokens`), and the
+Responses SSE stream (`response.output_text.delta`, `response.output_item.done`,
+`response.completed`) is folded back into the chat-completions chunks the rest
+of the pipeline already handles. So the same battle-tested Anthropic↔OpenAI
+translation — tool-call repair, phantom-block fixes, reasoning folding — applies
+unchanged to ChatGPT models.
+
+The proxy advertises the full launch-provider model catalog at `/v1/models`, so
+Claude Code's `/model` command lists every model from the active provider (not
+just the selected one) and switches between them live.
 
 Reasoning models emit their answer in `reasoning_content`; the proxy surfaces
 it as a text block so Claude Code never sees an empty message.

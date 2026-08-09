@@ -7,21 +7,24 @@ import (
 
 // openAIResponse is the non-streaming Chat Completions response from the gateway.
 type openAIResponse struct {
-	ID      string `json:"id"`
-	Choices []struct {
-		Index        int `json:"index"`
-		Message       struct {
-			Role      string          `json:"role"`
-			Content   string          `json:"content"`
-			ToolCalls []openAITool    `json:"tool_calls"`
-			Reasoning string          `json:"reasoning_content"` // stripped, never forwarded
-		} `json:"message"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Usage struct {
+	ID      string         `json:"id"`
+	Choices []openAIChoice `json:"choices"`
+	Usage   struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
+}
+
+// openAIChoice is one choice in a non-streaming Chat Completions response.
+type openAIChoice struct {
+	Index        int `json:"index"`
+	Message      struct {
+		Role      string       `json:"role"`
+		Content   string       `json:"content"`
+		ToolCalls []openAITool `json:"tool_calls"`
+		Reasoning string       `json:"reasoning_content"` // stripped, never forwarded
+	} `json:"message"`
+	FinishReason string `json:"finish_reason"`
 }
 
 // anthropicContentBlock is one block in an Anthropic message content array.

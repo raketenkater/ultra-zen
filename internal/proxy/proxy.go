@@ -22,6 +22,8 @@ type Config struct {
 	BaseURL          string // e.g. https://opencode.ai/zen/go/v1
 	APIKey           string
 	Model            string         // the Zen model id to forward orchestrator requests to
+	Kind             string         // primary route wire protocol ("" chat, "responses" for codex-sub)
+	AccountID        string         // ChatGPT-Account-ID header for the codex-sub backend
 	WorkerModel      string         // if set, background sub-agents use this cheaper model
 	Fallbacks        []Upstream     // ordered free-model fallbacks; replaces worker routing when set
 	OpenRouterRPM    int            // session-wide request pace for OpenRouter free models
@@ -33,6 +35,12 @@ type Config struct {
 	OnUnavailable    func(Upstream) // called after an explicit per-model access denial
 }
 
+// primaryUpstream returns the canonical Upstream for the primary route,
+// carrying the wire protocol kind and ChatGPT account id.
+func (c Config) primaryUpstream() Upstream {
+	return Upstream{Provider: c.Provider, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.Model, Kind: c.Kind, AccountID: c.AccountID}
+}
+
 // Upstream identifies one model and the endpoint/key that serves it. Fallbacks
 // may live on a different gateway from the primary model, which lets a Zen free
 // model rotate to an explicitly selected OpenRouter free model without
@@ -42,12 +50,30 @@ type Upstream struct {
 	BaseURL  string
 	APIKey   string
 	Model    string
+	// Kind selects the upstream wire protocol. Empty / "" is the default
+	// OpenAI Chat Completions path (all existing gateways). "responses" uses
+	// the OpenAI Responses API (the ChatGPT subscription backend).
+	Kind string
+	// AccountID is the ChatGPT-Account-ID header for the codex-sub backend.
+	AccountID string
 }
 
-// ModelInfo is a minimal model entry for /v1/models advertising.
+// Upstream kinds.
+const (
+	UpstreamChat      = ""    // OpenAI Chat Completions (default)
+	UpstreamResponses = "responses" // OpenAI Responses API (codex-sub)
+)
+
+// ModelInfo is a minimal model entry for /v1/models advertising. Provider
+// labels the owning provider so main.go can group the list; the /v1/models
+// handler renders group headers as real selectable ids (Claude Code's picker
+// has no non-selectable separator concept — verified against the installed
+// CLI — so a header is a routing-neutral id whose display name carries the
+// group title).
 type ModelInfo struct {
-	ID   string
-	Name string
+	ID       string
+	Name     string
+	Provider string // provider name, used to insert a group header before it
 }
 
 // maxOutputTokens is the maximum max_tokens the proxy forwards to the Zen
@@ -161,7 +187,23 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var models []map[string]any
+	// Group headers: Claude Code's /model picker has no non-selectable separator
+	// (verified against the installed CLI — only "disabled":true and a
+	// /(claude|anthropic)/i id filter apply). A header is therefore a real,
+	// selectable, routing-neutral id whose display name names the group. The
+	// "claude" in the id lets it survive the picker's gateway filter.
+	headerID := func(provider string) string {
+		if provider == "" {
+			return ""
+		}
+		return "claude-group-" + provider
+	}
+	seenProvider := map[string]bool{}
 	for _, m := range s.cfg.Models {
+		if m.Provider != "" && !seenProvider[m.Provider] {
+			seenProvider[m.Provider] = true
+			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider)))
+		}
 		models = append(models, entry(m.ID, m.Name))
 	}
 	if len(models) == 0 {
@@ -180,6 +222,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
+}
+
+// groupTitle renders a provider name as a /v1/models group header title.
+func groupTitle(provider string) string {
+	switch provider {
+	case "opencode-go":
+		return "opencode Zen"
+	case "openrouter":
+		return "OpenRouter"
+	case "codex":
+		return "Codex (ChatGPT sub)"
+	case "codex-sub":
+		return "Codex (ChatGPT sub)"
+	default:
+		return provider
+	}
 }
 
 // buildModelRoute maps model ids to the upstream that serves them so the
@@ -202,7 +260,7 @@ func buildModelRoute(cfg Config) map[string]Upstream {
 			m[u.Provider+"/"+u.Model] = u
 		}
 	}
-	add(Upstream{Provider: cfg.Provider, BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: cfg.Model})
+	add(cfg.primaryUpstream())
 	for _, f := range cfg.Fallbacks {
 		add(f)
 	}
@@ -232,7 +290,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// fallback pool replaces the worker split and gives every role the same
 	// resilient route, so a main-loop or subagent request can continue on the
 	// next free model without restarting the session.
-	primary := Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model}
+	primary := s.cfg.primaryUpstream()
 	if len(s.cfg.Fallbacks) == 0 && s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
 		// Background sub-agent: run on the worker unless the user explicitly
 		// selected a model via /model, which wins.
@@ -332,10 +390,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if areq.Stream {
-		s.streamResponse(w, resp, areq.Model)
+		s.streamResponse(w, resp, areq.Model, used.Kind)
 		return
 	}
-	s.nonStreamResponse(w, resp, areq.Model)
+	s.nonStreamResponse(w, resp, areq.Model, used.Kind)
 }
 
 // routeChoice retains a route's stable pool index so concurrent requests can
@@ -502,7 +560,7 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 		index int
 	}
 	pool := make([]entry, 0, 1+len(s.cfg.Fallbacks))
-	pool = append(pool, entry{Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model}, 0})
+	pool = append(pool, entry{s.cfg.primaryUpstream(), 0})
 	for i, f := range s.cfg.Fallbacks {
 		pool = append(pool, entry{f, 1 + i})
 	}
@@ -580,7 +638,7 @@ func (s *Server) exhaustProviderRoutes(current Upstream) {
 		return
 	}
 	routes := make([]Upstream, 0, 1+len(s.cfg.Fallbacks))
-	routes = append(routes, Upstream{Provider: s.cfg.Provider, BaseURL: s.cfg.BaseURL, APIKey: s.cfg.APIKey, Model: s.cfg.Model})
+	routes = append(routes, s.cfg.primaryUpstream())
 	routes = append(routes, s.cfg.Fallbacks...)
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
@@ -792,8 +850,18 @@ func parseRetryAfter(value string) time.Duration {
 }
 
 // forwardTo marshals the OpenAI request and sends it to one gateway route,
-// returning the marshalled payload and raw upstream response.
+// returning the marshalled payload and raw upstream response. The Responses-API
+// kind (codex-sub) is translated to the Responses wire format and posted to
+// {base}/responses instead of chat/completions.
 func (s *Server) forwardTo(ctx context.Context, upstream Upstream, oreq *openAIRequest) (payload []byte, resp *http.Response, err error) {
+	if upstream.Kind == UpstreamResponses {
+		payload, err = toResponses(oreq)
+		if err != nil {
+			return nil, nil, fmt.Errorf("translate to responses: %w", err)
+		}
+		resp, err = sendResponses(ctx, upstream, payload)
+		return payload, resp, err
+	}
 	payload, err = json.Marshal(oreq)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal request: %w", err)
@@ -844,10 +912,35 @@ func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
 	_ = os.WriteFile(dir+"/last-400.json", b, 0644)
 }
 
-func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+// nonStreamResponse converts a non-streaming upstream response to Anthropic.
+// Claude Code always requests streaming, so this path is rarely exercised; for
+// the Responses kind we read the buffered SSE (the codex backend always streams
+// even for a non-stream caller), replay the translated chat chunks into a
+// synthetic openAIResponse, and translate that.
+func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, model, kind string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		writeError(w, 502, "api_error", "read gateway response: "+err.Error())
+		return
+	}
+	if kind == UpstreamResponses {
+		// Replay the Responses SSE into chat-completions chunks and fold them
+		// into an openAIResponse.
+		chunks := collectChatChunks(body)
+		if len(chunks) == 0 {
+			writeError(w, 502, "api_error", "empty responses stream from codex backend")
+			return
+		}
+		oresp := chunksToOpenAIResponse(chunks)
+		anthropic := oresp.toAnthropic(model)
+		out, err := json.Marshal(anthropic)
+		if err != nil {
+			writeError(w, 502, "api_error", "encode translated response: "+err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(out)
 		return
 	}
 	var oresp openAIResponse
@@ -868,12 +961,87 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, m
 	w.Write(out)
 }
 
-func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+// collectChatChunks replays a buffered Responses SSE body into chat-completions
+// chunks, in order.
+func collectChatChunks(body []byte) []chatChunk {
+	var chunks []chatChunk
+	sc := newScanner(bytes.NewReader(body))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		if cs, ok := responsesEventToChatChunks(payload); ok {
+			chunks = append(chunks, cs...)
+		}
+	}
+	return chunks
+}
+
+// chunksToOpenAIResponse folds translated chat-completions chunks into a
+// non-streaming openAIResponse for translation. Tool calls arrive whole in the
+// output_item.done chunk; text accumulates across delta chunks.
+func chunksToOpenAIResponse(chunks []chatChunk) openAIResponse {
+	var resp openAIResponse
+	var text strings.Builder
+	var usage *chatUsage
+	for _, c := range chunks {
+		if resp.ID == "" {
+			resp.ID = c.ID
+		}
+		if c.Usage != nil {
+			usage = c.Usage
+		}
+		for _, ch := range c.Choices {
+			if ch.Delta.Content != "" {
+				text.WriteString(ch.Delta.Content)
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				choice := openAIChoice{Index: ch.Index, FinishReason: "tool_calls"}
+				choice.Message.Role = "assistant"
+				choice.Message.ToolCalls = append(choice.Message.ToolCalls, openAITool{
+					ID:   tc.ID,
+					Type: "function",
+					Function: openAIToolFunc{
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					},
+				})
+				resp.Choices = append(resp.Choices, choice)
+			}
+		}
+	}
+	if text.Len() > 0 && len(resp.Choices) == 0 {
+		choice := openAIChoice{Index: 0, FinishReason: "stop"}
+		choice.Message.Role = "assistant"
+		choice.Message.Content = text.String()
+		resp.Choices = append(resp.Choices, choice)
+	}
+	if usage != nil {
+		resp.Usage.PromptTokens = usage.PromptTokens
+		resp.Usage.CompletionTokens = usage.CompletionTokens
+	}
+	return resp
+}
+
+// streamResponse streams the upstream response to the client. For the
+// Responses-API kind the upstream body is a Responses SSE stream that is first
+// translated into chat-completions chunks, which streamTranslate then converts
+// to the Anthropic SSE stream Claude Code reads.
+func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response, model, kind string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
-	if err := streamTranslate(w, resp.Body, model); err != nil {
+	var body io.Reader = resp.Body
+	if kind == UpstreamResponses {
+		body = responsesSSEStream(resp.Body)
+	}
+	if err := streamTranslate(w, body, model); err != nil {
 		log.Printf("ultra-zen proxy stream: %v", err)
 	}
 }

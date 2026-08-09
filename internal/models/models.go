@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,11 @@ const (
 	CohereBase       = "https://api.cohere.ai/compatibility/v1"
 	ModelScopeBase   = "https://api-inference.modelscope.ai/v1"
 	ModelScopeCNBase = "https://api-inference.modelscope.cn/v1"
+	// CodexSubBase is the ChatGPT subscription backend the codex CLI talks to.
+	// It serves the OpenAI Responses API (POST /responses) and a model catalog
+	// at GET /models — NOT chat/completions. There is deliberately no /v1
+	// segment; the codex binary's own constant is exactly this string.
+	CodexSubBase = "https://chatgpt.com/backend-api/codex"
 )
 
 // FreeTierProvider describes a BYO-key OpenAI-compatible endpoint that offers
@@ -263,6 +269,119 @@ func ListCodex(httpClient *http.Client, baseURL, apiKey string) ([]Model, error)
 	return out, nil
 }
 
+// codexModelEntry is one model in the ChatGPT backend's GET /models response.
+// The codex backend does NOT speak the OpenAI {data:[{id}]} shape — it returns
+// {"models":[{slug,display_name,context_window,visibility,supported_in_api}]}.
+type codexModelEntry struct {
+	Slug           string `json:"slug"`
+	DisplayName    string `json:"display_name"`
+	ContextWindow  int    `json:"context_window"`
+	Visibility     string `json:"visibility"`
+	SupportedInAPI bool   `json:"supported_in_api"`
+}
+
+// ListCodexSub fetches the model catalog from the ChatGPT subscription backend
+// (the one the installed codex CLI authenticates against). accessToken is sent
+// as the Bearer credential and accountID as ChatGPT-Account-ID. Only models the
+// API can actually serve (supported_in_api && visibility=="list") are returned,
+// mirroring how the codex CLI filters its picker. clientVersion is the codex
+// CLI version string the backend expects in the query (e.g. "0.147.0"); pass ""
+// to omit the query.
+func ListCodexSub(httpClient *http.Client, base, accessToken, accountID, clientVersion string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if clientVersion != "" {
+		q := req.URL.Query()
+		q.Set("client_version", clientVersion)
+		req.URL.RawQuery = q.Encode()
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-ID", accountID)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("codex-sub models: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("codex-sub models: GET %s/models: %s: %s", base, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return parseCodexModels(body, base)
+}
+
+// parseCodexModels parses the codex backend's {"models":[...]} catalog into
+// []Model. Entries that are hidden or not API-served are skipped (the codex CLI
+// does the same when building its picker). base is the endpoint the catalog was
+// fetched from, kept on each Model so the proxy routes requests there.
+func parseCodexModels(body []byte, base string) ([]Model, error) {
+	var payload struct {
+		Models []codexModelEntry `json:"models"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("parse codex models: %w", err)
+	}
+	var out []Model
+	for _, e := range payload.Models {
+		if e.Slug == "" || !e.SupportedInAPI || e.Visibility != "list" {
+			continue
+		}
+		out = append(out, Model{
+			ID:            e.Slug,
+			Name:          e.DisplayName,
+			Base:          base,
+			Free:          false, // subscription-backed, not a free tier
+			ContextLength: e.ContextWindow,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// CodexModelsCachePath is the codex CLI's own model-cache file. It stores the
+// same shape as the live GET /models response, so it doubles as an offline
+// fallback when the backend is unreachable.
+func CodexModelsCachePath() string {
+	home := os.Getenv("CODEX_HOME")
+	if home == "" {
+		hd, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		home = filepath.Join(hd, ".codex")
+	}
+	return filepath.Join(home, "models_cache.json")
+}
+
+// ListCodexModelsFromCache reads the codex CLI's cached model catalog (same
+// {"models":[...]} shape as the live endpoint). base is the endpoint the models
+// are associated with (CodexSubBase). Returns an error when the cache is absent
+// or unreadable, so the caller falls back to the live fetch.
+func ListCodexModelsFromCache(base string) ([]Model, error) {
+	path := CodexModelsCachePath()
+	if path == "" {
+		return nil, fmt.Errorf("codex models cache: home dir unavailable")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("codex models cache (%s): %w", path, err)
+	}
+	list, err := parseCodexModels(data, base)
+	if err != nil {
+		return nil, fmt.Errorf("codex models cache (%s): %w", path, err)
+	}
+	if len(list) == 0 {
+		return nil, fmt.Errorf("codex models cache (%s): no usable models", path)
+	}
+	return list, nil
+}
+
 // ListFreeTier fetches the model list from a free-tier OpenAI-compatible
 // endpoint (see FreeTierProviders). Every model it advertises is treated as
 // free, since these are personal-signup free tiers rather than gateways with
@@ -338,6 +457,11 @@ func BaseForProvider(provider string) string {
 		return CohereBase
 	case "modelscope":
 		return ModelScopeBase
+	case "codex":
+		// The auto-detected ChatGPT subscription backend (the only codex route
+		// the recheck poller can reach with the shared token; a user-specified
+		// local endpoint is not a constant base).
+		return CodexSubBase
 	default:
 		return ""
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/raketenkater/ultra-zen/internal/auth"
+	"github.com/raketenkater/ultra-zen/internal/codex"
 	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
@@ -27,10 +28,26 @@ type FreeRoute struct {
 // String returns the provider:model spec consumed by splitFreeModelSpec.
 func (r FreeRoute) String() string { return r.Provider + ":" + r.Model }
 
+// codexClientVersion is the client_version the ChatGPT backend expects on
+// GET /models. It mirrors the installed codex CLI so the catalog matches what
+// the CLI itself would show.
+var codexClientVersion = func() string {
+	v := codex.Version()
+	if v == "" {
+		return "0.147.0" // sensible default when the CLI isn't on PATH
+	}
+	return v
+}()
+
 // poolProviders is the set of providers whose free models can rotate as
 // fallbacks, in display order. codex is excluded: its models are
 // subscription-backed (Free:false) and addRoute only accepts free models.
+// codex-sub is discovered here too — it appears as a launchable provider row
+// (its models are Free:false, so they never enter the free pool), giving the
+// TUI a one-keypress path to the ChatGPT subscription when the codex CLI is
+// logged in.
 var poolProviders = []string{
+	"codex-sub",
 	"openrouter",
 	"opencode-go",
 	"groq",
@@ -280,21 +297,46 @@ func (m *fallbackManager) fetch(provider string) tea.Cmd {
 }
 
 func loadProvider(provider string) fallbackLoaded {
-	key := providerKey(provider)
-	if key == "" {
-		return fallbackLoaded{provider: provider, key: ""}
-	}
 	client := &http.Client{Timeout: 4 * time.Second}
 	var (
 		list []models.Model
 		err  error
 	)
+	key := providerKey(provider)
 	switch provider {
+	case "codex-sub":
+		// The ChatGPT subscription backend is auto-detected from the installed
+		// codex CLI's login; no stored key exists. If the login is missing, the
+		// provider reads as keyless and the row prompts to run `codex login`.
+		auth, ok := codex.Detect()
+		if !ok {
+			return fallbackLoaded{provider: provider, key: ""}
+		}
+		key = "codex-sub:" + auth.AccountID
+		list, err = models.ListCodexSub(client, models.CodexSubBase, auth.AccessToken, auth.AccountID, codexClientVersion)
+		if err != nil {
+			// The live endpoint may be down or rate-limiting; fall back to the
+			// codex CLI's own cached catalog so the row still shows something.
+			cached, cacheErr := models.ListCodexModelsFromCache(models.CodexSubBase)
+			if cacheErr == nil {
+				list = cached
+				err = nil
+			}
+		}
 	case "openrouter":
+		if key == "" {
+			return fallbackLoaded{provider: provider, key: ""}
+		}
 		list, err = models.ListOpenRouter(client, key)
 	case "opencode-go":
+		if key == "" {
+			return fallbackLoaded{provider: provider, key: ""}
+		}
 		list, err = models.ListZenFree(client, key)
 	default:
+		if key == "" {
+			return fallbackLoaded{provider: provider, key: ""}
+		}
 		_, ok := models.FreeTierProviders[provider]
 		if !ok {
 			return fallbackLoaded{provider: provider, err: errUnknownProvider(provider)}

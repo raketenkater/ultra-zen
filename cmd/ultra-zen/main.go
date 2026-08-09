@@ -29,6 +29,7 @@ import (
 
 	"github.com/raketenkater/ultra-zen/internal/auth"
 	"github.com/raketenkater/ultra-zen/internal/claude"
+	"github.com/raketenkater/ultra-zen/internal/codex"
 	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/proxy"
@@ -50,6 +51,25 @@ const autoSourceMaxRoutes = 3
 // providers during automatic pool discovery (after the active provider, Zen,
 // and OpenRouter). Only providers with an already-stored key are ever loaded.
 var autoSourceOrder = []string{"modelscope", "groq", "cerebras", "huggingface", "cohere"}
+
+// codexSub is set when the --provider codex launch auto-detected the ChatGPT
+// subscription (no explicit --codex-url). It switches the proxy's upstream wire
+// protocol to the Responses API and threads the ChatGPT-Account-ID header.
+var codexSub bool
+
+// codexAccountID is the ChatGPT account id from ~/.codex/auth.json, sent as the
+// ChatGPT-Account-ID header on codex-sub requests.
+var codexAccountID string
+
+// codexClientVersion returns the client_version string for the ChatGPT backend
+// model catalog, mirroring the installed codex CLI ("" falls back to a sensible
+// default the backend accepts).
+func codexClientVersion() string {
+	if v := codex.Version(); v != "" {
+		return v
+	}
+	return "0.147.0"
+}
 
 // modelFlag is a repeatable, comma-friendly model list. Keeping each selected
 // model explicit makes a free pool deterministic while still allowing the
@@ -158,6 +178,30 @@ func freeTierModels(list []models.Model) []models.Model {
 // the normal startup path and verifies the model list again before launch.
 func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string) ([]models.Model, string, error) {
 	switch {
+	case provider == "codex-sub":
+		// Re-detect the ChatGPT subscription (same path as the --provider codex
+		// startup); sets the global flags so the proxy gets the Responses kind
+		// and account id.
+		auth, ok := codex.Detect()
+		if !ok {
+			return nil, "", fmt.Errorf("codex login is no longer available; run `codex login`")
+		}
+		if auth.NeedsRefresh() {
+			if err := codex.Refresh(client, auth); err == nil {
+				auth, _ = codex.Detect()
+			}
+		}
+		codexSub = true
+		codexAccountID = auth.AccountID
+		list, err := models.ListCodexSub(client, models.CodexSubBase, auth.AccessToken, auth.AccountID, codexClientVersion())
+		if err != nil {
+			cached, cacheErr := models.ListCodexModelsFromCache(models.CodexSubBase)
+			if cacheErr != nil {
+				return nil, "", err
+			}
+			list = cached
+		}
+		return list, auth.AccessToken, nil
 	case provider == "openrouter":
 		key := models.ProviderKey(provider, openRouterFlag, "")
 		if key == "" {
@@ -227,7 +271,7 @@ func main() {
 	var freeModels modelFlag
 	var (
 		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
-		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex")
+		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex (auto-detects the ChatGPT subscription from the codex CLI login)")
 		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
 		codexBaseURL  = flag.String("codex-url", "", "Codex endpoint base URL (or set CODEX_BASE_URL), e.g. http://127.0.0.1:8000/v1")
 		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
@@ -252,7 +296,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Providers:")
 		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
 		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
-		fmt.Fprintln(os.Stderr, "  --provider codex         Local Codex endpoint (ChatGPT sub, e.g. ChatMock)")
+		fmt.Fprintln(os.Stderr, "  --provider codex         Codex: auto-detect the ChatGPT subscription (codex login) or a local endpoint")
 		fmt.Fprintln(os.Stderr, "  --provider groq          Groq free tier (set GROQ_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider cerebras      Cerebras free tier (set CEREBRAS_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider huggingface   HuggingFace Inference router (set HF_TOKEN or --api-key)")
@@ -447,15 +491,44 @@ func main() {
 		if base == "" {
 			base = os.Getenv("CODEX_BASE_URL")
 		}
-		if base == "" && interactive {
-			base = tui.PromptKey("Codex endpoint base URL", "e.g. http://127.0.0.1:8000/v1 (ChatMock)", false)
-		}
-		if base == "" {
-			die(fmt.Errorf("codex provider requires a base URL: set CODEX_BASE_URL or pass --codex-url\nPoint it at a local Codex endpoint (e.g. ChatMock on http://127.0.0.1:8000/v1)"))
-		}
 		ck := *codexKey
 		if ck == "" {
 			ck = os.Getenv("CODEX_API_KEY")
+		}
+		var codexErr error
+		if base == "" {
+			// No explicit local endpoint: fall back to the ChatGPT subscription
+			// auto-detected from the installed codex CLI's login. This is the
+			// zero-setup path — no CODEX_BASE_URL, no ChatMock, no key.
+			if auth, ok := codex.Detect(); ok {
+				if auth.NeedsRefresh() {
+					if err := codex.Refresh(httpClient, auth); err == nil {
+						auth, _ = codex.Detect()
+					}
+				}
+				codexSub = true
+				codexAccountID = auth.AccountID
+				base = models.CodexSubBase
+				key = auth.AccessToken
+				list, codexErr = models.ListCodexSub(httpClient, base, auth.AccessToken, auth.AccountID, codexClientVersion())
+				if codexErr != nil {
+					// The live catalog may be unreachable (network / rate limit);
+					// fall back to the codex CLI's own cached catalog.
+					cached, cacheErr := models.ListCodexModelsFromCache(base)
+					if cacheErr != nil {
+						die(fmt.Errorf("codex-sub: %w", codexErr))
+					}
+					list = cached
+					codexErr = nil
+				}
+				break
+			}
+			if interactive {
+				base = tui.PromptKey("Codex endpoint base URL", "e.g. http://127.0.0.1:8000/v1 (ChatMock)", false)
+			}
+		}
+		if base == "" {
+			die(fmt.Errorf("codex provider requires a base URL: set CODEX_BASE_URL or pass --codex-url\nPoint it at a local Codex endpoint (e.g. ChatMock on http://127.0.0.1:8000/v1), or `codex login` for the ChatGPT subscription"))
 		}
 		if ck == "" {
 			ck = "codex" // ChatMock ignores the key
@@ -911,22 +984,38 @@ func main() {
 		}
 	}
 
-	// Build the model list for /v1/models (Claude Code's /model command).
+	// Build the model list for /v1/models (Claude Code's /model command). Each
+	// entry carries its provider so the handler groups the list; the primary
+	// provider's catalog is the launch list, and each fallback route appears once.
 	modelInfos := make([]proxy.ModelInfo, 0, len(list))
 	for _, m := range list {
-		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name})
+		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name, Provider: *provider})
 	}
 	for _, route := range fallbackRoutes {
 		if models.Find(list, route.Model) == nil {
-			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: route.Model})
+			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: route.Model, Provider: route.Provider})
 		}
 	}
 
 	// Start the proxy.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The codex-sub launch talks the Responses API and threads the account id
+	// header; everything else uses the default chat-completions path.
+	primaryKind := ""
+	if codexSub {
+		primaryKind = proxy.UpstreamResponses
+	}
+	primaryUp := proxy.Upstream{
+		Provider:  *provider,
+		BaseURL:   selected.Base,
+		APIKey:    key,
+		Model:     selected.ID,
+		Kind:      primaryKind,
+		AccountID: codexAccountID,
+	}
 	upstreams := make([]proxy.Upstream, 0, 1+len(fallbackRoutes))
-	upstreams = append(upstreams, proxy.Upstream{Provider: *provider, BaseURL: selected.Base, APIKey: key, Model: selected.ID})
+	upstreams = append(upstreams, primaryUp)
 	upstreams = append(upstreams, fallbackRoutes...)
 
 	srv := proxy.New(proxy.Config{
@@ -934,6 +1023,8 @@ func main() {
 		BaseURL:       selected.Base,
 		APIKey:        key,
 		Model:         selected.ID,
+		Kind:          primaryKind,
+		AccountID:     codexAccountID,
 		WorkerModel:   *workerModel,
 		Fallbacks:     fallbackRoutes,
 		OpenRouterRPM: *openRouterRPM,
@@ -941,6 +1032,11 @@ func main() {
 		Models:        modelInfos,
 		Upstreams:     upstreams,
 		OnUnavailable: func(route proxy.Upstream) {
+			// Subscription-backed codex models are not account-gated free tiers;
+			// a transient denial should not hide them from future launches.
+			if codexSub && route.Provider == *provider {
+				return
+			}
 			if err := models.MarkUnavailable(route.Provider, route.Model); err != nil {
 				log.Printf("ultra-zen: could not remember unavailable %s model %s: %v", route.Provider, route.Model, err)
 			}

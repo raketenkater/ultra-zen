@@ -62,6 +62,8 @@ func (i modelItem) Description() string {
 		tier = "HuggingFace free"
 	case baseCohere:
 		tier = "Cohere free"
+	case models.CodexSubBase:
+		tier = "ChatGPT subscription"
 	default:
 		if i.m.Free {
 			tier = "zen free tier"
@@ -133,6 +135,9 @@ func (i providerModelItem) Description() string {
 	if i.model.Free {
 		tier = "free"
 	}
+	if i.provider == "codex-sub" {
+		return "ChatGPT subscription · auto-detected from the codex CLI login"
+	}
 	return i.provider + " " + tier + " · provider discovered automatically"
 }
 func (i providerModelItem) FilterValue() string {
@@ -154,6 +159,9 @@ func (i providerStatusItem) Title() string {
 	case "loading":
 		return i.provider + " — loading free models…"
 	case "keyless":
+		if i.provider == "codex-sub" {
+			return "Codex (ChatGPT sub) — not logged in (run `codex login`)"
+		}
 		return i.provider + " — no key (Enter to set)"
 	default:
 		return i.provider + " — unavailable (Enter to retry)"
@@ -645,6 +653,8 @@ func providerSubtitle(provider string) string {
 		return "OpenRouter"
 	case "codex":
 		return "Codex endpoint"
+	case "codex-sub":
+		return "Codex (ChatGPT sub)"
 	case "groq", "cerebras", "huggingface", "cohere", "modelscope":
 		return provider
 	default:
