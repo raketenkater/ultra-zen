@@ -210,7 +210,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		// upstream model via modelRoute.
 		advertisedID := m.ID
 		if m.Provider != "" {
-			advertisedID = claudeModelID(m.Provider, m.ID)
+			advertisedID = ClaudeModelID(m.Provider, m.ID)
 		}
 		models = append(models, entry(advertisedID, m.Name))
 	}
@@ -232,13 +232,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-// claudeModelID produces the id ultra-zen advertises at /v1/models for a model.
+// ClaudeModelID produces the id ultra-zen advertises at /v1/models for a model.
 // Claude Code's /model gateway discovery filters advertised ids with
 // /(claude|anthropic)/i (verified in the installed binary), so a real model id
 // like "deepseek-v4-flash" would be silently dropped. Prefixing every
 // advertised id with "claude-" makes the whole catalog survive the filter. The
 // proxy's modelRoute maps these advertised ids back to the real upstream model.
-func claudeModelID(provider, model string) string {
+func ClaudeModelID(provider, model string) string {
 	// Sanitize: strip anything that would make a weird id (slashes, colons).
 	clean := strings.NewReplacer("/", "-", ":", "-", " ", "-").Replace(model)
 	return "claude-" + provider + "-" + clean
@@ -279,7 +279,7 @@ func buildModelRoute(cfg Config) map[string]Upstream {
 		m[u.Model] = u
 		if u.Provider != "" {
 			m[u.Provider+"/"+u.Model] = u
-			m[claudeModelID(u.Provider, u.Model)] = u
+			m[ClaudeModelID(u.Provider, u.Model)] = u
 		}
 	}
 	add(cfg.primaryUpstream())

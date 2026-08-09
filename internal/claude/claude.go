@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/raketenkater/ultra-zen/internal/workflow"
 )
@@ -61,14 +63,15 @@ func Env(proxyURL, model string, contextLength int) []string {
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+model,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL="+model,
 		"ANTHROPIC_DEFAULT_OPUS_MODEL="+model,
-		// /model gateway discovery: Claude Code only fetches /v1/models from the
+		// /model gateway discovery: Claude Code fetches /v1/models from the
 		// proxy when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set AND the
-		// base URL is treated as first-party. The proxy URL (127.0.0.1) would
-		// fail the api.anthropic.com host check, so assume-first-party bypasses
-		// it. The proxy advertises claude-prefixed ids so the discovery filter
+		// base URL is NOT treated as first-party (hf() must be false). The proxy
+		// URL (127.0.0.1) already fails the api.anthropic.com host check, so no
+		// first-party override is set — and _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL
+		// must stay unset, because it would make hf() true and DISABLE discovery.
+		// The proxy advertises claude-prefixed ids so the discovery filter
 		// (/(claude|anthropic)/i) keeps them.
 		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1",
-		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1",
 		fmt.Sprintf("API_TIMEOUT_MS=%d", noTimeoutMS),
 		fmt.Sprintf("CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=%d", noTimeoutMS),
 		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",
@@ -91,6 +94,76 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// GatewayCachePath returns the Claude Code gateway-models cache file that feeds
+// its /model command. The path is resolved exactly as the installed binary does:
+// Rms.join(Ln(), "cache", "gateway-models.json") where Ln() is the XDG cache dir
+// (CLAUDE_CODE_GATEWAY_CACHE_DIR override, else ~/.cache/claude). Verified
+// against the decompiled Claude Code 2.1.226 bootstrap.
+func GatewayCachePath() string {
+	if p := os.Getenv("CLAUDE_CODE_GATEWAY_CACHE_DIR"); p != "" {
+		return filepath.Join(p, "cache", "gateway-models.json")
+	}
+	cache := os.Getenv("XDG_CACHE_HOME")
+	if cache == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		cache = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(cache, "claude", "cache", "gateway-models.json")
+}
+
+// GatewayCacheModel is one entry in the gateway-models cache file. It matches
+// the schema Claude Code validates with (hpu = {id, display_name?}.strip()).
+type GatewayCacheModel struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+// WriteGatewayCache pre-writes Claude Code's /model gateway-models cache so the
+// picker shows the full catalog immediately on launch — without depending on
+// Claude Code's own (fragile) gateway discovery fetch (bpu) to populate it.
+//
+// Claude Code's cnn() reads this file and maps every entry into the /model
+// picker when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set and the file's
+// baseUrl matches ANTHROPIC_BASE_URL. ultra-zen therefore writes exactly the
+// shape the binary expects: {baseUrl, fetchedAt, models:[{id, display_name}]}.
+//
+// models are the advertised catalog entries (already claude-prefixed ids, since
+// the /model discovery filter drops anything not matching /(claude|anthropic)/i).
+// baseURL must be the proxy URL passed to claude as ANTHROPIC_BASE_URL, byte-for-
+// byte, or cnn() ignores the cache.
+func WriteGatewayCache(baseURL string, models []GatewayCacheModel) error {
+	path := GatewayCachePath()
+	if path == "" {
+		return fmt.Errorf("gateway cache path unavailable")
+	}
+	cache := map[string]any{
+		"baseUrl":   baseURL,
+		"fetchedAt": time.Now().UTC().Format(time.RFC3339),
+		"models":    models,
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return fmt.Errorf("encode gateway cache: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("gateway cache dir: %w", err)
+	}
+	// Write the temp file then rename, so a concurrent Claude Code read never
+	// sees a partially-written cache.
+	tmp := path + ".ultra-zen-tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("gateway cache write: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("gateway cache replace: %w", err)
+	}
+	return nil
 }
 
 // SettingsJSON returns the inline --settings JSON injected at launch. It wires

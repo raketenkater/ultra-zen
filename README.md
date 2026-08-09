@@ -370,10 +370,15 @@ just the selected one) and switches between them live. Two things make that
 work:
 
 - **Gateway discovery is enabled** — ultra-zen injects
-  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` and
-  `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1`, which makes Claude Code fetch
-  `/v1/models` from the proxy even though it points at `127.0.0.1` instead of
-  `api.anthropic.com` (verified against the installed Claude Code binary).
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`, which makes Claude Code fetch
+  `/v1/models` from the proxy (verified against the installed Claude Code
+  binary). The `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` override is
+  deliberately NOT set: it would tell Claude Code the proxy IS first-party
+  Anthropic, which disables discovery.
+- **The catalog is pre-cached** — ultra-zen writes Claude Code's
+  `gateway-models.json` cache file directly before launch, so the `/model`
+  picker populates instantly without depending on Claude Code's own
+  startup-race-prone discovery fetch.
 - **Advertised ids survive the picker filter** — Claude Code's `/model`
   gateway discovery drops any id that doesn't match `/(claude|anthropic)/i`, so
   the proxy advertises every model under a `claude-<provider>-<model>` id (e.g.

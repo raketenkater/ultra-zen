@@ -1050,6 +1050,21 @@ func main() {
 		die(err)
 	}
 
+	// Pre-write Claude Code's /model gateway-models cache so the picker shows the
+	// full catalog immediately, without depending on Claude Code's own (fragile,
+	// startup-race-prone) discovery fetch. The ids must be the claude-prefixed
+	// advertised ids so they survive the /(claude|anthropic)/i picker filter.
+	gatewayModels := make([]claude.GatewayCacheModel, 0, len(modelInfos))
+	for _, m := range modelInfos {
+		gatewayModels = append(gatewayModels, claude.GatewayCacheModel{
+			ID:          proxy.ClaudeModelID(m.Provider, m.ID),
+			DisplayName: m.Name,
+		})
+	}
+	if err := claude.WriteGatewayCache(srv.BaseURL(), gatewayModels); err != nil {
+		warn("could not pre-write /model gateway cache: %v", err)
+	}
+
 	// Re-poll denied models while the session runs so a model that comes back
 	// (daily free limit reset, access restored) shows up again without waiting
 	// out the full 24h TTL in unavailable-models.json. Stops with ctx on exit.
