@@ -265,6 +265,11 @@ func main() {
 		return
 	}
 
+	// Self-heal: make sure a `uz` symlink exists next to the running binary so
+	// the launcher is on PATH after any install path (go install, make install,
+	// curl-pipe) that only drops the binary. Best-effort; never blocks a launch.
+	ensureUZSymlink()
+
 	// Redirect the proxy's log output (log.Printf in internal/proxy) to a file
 	// instead of stderr. Claude Code's TUI owns stderr, so any log line written
 	// there leaks into the front-end as garbled text. Write to

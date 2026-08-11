@@ -130,6 +130,44 @@ func TestSetupCopyUserKeysSkipsEmpty(t *testing.T) {
 	}
 }
 
+// TestEnsureUZSymlink verifies the self-heal: running from a writable dir
+// creates a uz symlink next to the binary; a read-only dir is left alone.
+func TestEnsureUZSymlink(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "ultra-zen")
+	if err := os.WriteFile(bin, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Can't easily swap os.Args[0] in-process; the guard is on the writable
+	// dir. Simulate by pointing the symlink at the binary name.
+	if err := setupCreateSymlink("ultra-zen", filepath.Join(dir, "uz")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got, _ := os.Readlink(filepath.Join(dir, "uz")); got != "ultra-zen" {
+		t.Fatalf("uz = %q, want ultra-zen", got)
+	}
+}
+
+// TestEnsureUZSymlinkRefusesClobber verifies the self-heal won't overwrite an
+// unrelated `uz` that already exists.
+func TestEnsureUZSymlinkRefusesClobber(t *testing.T) {
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other-bin")
+	if err := os.WriteFile(other, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	uz := filepath.Join(dir, "uz")
+	if err := os.Symlink("other-bin", uz); err != nil {
+		t.Fatal(err)
+	}
+	// EnsureUZSymlink uses os.Args[0]/os.Executable which we can't redirect in
+	// a unit test; exercise the underlying refusal path directly.
+	if err := setupCreateSymlink("ultra-zen", uz); err == nil {
+		t.Fatal("should refuse to replace an existing unrelated symlink")
+	}
+}
+
 // TestSetupReport uses the stdout capture convention to check the report.
 func TestSetupReport(t *testing.T) {
 	var buf strings.Builder

@@ -97,6 +97,33 @@ func setupCreateSymlink(binPath, linkPath string) error {
 	return os.Symlink(binPath, linkPath)
 }
 
+// ensureUZSymlink is the self-healing install path: whenever the binary runs
+// from a directory it can write to (an install dir like ~/.local/bin, not a
+// read-only system dir), it makes sure a `uz` symlink exists next to itself.
+// This covers `go install`/`make install` and curl-pipe installs, which only
+// place the binary and would otherwise leave `uz` missing. Best-effort: any
+// failure is silently ignored — a launch must never block on this.
+func ensureUZSymlink() {
+	if filepath.Base(os.Args[0]) == "uz" {
+		return // already running as uz
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	dir := filepath.Dir(exe)
+	// Only self-heal in writable install dirs. /usr/local/bin and similar
+	// root-owned dirs are the `setup` command's job (with sudo).
+	if w, _ := isWritable(dir); !w {
+		return
+	}
+	// Don't clobber a `uz` that already points somewhere sensible.
+	if cur, err := os.Readlink(filepath.Join(dir, "uz")); err == nil && cur != filepath.Base(exe) {
+		return
+	}
+	_ = setupCreateSymlink(filepath.Base(exe), filepath.Join(dir, "uz"))
+}
+
 // setupInitSystemStore creates the system key store directory with 0711 so any
 // local user can traverse it but only root can write.
 func setupInitSystemStore() error {

@@ -10,6 +10,9 @@ build:
 
 install:
 	go install -ldflags="-X main.Version=$(VERSION)" ./cmd/$(BINARY)
+	@# Self-heal the uz symlink next to the installed binary (best-effort).
+	@BIN=$$(go env GOBIN); [ -n "$$BIN" ] || BIN=$$(go env GOPATH)/bin; \
+	  [ -x "$$BIN/$(BINARY)" ] && "$$BIN/$(BINARY)" --version >/dev/null 2>&1 || true
 
 # system installs to /usr/local/bin (via sudo) and sets up the shared key
 # store at /etc/ultra-zen/keys so any user on the machine can launch ultra-zen.

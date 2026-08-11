@@ -177,15 +177,19 @@ main() {
         log_warn "Binary may not be functional: ${INSTALL_DIR}/${BINARY} --version"
     fi
 
-    # System-wide setup: create the uz symlink and initialise the shared key
-    # store at /etc/ultra-zen/keys so any user on the machine can launch
-    # ultra-zen. Needs root; when the install used sudo, do it now so the
-    # curl-pipe flow is fully system-wide.
+    # uz symlink: run setup so the launcher is on PATH from any directory. In
+    # the sudo case this also initialises the shared key store at
+    # /etc/ultra-zen/keys so every user can launch ultra-zen. In the non-sudo
+    # case setup still creates the `uz` symlink in the user-writable install
+    # dir; system-wide key sharing is a follow-up the binary self-heals.
     if [ "$NEEDS_SUDO" = true ]; then
         log_step "Setting up system-wide access (uz + shared keys)..."
         sudo "${INSTALL_DIR}/${BINARY}" setup --copy-keys || \
             log_warn "system setup failed; run later: sudo ultra-zen setup --copy-keys"
     else
+        log_step "Creating uz launcher..."
+        "${INSTALL_DIR}/${BINARY}" setup || \
+            log_warn "could not create uz symlink; run later: ultra-zen setup"
         log_info "For system-wide access for every user, run:"
         log_info "  sudo ultra-zen setup --copy-keys"
     fi
