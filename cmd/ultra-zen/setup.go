@@ -124,6 +124,50 @@ func ensureUZSymlink() {
 	_ = setupCreateSymlink(filepath.Base(exe), filepath.Join(dir, "uz"))
 }
 
+// systemSetupDone reports whether the system-wide store exists. When it does,
+// any local user can already use ultra-zen, so no setup prompt is needed.
+func systemSetupDone() bool {
+	if st, err := os.Stat(keys.SystemDir()); err == nil && st.IsDir() {
+		return true
+	}
+	return false
+}
+
+// promptSystemSetup asks the user whether to set up system-wide access (uz +
+// shared keys for all users) and, on yes, re-execs this binary under sudo to
+// run `ultra-zen setup --copy-keys`. sudo prompts for the password itself.
+// Returns true if setup was run (successfully or not); false if the user
+// declined or the prompt is impossible (non-interactive stdin).
+func promptSystemSetup(exe string) bool {
+	if os.Geteuid() == 0 {
+		return false // already root; no sudo needed
+	}
+	// Only prompt on a real terminal. Without one (scripts, --list) we stay
+	// silent — a launch must never hang waiting for input that can't come.
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	if !systemSetupDone() {
+		fmt.Fprint(os.Stderr, "\nultra-zen: system-wide access isn't set up yet (uz + shared keys for all users).\n")
+		fmt.Fprint(os.Stderr, "Set it up now (requires sudo)? [y/N] ")
+		var ans string
+		if _, err := fmt.Fscanln(os.Stdin, &ans); err != nil {
+			return false
+		}
+		if strings.EqualFold(ans, "y") || strings.EqualFold(ans, "yes") {
+			fmt.Fprintf(os.Stderr, "\nRunning: sudo %s setup --copy-keys\n", exe)
+			cmd := exec.Command("sudo", exe, "setup", "--copy-keys")
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			_ = cmd.Run()
+			return true
+		}
+	}
+	return false
+}
+
 // setupInitSystemStore creates the system key store directory with 0711 so any
 // local user can traverse it but only root can write.
 func setupInitSystemStore() error {

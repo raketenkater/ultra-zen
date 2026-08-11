@@ -454,6 +454,19 @@ func main() {
 	// open a TUI prompt for a missing key rather than exiting.
 	interactive := modelID == "" && !*listOnly
 
+	// First-run system setup: if system-wide access (uz + shared keys for all
+	// users) isn't set up yet, ask the user once whether to run it now. Only
+	// fires on a real interactive launch, never on --list/subcommands/scripts.
+	if interactive {
+		if exe, err := os.Executable(); err == nil {
+			if promptSystemSetup(exe) {
+				// setup ran (possibly with a password prompt). Continue the
+				// launch regardless; the system store now exists for future runs.
+				fmt.Fprintln(os.Stderr, "\nultra-zen: system-wide setup complete — continuing launch.")
+			}
+		}
+	}
+
 	switch def, isFreeTier := models.FreeTierProviders[*provider]; {
 	case isFreeTier:
 		k := *apiKey
