@@ -257,6 +257,13 @@ func main() {
 		cmdKeys(os.Args[2:])
 		return
 	}
+	// `setup` installs the binary + `uz` symlink system-wide and initialises the
+	// shared key store at /etc/ultra-zen/keys so any user on the machine can
+	// launch ultra-zen. See setup.go.
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		cmdSetup(os.Args[2:])
+		return
+	}
 
 	// Redirect the proxy's log output (log.Printf in internal/proxy) to a file
 	// instead of stderr. Claude Code's TUI owns stderr, so any log line written

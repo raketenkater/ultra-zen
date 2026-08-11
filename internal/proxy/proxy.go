@@ -447,6 +447,10 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 	var lastResp *http.Response
 	var lastUsed Upstream
 	var lastRetryAfter time.Duration
+	// lastCallErr records the most recent transport failure so the final return
+	// can surface a real 502 instead of the "every route exhausted" 429 when every
+	// pool route was unreachable (no HTTP response at all).
+	var lastCallErr error
 
 	for round := 0; round <= retries; round++ {
 		routes := s.routeOrder(primary)
@@ -464,7 +468,17 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			oreq.Model = choice.Model
 			p, candidate, callErr := s.forwardTo(ctx, choice.Upstream, oreq)
 			if callErr != nil {
-				return nil, nil, Upstream{}, callErr
+				// A transport failure (dial timeout, connection refused, TLS error)
+				// is a temporary endpoint outage, not a permanent request error.
+				// Soft-skip to the next pool route instead of surfacing a 502
+				// straight to Claude Code; if every route is down the outer loop
+				// retries with backoff and the last error is returned.
+				s.limitRoute(choice.index, false)
+				lastPayload, lastBody, lastResp, lastUsed = p, nil, nil, choice.Upstream
+				lastCallErr = callErr
+				temporary = true
+				log.Printf("ultra-zen proxy: transport error on %s: %v; rotating", choice.Model, callErr)
+				continue
 			}
 			if candidate.StatusCode == http.StatusOK {
 				// Peek the body so a gateway error or empty completion served
@@ -515,6 +529,25 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 					continue
 				}
 			}
+			// A 5xx from the upstream (503 "Endpoint is unavailable", 500 Internal
+			// server error) is a temporary endpoint outage, not a permanent request
+			// error. Soft-skip to the next pool route (limitRoute(false) rotates the
+			// cursor but leaves the route eligible), mark the round temporary so the
+			// outer backoff loop retries the whole pool, and DON'T promoteRoute the
+			// broken route (promoting it would make every later request start there).
+			if candidate.StatusCode == http.StatusServiceUnavailable ||
+				candidate.StatusCode == http.StatusInternalServerError ||
+				candidate.StatusCode == http.StatusBadGateway ||
+				candidate.StatusCode == http.StatusGatewayTimeout {
+				body, _ := io.ReadAll(candidate.Body)
+				candidate.Body.Close()
+				candidate.Body = io.NopCloser(bytes.NewReader(body))
+				s.limitRoute(choice.index, false)
+				temporary = true
+				lastPayload, lastBody, lastResp, lastUsed = p, body, candidate, choice.Upstream
+				log.Printf("ultra-zen proxy: upstream %d (endpoint unavailable) on %s: %s; rotating", candidate.StatusCode, choice.Model, truncate(string(body), 200))
+				continue
+			}
 			if candidate.StatusCode != http.StatusTooManyRequests {
 				s.promoteRoute(choice.index)
 				return p, candidate, choice.Upstream, nil
@@ -562,6 +595,13 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 
 	if lastResp != nil {
 		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
+	}
+	// Every route was unreachable (no HTTP response at all) — surface the actual
+	// transport error so handleMessages reports a 502, not a bogus "429 all models
+	// exhausted". A transient 503/500 (which produced a real response) still
+	// returns the last upstream body through lastResp above.
+	if lastResp == nil && lastCallErr != nil {
+		return nil, nil, Upstream{}, lastCallErr
 	}
 	return lastPayload, lastResp, lastUsed, nil
 }

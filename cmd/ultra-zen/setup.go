@@ -1,0 +1,226 @@
+// Setup subcommand: install ultra-zen system-wide and initialise the shared
+// key store so any user on the machine can launch it. `ultra-zen setup`
+// resolves the running binary, copies it (plus a `uz` symlink) into a bin dir,
+// and creates /etc/ultra-zen/keys. `uz` is the on-PATH name; Claude Code stays
+// in the directory it was launched from (ultra-zen never chdirs — the exec'd
+// claude inherits the launch cwd).
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/raketenkater/ultra-zen/internal/keys"
+)
+
+// setupDefaults mirrors install.sh's find_bindir precedence so the Go path and
+// the curl-pipe path agree on where the binary lands.
+func setupFindBindir(override string) (string, bool) {
+	if override != "" {
+		return override, false
+	}
+	// Try /usr/local/bin first (may need sudo).
+	if d, err := os.Stat("/usr/local/bin"); err == nil && d.IsDir() {
+		if writable, _ := isWritable("/usr/local/bin"); writable {
+			return "/usr/local/bin", false
+		}
+		return "/usr/local/bin", true
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	return filepath.Join(home, ".local", "bin"), false
+}
+
+// isWritable reports whether dir is writable by the current user.
+func isWritable(dir string) (bool, error) {
+	f, err := os.CreateTemp(dir, ".ultra-zen-write-test-*")
+	if err != nil {
+		return false, err
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true, nil
+}
+
+// setupInstallBinary copies the running binary to dst and makes it executable.
+func setupInstallBinary(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	tmp := dst + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// setupCreateSymlink links linkPath to binPath (a relative or absolute link).
+// It refuses to overwrite an existing entry that is not already this symlink.
+func setupCreateSymlink(binPath, linkPath string) error {
+	if cur, err := os.Readlink(linkPath); err == nil && cur == binPath {
+		return nil // already the right link
+	}
+	if _, err := os.Lstat(linkPath); err == nil {
+		// Don't clobber an unrelated file or symlink.
+		return fmt.Errorf("refusing to replace existing %s (not our symlink)", linkPath)
+	}
+	return os.Symlink(binPath, linkPath)
+}
+
+// setupInitSystemStore creates the system key store directory with 0711 so any
+// local user can traverse it but only root can write.
+func setupInitSystemStore() error {
+	dir := keys.SystemDir()
+	if err := os.MkdirAll(dir, 0o711); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o711)
+}
+
+// setupCopyUserKeys copies every non-empty per-user key into the system store.
+// Providers that have no user key are skipped.
+func setupCopyUserKeys() (copied []string) {
+	for _, p := range knownKeyProviders {
+		k := keys.LoadFrom(p, keys.StoreUser)
+		if k == "" {
+			continue
+		}
+		if err := keys.SaveSystem(p, k); err != nil {
+			fmt.Fprintf(os.Stderr, "ultra-zen: could not copy %s key to system store: %v\n", p, err)
+			continue
+		}
+		copied = append(copied, p)
+	}
+	return copied
+}
+
+// cmdSetup is the `ultra-zen setup` entry point. Non-interactive; prints a
+// status report via the stdout var so tests can capture it.
+func cmdSetup(args []string) {
+	var bindirOverride string
+	var copyKeys bool
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--dir":
+			if i+1 < len(args) {
+				bindirOverride = args[i+1]
+				i++
+			}
+		case "--copy-keys":
+			copyKeys = true
+		case "-h", "--help", "help":
+			setupUsage()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "ultra-zen: unrecognized setup option %q\n", args[i])
+			setupUsage()
+			os.Exit(1)
+		}
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		die(fmt.Errorf("resolve running binary: %w", err))
+	}
+	exe, _ = filepath.Abs(exe)
+
+	binDir, needsSudo := setupFindBindir(bindirOverride)
+	if needsSudo && os.Geteuid() != 0 {
+		die(fmt.Errorf("/usr/local/bin is not writable; run setup with sudo:\n  sudo ultra-zen setup %s", flagWord(bindirOverride)))
+	}
+	if err := setupInstallBinary(exe, filepath.Join(binDir, "ultra-zen")); err != nil {
+		die(fmt.Errorf("install binary to %s: %w", binDir, err))
+	}
+	uzPath := filepath.Join(binDir, "uz")
+	if err := setupCreateSymlink("ultra-zen", uzPath); err != nil {
+		// Non-fatal: a conflicting `uz` exists; the binary is still installed.
+		fmt.Fprintf(os.Stderr, "ultra-zen: warning: %v\n", err)
+	}
+	if err := setupInitSystemStore(); err != nil {
+		// Non-fatal when not root: report the hint instead of failing.
+		if os.Geteuid() != 0 {
+			fmt.Fprintf(os.Stderr, "ultra-zen: could not create system key store %s: %v\n", keys.SystemDir(), err)
+			fmt.Fprintf(os.Stderr, "ultra-zen: run `sudo ultra-zen setup --copy-keys` to share keys across users\n")
+		} else {
+			die(fmt.Errorf("create system key store: %w", err))
+		}
+	} else if copyKeys {
+		copied := setupCopyUserKeys()
+		if len(copied) > 0 {
+			fmt.Fprintf(stdout, "copied %d key(s) to the system store: %s\n", len(copied), strings.Join(copied, ", "))
+		} else {
+			fmt.Fprintln(stdout, "no per-user keys to copy to the system store")
+		}
+	}
+
+	reportSetup(binDir, uzPath, needsSudo, copyKeys)
+}
+
+// flagWord renders the --dir override for error messages.
+func flagWord(override string) string {
+	if override == "" {
+		return ""
+	}
+	return "--dir " + override
+}
+
+// reportSetup prints where things landed and what the user should run next.
+func reportSetup(binDir, uzPath string, needsSudo, copyKeys bool) {
+	fmt.Fprintf(stdout, "\nultra-zen installed to %s/ultra-zen\n", binDir)
+	fmt.Fprintf(stdout, "uz -> %s/ultra-zen (symlink)\n", binDir)
+	if needsSudo {
+		fmt.Fprintf(stdout, "note: installed with sudo; %s is root-owned\n", binDir)
+	}
+	// Warn if the `uz` that would run on PATH isn't the one just created.
+	if !needsSudo {
+		if w, err := exec.LookPath("uz"); err == nil && w != uzPath {
+			fmt.Fprintf(os.Stderr, "ultra-zen: warning: `uz` on PATH (%s) differs from the installed %s\n", w, uzPath)
+		}
+	}
+	fmt.Fprintf(stdout, "system key store: %s (world-readable 0644; root-writable)\n", keys.SystemDir())
+	fmt.Fprintf(stdout, "\nNext steps:\n")
+	fmt.Fprintf(stdout, "  uz --list                          # models from any directory\n")
+	if !copyKeys {
+		fmt.Fprintf(stdout, "  sudo ultra-zen setup --copy-keys  # share your API keys with all users\n")
+	}
+	fmt.Fprintf(stdout, "  sudo ultra-zen keys --system set <provider> <key>   # set a shared key\n")
+}
+
+func setupUsage() {
+	fmt.Fprintln(os.Stderr, "Usage:")
+	fmt.Fprintln(os.Stderr, "  ultra-zen setup                   install binary + uz symlink to a bin dir")
+	fmt.Fprintln(os.Stderr, "  ultra-zen setup --copy-keys       also copy your API keys to /etc/ultra-zen/keys")
+	fmt.Fprintln(os.Stderr, "  ultra-zen setup --dir <dir>       install to a specific directory")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Run with sudo when installing to /usr/local/bin.")
+}

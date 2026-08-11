@@ -98,13 +98,30 @@ func envOr(key, def string) string {
 
 // GatewayCachePath returns the Claude Code gateway-models cache file that feeds
 // its /model command. The path is resolved exactly as the installed binary does:
-// Rms.join(Ln(), "cache", "gateway-models.json") where Ln() is the XDG cache dir
-// (CLAUDE_CODE_GATEWAY_CACHE_DIR override, else ~/.cache/claude). Verified
-// against the decompiled Claude Code 2.1.226 bootstrap.
+// Rms.join(Ln(), "cache", "gateway-models.json") where Ln() is the CONFIG dir —
+// CLAUDE_CONFIG_DIR if set, else ~/.claude — NOT the XDG cache dir. Verified by
+// decompiling the Claude Code 2.1.226 binary: Ln()=pn(()=>(bcc()??
+// gwe.join(vcc.homedir(),".claude")).normalize("NFC")), bcc()=CLAUDE_CONFIG_DIR,
+// _pu()=Rms.join(ypu(),"gateway-models.json"). The old code consulted
+// CLAUDE_CODE_GATEWAY_CACHE_DIR (which does not exist in the binary) and wrote to
+// ~/.cache/claude/cache, a file /model never reads — leaving the picker stale.
 func GatewayCachePath() string {
-	if p := os.Getenv("CLAUDE_CODE_GATEWAY_CACHE_DIR"); p != "" {
-		return filepath.Join(p, "cache", "gateway-models.json")
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if configDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		configDir = filepath.Join(home, ".claude")
 	}
+	return filepath.Join(configDir, "cache", "gateway-models.json")
+}
+
+// legacyGatewayCachePath is the XDG-style path older Claude Code builds may
+// still read (~/.cache/claude/cache/gateway-models.json). WriteGatewayCache also
+// writes here as a belt-and-suspenders fallback so a catalog pre-write reaches
+// every binary variant.
+func legacyGatewayCachePath() string {
 	cache := os.Getenv("XDG_CACHE_HOME")
 	if cache == "" {
 		home, err := os.UserHomeDir()
@@ -137,10 +154,6 @@ type GatewayCacheModel struct {
 // baseURL must be the proxy URL passed to claude as ANTHROPIC_BASE_URL, byte-for-
 // byte, or cnn() ignores the cache.
 func WriteGatewayCache(baseURL string, models []GatewayCacheModel) error {
-	path := GatewayCachePath()
-	if path == "" {
-		return fmt.Errorf("gateway cache path unavailable")
-	}
 	cache := map[string]any{
 		"baseUrl":   baseURL,
 		"fetchedAt": time.Now().UTC().Format(time.RFC3339),
@@ -150,11 +163,28 @@ func WriteGatewayCache(baseURL string, models []GatewayCacheModel) error {
 	if err != nil {
 		return fmt.Errorf("encode gateway cache: %w", err)
 	}
+	// Primary: the path Claude Code's /model reader (cnn) actually reads.
+	path := GatewayCachePath()
+	if path == "" {
+		return fmt.Errorf("gateway cache path unavailable")
+	}
+	if err := writeGatewayCacheFile(path, data); err != nil {
+		return err
+	}
+	// Belt-and-suspenders: also write the legacy XDG path so older binaries that
+	// may read it still see the catalog. A failure here is non-fatal.
+	if legacy := legacyGatewayCachePath(); legacy != "" && legacy != path {
+		_ = writeGatewayCacheFile(legacy, data)
+	}
+	return nil
+}
+
+// writeGatewayCacheFile atomically writes the cache: temp file then rename, so a
+// concurrent Claude Code read never sees a partially-written cache.
+func writeGatewayCacheFile(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("gateway cache dir: %w", err)
 	}
-	// Write the temp file then rename, so a concurrent Claude Code read never
-	// sees a partially-written cache.
 	tmp := path + ".ultra-zen-tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("gateway cache write: %w", err)
@@ -179,12 +209,17 @@ func WriteGatewayCache(baseURL string, models []GatewayCacheModel) error {
 // the command to run for the Workflow PreToolUse hook (typically the absolute
 // path to the ultra-zen binary plus "workflow-hook").
 //
-// The payload carries the ultracode flag. --settings replaces the project
-// .claude/settings.json for this session, so if ultracode is not emitted here a
-// project that opts in via its settings file would launch without it.
+// The payload carries the ultracode flag and the effort level. --settings
+// replaces the project .claude/settings.json for this session, so if ultracode
+// and effortLevel are not emitted here, a project that opts in via its settings
+// file (or sets an effortLevel there) would launch without either. The effort
+// default is "max" (ultracode's full thinking budget); a user's explicit
+// --effort flag on the CLI wins because Args() only injects --effort when the
+// user didn't pass one.
 func SettingsJSON(hookCmd string) string {
 	settings := map[string]any{
-		"ultracode": true,
+		"ultracode":    true,
+		"effortLevel":  defaultEffort,
 		"hooks": map[string]any{
 			"PreToolUse": []map[string]any{
 				{
@@ -199,6 +234,11 @@ func SettingsJSON(hookCmd string) string {
 	b, _ := json.Marshal(settings)
 	return string(b)
 }
+
+// defaultEffort is the session-wide effort level ultra-zen sets as the general
+// default (ultracode's full thinking budget). A user's explicit --effort flag
+// on the CLI wins over this injected setting.
+const defaultEffort = "max"
 
 // Args returns the claude arguments: the selected model, the inline --settings,
 // and any user-supplied passthrough args. The explicit --model makes ultra-zen

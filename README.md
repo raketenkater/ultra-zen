@@ -83,13 +83,42 @@ Every provider that needs a key is resolved in this order:
 2. **The stored key** — `~/.config/ultra-zen/keys/<provider>` (one file per
    provider, mode `0600`). Use the TUI's key manager (press `k` in the
    selector) or write the file directly.
-3. **Interactive prompt** — when running interactively with no key set, the
+3. **The system-wide stored key** — `/etc/ultra-zen/keys/<provider>` (mode
+   `0644`, set up by `ultra-zen setup`), so a shared credential covers users
+   with no personal key.
+4. **Interactive prompt** — when running interactively with no key set, the
    TUI asks you to paste one, then **saves it to the key store** so you only
    enter it once.
 
-Precedence is `flag/env` → `stored` → `prompt`, so an env var always wins over
-a stored key. Clearing a stored key (empty string) makes the prompt appear
-again.
+Precedence is `flag/env` → `stored (user)` → `stored (system)` → `prompt`, so
+an env var always wins over a stored key, and a per-user key always wins over a
+shared system key (any user can opt out of the shared credential for their own
+sessions). Clearing a stored key (empty string) makes the prompt appear again.
+
+### System-wide access (`uz`)
+
+`ultra-zen setup` installs the binary plus a `uz` symlink so the launcher is on
+`PATH` from any directory for any user on the machine, and initialises the
+shared key store at `/etc/ultra-zen/keys`:
+
+```bash
+sudo ultra-zen setup --copy-keys      # install to /usr/local/bin, share your keys
+uz --list                             # works from any directory, any user
+uz glm-5.1 -- --resume                # passthrough args, Claude Code stays in the cwd you launched from
+```
+
+- `uz` is a symlink to the same `ultra-zen` binary; nothing behaves differently
+  under either name. Claude Code is launched in the directory you ran it from
+  (ultra-zen never changes the working directory).
+- The system store is **world-readable (0644)** — any local user can read the
+  shared keys. This is the deliberate trade-off of "any user on the machine":
+  it is only appropriate for a trusted workstation. Prefer the per-user store
+  when you need a personal key that others can't read (a per-user key wins).
+- Writes to the system store need root: `sudo ultra-zen keys --system set
+  <provider> <key>`, `sudo ultra-zen keys --system clear <provider>`. The
+  `ULTRA_ZEN_SYSTEM_KEYS` env var redirects the store (mostly for testing).
+- `make system` and `install.sh` (when installing to `/usr/local/bin` via
+  sudo) perform the same setup.
 
 ## Usage
 
@@ -404,6 +433,11 @@ The launcher sets:
 ### Ultracode / Workflow support
 A `PreToolUse` hook rewrites Workflow `agent()` scripts to set `stallMs` to
 the maximum safe value, so background fan-out never aborts a quiet model.
+
+Ultracode is on by default, and every session starts at the highest thinking
+budget (`--effort max`): the injected `--settings` payload carries
+`"ultracode": true` and `"effortLevel": "max"`. Your own `--effort` flag always
+wins.
 
 ### Web research
 The Anthropic-only `WebSearch` tool cannot run against the local proxy, so

@@ -661,3 +661,136 @@ func TestClassifyUpstreamBodyWithKeepAliveInFullStream(t *testing.T) {
 		t.Fatalf("classifyUpstreamBody(keepalive stream) = %d, want bodyOK", got)
 	}
 }
+
+// Test503RotatesToFallback verifies that an upstream 503 "Endpoint is unavailable"
+// is treated as a temporary outage: the failed route is soft-skipped (NOT promoted)
+// and the next healthy pool route serves the request. Before the fix, a 503 was
+// returned straight to the client as a hard API error.
+func Test503RotatesToFallback(t *testing.T) {
+	var selCalls, fbCalls int
+	sel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		selCalls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":{"type":"server_error","message":"Endpoint is unavailable."}}`))
+	}))
+	defer sel.Close()
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fbCalls++
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"fallback-ok"}}]}`))
+	}))
+	defer fb.Close()
+
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  fb.URL,
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: sel.URL, APIKey: "k", Model: "glm-5.2"},
+			{Provider: "opencode-go", BaseURL: fb.URL, APIKey: "k", Model: "north-mini-code-free"},
+		},
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 after 503 rotation, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fallback-ok") {
+		t.Fatalf("expected fallback response, got %s", rec.Body.String())
+	}
+	if selCalls == 0 || fbCalls == 0 {
+		t.Fatalf("expected 503 route (sel=%d) to be tried then fallback (fb=%d) to serve", selCalls, fbCalls)
+	}
+}
+
+// TestAll503RetriesThenReturns verifies that when every pool route 503s, the
+// proxy retries the whole pool with backoff and then surfaces the last upstream
+// 503 to the client — a real 503, not a bogus 429.
+func TestAll503RetriesThenReturns(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":{"type":"server_error","message":"Endpoint is unavailable."}}`))
+	}))
+	defer up.Close()
+
+	cfg := Config{
+		Provider:          "opencode-go",
+		BaseURL:           up.URL,
+		APIKey:            "k",
+		Model:             "deepseek-v4-flash",
+		RateLimitRetries:  1,
+		RateLimitBackoff:  time.Millisecond,
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"deepseek-v4-flash","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 after retries, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Endpoint is unavailable") {
+		t.Fatalf("expected the upstream 503 body, got %s", rec.Body.String())
+	}
+}
+
+// TestTransportErrorRotatesToFallback verifies that a transport failure (no HTTP
+// response, e.g. connection refused) on one route soft-skips to the next healthy
+// pool route instead of surfacing a 502.
+func TestTransportErrorRotatesToFallback(t *testing.T) {
+	// A closed listener: connection refused.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"fallback-ok"}}]}`))
+	}))
+	defer fb.Close()
+
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  fb.URL,
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: deadURL, APIKey: "k", Model: "glm-5.2"},
+			{Provider: "opencode-go", BaseURL: fb.URL, APIKey: "k", Model: "north-mini-code-free"},
+		},
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 after transport-error rotation, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fallback-ok") {
+		t.Fatalf("expected fallback response, got %s", rec.Body.String())
+	}
+}
