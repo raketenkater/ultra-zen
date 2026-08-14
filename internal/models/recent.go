@@ -127,9 +127,9 @@ var RecommendedCombos = []Combo{
 	// Paid Go-tier — smart Go orchestrator + cheap Go worker
 	{Orchestrator: "glm-5.2", Worker: "deepseek-v4-flash"},
 	{Orchestrator: "kimi-k3", Worker: "deepseek-v4-flash"},
-	{Orchestrator: "glm-5.2", Worker: "mini-max-m2.5"},
+	{Orchestrator: "glm-5.2", Worker: "minimax-m2.5"},
 	{Orchestrator: "kimi-k2.7-code", Worker: "deepseek-v4-flash"},
-	{Orchestrator: "glm-5.2", Worker: "mini-max-m3"},
+	{Orchestrator: "glm-5.2", Worker: "minimax-m3"},
 	// Free — orchestrator + free worker
 	{Orchestrator: "deepseek-v4-flash-free", Worker: "deepseek-v4-flash-free"},
 	{Orchestrator: "qwen/qwen3-coder:free", Worker: "deepseek-v4-flash-free"},

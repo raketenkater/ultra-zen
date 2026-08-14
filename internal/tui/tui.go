@@ -255,10 +255,11 @@ type model struct {
 	keys      *keyManager      // non-nil while the key manager screen is open
 	fallbacks *fallbackManager // non-nil while the fallback pool screen is open
 	catalog   *fallbackManager // background free-provider discovery
-	freePool  []FreeRoute      // configured rotation pool (nil = auto-discover)
-	prevStep  step             // step to restore when a sub-screen closes
-	resume    *ResumeOption
-	poolErr   string
+	freePool   []FreeRoute      // configured rotation pool (nil = auto-discover)
+	poolTouched bool            // true once the user engages the pool (free cycle / f editor)
+	prevStep   step             // step to restore when a sub-screen closes
+	resume     *ResumeOption
+	poolErr    string
 }
 
 func (m model) Init() tea.Cmd {
@@ -451,6 +452,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fallbacks = fm.(*fallbackManager)
 		if m.fallbacks.done {
 			m.freePool = m.fallbacks.routes()
+			m.poolTouched = true // the user edited the pool in the f screen
 			m.quit = m.quit || m.fallbacks.quit
 			if !m.fallbacks.quit {
 				if err := SaveFreePool(m.freePool); err != nil {
@@ -502,6 +504,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case stepCombo:
 				if item, ok := m.list.SelectedItem().(cycleItem); ok {
 					if item.selected > 0 && len(m.freePool) > 0 {
+						// Launching the Free cycle is an explicit engagement of the
+						// saved pool — carry it.
+						m.poolTouched = true
 						m.choice = m.freePool[0].Model
 						m.choiceVia = m.freePool[0].Provider
 						m.worker = ""
@@ -510,12 +515,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.openFallbacks()
 				}
 				if item, ok := m.list.SelectedItem().(modelItem); ok {
+					// A concrete model pick must NOT carry the saved free pool —
+					// it would silently attach -free fallbacks that get promoted
+					// on the first hiccup, running a paid pick on free.
+					m.freePool = nil
 					m.choice = item.m.ID
 					m.choiceVia = m.provider
 					m.worker = ""
 					return m.enterWorkerStep()
 				}
 				if item, ok := m.list.SelectedItem().(providerModelItem); ok {
+					m.freePool = nil
 					m.choice = item.model.ID
 					m.choiceVia = item.provider
 					m.worker = ""
@@ -533,9 +543,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if item, ok := m.list.SelectedItem().(comboItem); ok {
 					if item.manual {
+						// A manual pick walks the orchestrator/worker steps — no
+						// saved pool fallbacks.
+						m.freePool = nil
 						m.enterOrchestratorStep()
 						return m, nil
 					}
+					// A concrete combo pick also drops the saved pool: the combo
+					// defines its own orchestrator + worker with no free fallbacks.
+					m.freePool = nil
 					m.choice = item.combo.Orchestrator
 					m.choiceVia = m.provider
 					m.worker = item.combo.Worker
@@ -728,11 +744,18 @@ func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
 	if !ok {
 		return Result{}
 	}
+	// The saved pool is only meaningful when the user actually engaged it (Free
+	// cycle launch or the f pool editor). A concrete model/combo pick clears the
+	// pool, so an explicit paid selection never silently gains -free fallbacks.
+	pool := mm.freePool
+	if !mm.poolTouched {
+		pool = nil
+	}
 	if mm.resumeID != "" {
-		return Result{ResumeSessionID: mm.resumeID, FreePool: mm.freePool}
+		return Result{ResumeSessionID: mm.resumeID, FreePool: pool}
 	}
 	if mm.quit || mm.choice == "" {
-		return Result{Quit: mm.quit, FreePool: mm.freePool}
+		return Result{Quit: mm.quit, FreePool: pool}
 	}
-	return Result{Choice: mm.choice, Provider: mm.choiceVia, Worker: mm.worker, FreePool: mm.freePool}
+	return Result{Choice: mm.choice, Provider: mm.choiceVia, Worker: mm.worker, FreePool: pool}
 }

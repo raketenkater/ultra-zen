@@ -189,6 +189,68 @@ func TestFallbackManagerReopensWithExistingPool(t *testing.T) {
 	}
 }
 
+// TestPickingModelDoesNotCarrySavedPool is the regression test for the bug
+// where a direct model pick in the launcher silently attached the saved
+// free-pool.json routes as fallbacks (and wiped the worker), so a paid pick
+// could run a -free variant for the whole session. A concrete model/combo pick
+// must return a nil FreePool; only engaging the Free cycle or the f editor
+// carries it.
+func TestPickingModelDoesNotCarrySavedPool(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := newCatalogTestModel()
+	// Simulate a saved free pool on disk.
+	m.freePool = []FreeRoute{
+		{Provider: "opencode-go", Model: "zen-free"},
+		{Provider: "openrouter", Model: "vendor/router-model:free"},
+	}
+	// Find a modelItem row (a concrete model pick) in the list and select it.
+	idx := -1
+	for i, item := range m.list.Items() {
+		if _, ok := item.(modelItem); ok {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("no modelItem in the start list")
+	}
+	m.list.Select(idx)
+	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = cmd
+	// A modelItem pick enters the worker step (not quit) — but freePool must
+	// already be cleared so a subsequent quit never carries it.
+	picked := mm.(model)
+	if picked.freePool != nil {
+		t.Fatalf("model pick kept the saved pool: %v", picked.freePool)
+	}
+}
+
+// TestCycleLaunchCarriesSavedPool verifies that launching the Free cycle (the
+// cycleItem row) DOES carry the saved pool — that's the intended engagement.
+func TestCycleLaunchCarriesSavedPool(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := newCatalogTestModel()
+	// Set the pool BEFORE the start items are built so the cycleItem carries
+	// selected>0 (the launch condition). Rebuild the list.
+	m.freePool = []FreeRoute{{Provider: "openrouter", Model: "vendor/router-model:free"}}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+	// The cycleItem is the first item.
+	m.list.Select(0)
+	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_ = cmd
+	picked := mm.(model)
+	if !picked.poolTouched {
+		t.Fatalf("Free cycle launch did not mark the pool as touched")
+	}
+	if len(picked.freePool) != 1 {
+		t.Fatalf("Free cycle should carry the pool, got %v", picked.freePool)
+	}
+}
+
 func newCatalogTestModel() model {
 	ms := []models.Model{
 		{ID: "zen-paid", Name: "zen-paid", Base: models.GoBase},
