@@ -1018,7 +1018,9 @@ func main() {
 	}
 	for _, route := range fallbackRoutes {
 		if models.Find(list, route.Model) == nil {
-			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: route.Model, Provider: route.Provider})
+			// Fallback routes not in the primary catalog show a friendly name
+			// instead of the raw upstream id, so /model identifies them.
+			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: models.FriendlyName(route.Model), Provider: route.Provider})
 		}
 	}
 
@@ -1083,7 +1085,7 @@ func main() {
 	for _, m := range modelInfos {
 		gatewayModels = append(gatewayModels, claude.GatewayCacheModel{
 			ID:          proxy.ClaudeModelID(m.Provider, m.ID),
-			DisplayName: m.Name,
+			DisplayName: proxy.ModelDisplayName(m.Name, m.Provider),
 		})
 	}
 	if err := claude.WriteGatewayCache(srv.BaseURL(), gatewayModels); err != nil {

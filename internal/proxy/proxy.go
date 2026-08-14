@@ -173,11 +173,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// shape: each entry has type/id/display_name/created_at, and the list has
 	// has_more/first_id/last_id. The OpenAI-style object/owned_by fields are
 	// included too so OpenAI-compatible probes still work.
-	entry := func(id, name string) map[string]any {
+	entry := func(id, name string, disabled bool) map[string]any {
 		if name == "" {
 			name = id
 		}
-		return map[string]any{
+		e := map[string]any{
 			"type":         "model",
 			"id":           id,
 			"display_name": name,
@@ -185,12 +185,17 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			"object":       "model",
 			"owned_by":     "ultra-zen",
 		}
+		if disabled {
+			e["disabled"] = true
+		}
+		return e
 	}
 	var models []map[string]any
 	// Group headers: Claude Code's /model picker has no non-selectable separator
 	// (verified against the installed CLI — only "disabled":true and a
-	// /(claude|anthropic)/i id filter apply). A header is therefore a real,
-	// selectable, routing-neutral id whose display name names the group. The
+	// /(claude|anthropic)/i id filter apply). A header is therefore a real id
+	// whose display name names the group, marked disabled so picking it is
+	// impossible (it routes nowhere — buildModelRoute never registers it). The
 	// "claude" in the id lets it survive the picker's gateway filter.
 	headerID := func(provider string) string {
 		if provider == "" {
@@ -202,20 +207,21 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	for _, m := range s.cfg.Models {
 		if m.Provider != "" && !seenProvider[m.Provider] {
 			seenProvider[m.Provider] = true
-			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider)))
+			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider), true))
 		}
 		// Advertise the claude-prefixed id so the /model gateway filter
-		// (/(claude|anthropic)/i) keeps it; the display name stays the human
-		// model name. The proxy routes the advertised id back to the real
-		// upstream model via modelRoute.
+		// (/(claude|anthropic)/i) keeps it; the display name is the friendly
+		// model name plus the provider label so the picker identifies both. The
+		// proxy routes the advertised id back to the real upstream model via
+		// modelRoute.
 		advertisedID := m.ID
 		if m.Provider != "" {
 			advertisedID = ClaudeModelID(m.Provider, m.ID)
 		}
-		models = append(models, entry(advertisedID, m.Name))
+		models = append(models, entry(advertisedID, ModelDisplayName(m.Name, m.Provider), false))
 	}
 	if len(models) == 0 {
-		models = append(models, entry(s.cfg.Model, ""))
+		models = append(models, entry(s.cfg.Model, "", false))
 	}
 	out := map[string]any{
 		"object":   "list",
@@ -258,6 +264,16 @@ func groupTitle(provider string) string {
 	default:
 		return provider
 	}
+}
+
+// ModelDisplayName renders the /v1/models display_name for a model: the
+// friendly name plus the provider label, so the picker identifies both the
+// model and where it comes from. e.g. "GLM 5.2 — ModelScope".
+func ModelDisplayName(name, provider string) string {
+	if provider == "" || name == "" {
+		return name
+	}
+	return name + " — " + groupTitle(provider)
 }
 
 // buildModelRoute maps model ids to the upstream that serves them so the
@@ -324,6 +340,15 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	} else if areq.Model != "" {
 		if u, ok := s.modelRoute[areq.Model]; ok {
 			primary = u
+		} else if strings.HasPrefix(areq.Model, "claude-group-") {
+			// A disabled group header (claude-group-*) is advertised at /v1/models
+			// purely as a section label and routes nowhere. If a client still sends
+			// one, fail loudly instead of silently serving the primary — a user who
+			// picked a section should never silently get a model. Any other
+			// unrecognized model id keeps the primary fallback (harmless for
+			// arbitrary/other-client requests).
+			writeError(w, 400, "invalid_request_error", fmt.Sprintf("model group %q is a section header, not a selectable model; run /model to pick one", areq.Model))
+			return
 		}
 	}
 	oreq, err := areq.toOpenAI(primary.Model)

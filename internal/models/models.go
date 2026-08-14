@@ -204,12 +204,171 @@ func fetchIDs(c *http.Client, base, key string) ([]string, error) {
 	return ids, nil
 }
 
-// pretty turns a model id into a display name. We keep it close to the id but
-// tidy a couple of common suffixes.
+// pretty turns a model id into a display name. It strips the -free suffix;
+// most catalog names are derived through FriendlyName instead.
 func pretty(id string) string {
-	name := id
+	return FriendlyName(id)
+}
+
+// friendlyTokens maps vendor/model tokens to their canonical, human-readable
+// casing. Everything not listed is title-cased.
+var friendlyTokens = map[string]string{
+	"gpt":          "GPT",
+	"glm":          "GLM",
+	"qwen":         "Qwen",
+	"qwen3":        "Qwen3",
+	"qwen3.5":      "Qwen3.5",
+	"minimax":      "MiniMax",
+	"moonshot":     "Moonshot",
+	"deepseek":     "DeepSeek",
+	"kimi":         "Kimi",
+	"grok":         "Grok",
+	"cohere":       "Cohere",
+	"gemma":        "Gemma",
+	"nemotron":     "Nemotron",
+	"laguna":       "Laguna",
+	"mimo":         "Mimo",
+	"north":        "North",
+	"ernie":        "ERNIE",
+	"paddlepaddle": "PaddlePaddle",
+	"internvl":     "InternVL",
+	"openrouter":   "OpenRouter",
+	"free":         "Free",
+	"code":         "Code",
+	"reasoning":    "Reasoning",
+	"omni":         "Omni",
+	"flash":        "Flash",
+	"pro":          "Pro",
+	"mini":         "Mini",
+	"nano":         "Nano",
+	"lightning":    "Lightning",
+	"super":        "Super",
+	"ultra":        "Ultra",
+	"it":           "IT",
+	"oss":          "OSS",
+	"xs":           "XS",
+	"luna":         "Luna",
+	"sol":          "Sol",
+	"terra":        "Terra",
+	"preview":      "Preview",
+	"thinking":     "Thinking",
+	"instruct":     "Instruct",
+	"tool":         "Tool",
+	"coder":        "Coder",
+}
+
+// FriendlyName turns a gateway model id into a human-readable display name so
+// the /model picker and TUI identify models at a glance. It is a pure function
+// of the id — the gateways mostly don't supply friendly names (only codex-sub
+// does, and that path uses the real DisplayName instead). Rules:
+//
+//   - strip the ":free" / "-free" suffix;
+//   - drop an owner/org prefix (ModelScope/HF style "zai-org/GLM-5.2");
+//   - split on '/', ':', '-', '_' and title-case, keeping known vendor tokens
+//     in their canonical casing (GLM, Qwen, MiniMax, ...) and size tokens
+//     uppercase (26B, A22B);
+//   - "openrouter/free" -> "OpenRouter Free".
+//
+// Examples:
+//
+//	deepseek-v4-flash          -> DeepSeek V4 Flash
+//	kimi-k2.6                  -> Kimi K2.6
+//	poolside/laguna-s-2.1:free -> Laguna S 2.1
+//	zai-org/GLM-5.2            -> GLM 5.2
+//	Qwen/Qwen3-235B-A22B       -> Qwen3 235B A22B
+func FriendlyName(id string) string {
+	name := strings.TrimSuffix(id, ":free")
 	name = strings.TrimSuffix(name, "-free")
-	return name
+	// openrouter/free is a router pseudo-model.
+	if name == "openrouter/free" {
+		return "OpenRouter Free"
+	}
+	// Drop an owner/org prefix (ModelScope/HF style "org/Model").
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	// Split into tokens on separators. Digits and dots stay attached to the
+	// token they're in (K2.6, v4, 5.2), and a letter right after digits also
+	// stays attached (26B, A22B), so sizes keep their unit.
+	var tokens []string
+	cur := strings.Builder{}
+	flush := func() {
+		if cur.Len() > 0 {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+		}
+	}
+	for _, r := range name {
+		switch {
+		case r == '-' || r == '_' || r == '/':
+			flush()
+		case r == ' ':
+			flush()
+		default:
+			// Every non-separator rune joins the current token, so digits and
+			// dots stay attached to their word (K2.6, v4, 5.2, 26b, A22B) and a
+			// token is only ever split on '-'/'_'/'/'/space.
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+
+	out := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		if tok == "" {
+			continue
+		}
+		// Canonical casing for known tokens, else title-case.
+		if canon, ok := friendlyTokens[strings.ToLower(tok)]; ok {
+			out = append(out, canon)
+			continue
+		}
+		// Size tokens (26B, A22B, 235B, 12b -> 12B) uppercase.
+		if isSizeToken(tok) {
+			out = append(out, strings.ToUpper(tok))
+			continue
+		}
+		out = append(out, titleWord(tok))
+	}
+	if len(out) == 0 {
+		return id
+	}
+	return strings.Join(out, " ")
+}
+
+// isSizeToken reports whether a token is a model size/variant like 26B, A22B,
+// 235B, 1b, a4b — keep these uppercase so tiers stay distinguishable.
+func isSizeToken(tok string) bool {
+	lower := strings.ToLower(tok)
+	if len(lower) < 2 || lower[len(lower)-1] != 'b' {
+		return false
+	}
+	// The token ends in "b"; the prefix must contain at least one digit and
+	// otherwise be letters/digits (26b, a4b, 235b, A22b). "flash" -> false.
+	hasDigit := false
+	for _, r := range lower[:len(lower)-1] {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+		} else if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return hasDigit
+}
+
+// titleWord title-cases a single word: "deepseek" -> "Deepseek", "GLM" stays
+// "GLM" only via the token table; here plain alpha words get their first letter
+// capitalised.
+func titleWord(word string) string {
+	if word == "" {
+		return word
+	}
+	// Preserve words that are already all-caps (A22B handled by isSizeToken).
+	lower := strings.ToLower(word)
+	if word == lower {
+		return strings.ToUpper(word[:1]) + word[1:]
+	}
+	return word
 }
 
 // ListOpenRouter fetches all free models available via OpenRouter. The

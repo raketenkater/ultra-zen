@@ -412,25 +412,35 @@ func TestHandleModelsAdvertisesClaudePrefixedIDs(t *testing.T) {
 	}
 	var payload struct {
 		Data []struct {
-			ID   string `json:"id"`
-			Name string `json:"display_name"`
+			ID         string `json:"id"`
+			Name       string `json:"display_name"`
+			Disabled   bool   `json:"disabled"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	// Every model id must contain "claude" (survive the /model filter), and the
-	// codex + opencode group headers must appear.
+	// codex + opencode group headers must appear as disabled (non-selectable).
 	ids := map[string]bool{}
 	var hasHeader bool
 	for _, m := range payload.Data {
 		ids[m.ID] = true
 		if m.ID == "claude-group-opencode-go" || m.ID == "claude-group-codex" {
 			hasHeader = true
+			if !m.Disabled {
+				t.Fatalf("group header %q must be disabled (non-selectable)", m.ID)
+			}
 		}
 	}
 	if !hasHeader {
 		t.Fatalf("missing group headers; ids=%v", ids)
+	}
+	// Real model rows must NOT be disabled.
+	for _, m := range payload.Data {
+		if m.Disabled && (m.ID == "claude-opencode-go-deepseek-v4-flash" || m.ID == "claude-codex-gpt-5.6-sol") {
+			t.Fatalf("model row %q must not be disabled", m.ID)
+		}
 	}
 	for _, want := range []string{
 		"claude-opencode-go-deepseek-v4-flash",
@@ -440,6 +450,70 @@ func TestHandleModelsAdvertisesClaudePrefixedIDs(t *testing.T) {
 		if !ids[want] {
 			t.Fatalf("missing advertised id %q; ids=%v", want, ids)
 		}
+	}
+	// Display names identify both the model and its provider.
+	nameByID := map[string]string{}
+	for _, m := range payload.Data {
+		nameByID[m.ID] = m.Name
+	}
+	if got := nameByID["claude-codex-gpt-5.6-sol"]; got != "GPT-5.6-Sol — Codex (ChatGPT sub)" {
+		t.Fatalf("codex display name = %q, want provider-labelled", got)
+	}
+}
+
+// TestMessagesGroupHeaderFails verifies a request whose model is a disabled
+// group header (claude-group-*) is rejected loudly instead of silently routing
+// to the primary.
+func TestMessagesGroupHeaderFails(t *testing.T) {
+	srv := New(Config{
+		Provider: "opencode-go",
+		BaseURL:  "https://zen.example/v1",
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"claude-group-openrouter","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleMessages(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (group header is not selectable)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "section header") {
+		t.Fatalf("error should mention section header: %s", rec.Body.String())
+	}
+}
+
+// TestMessagesUnknownModelKeepsPrimary verifies an arbitrary unrecognized model
+// id (not a group header) still falls back to the primary, matching the
+// pre-existing behavior for other clients.
+func TestMessagesUnknownModelKeepsPrimary(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer backend.Close()
+
+	srv := New(Config{
+		Provider: "opencode-go",
+		BaseURL:  backend.URL,
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"some-other-client-model","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.handleMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (unknown id falls back to primary)", rec.Code)
 	}
 }
 

@@ -28,7 +28,12 @@ type modelItem struct {
 }
 
 func (i modelItem) Title() string {
-	t := i.m.ID
+	// Prefer the friendly Name when set; fall back to the id so the row is
+	// never blank.
+	t := i.m.Name
+	if t == "" || t == i.m.ID {
+		t = i.m.ID
+	}
 	if i.m.Free {
 		t += "  (free)"
 	}
@@ -124,7 +129,10 @@ type providerModelItem struct {
 }
 
 func (i providerModelItem) Title() string {
-	title := i.model.ID
+	title := i.model.Name
+	if title == "" || title == i.model.ID {
+		title = i.model.ID
+	}
 	if i.model.Free {
 		title += "  (free)"
 	}

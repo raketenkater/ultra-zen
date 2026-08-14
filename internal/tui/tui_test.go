@@ -9,6 +9,30 @@ import (
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
+// TestModelItemTitleUsesFriendlyName verifies the picker row renders the
+// friendly Name (falling back to the id), so users identify models at a glance.
+func TestModelItemTitleUsesFriendlyName(t *testing.T) {
+	// Friendly name differs from the id -> show the name.
+	item := modelItem{m: models.Model{ID: "zai-org/GLM-5.2", Name: "GLM 5.2", Free: true}}
+	if got := item.Title(); got != "GLM 5.2  (free)" {
+		t.Fatalf("Title = %q, want friendly name", got)
+	}
+	// No friendly name (Name == ID) -> fall back to the id.
+	plain := modelItem{m: models.Model{ID: "glm-5.1", Name: "glm-5.1"}}
+	if got := plain.Title(); got != "glm-5.1" {
+		t.Fatalf("Title = %q, want id fallback", got)
+	}
+}
+
+// TestProviderModelItemTitleUsesFriendlyName mirrors the above for the
+// provider-discovered rows.
+func TestProviderModelItemTitleUsesFriendlyName(t *testing.T) {
+	item := providerModelItem{provider: "modelscope", model: models.Model{ID: "Qwen/Qwen3-235B-A22B", Name: "Qwen3 235B A22B"}}
+	if got := item.Title(); got != "Qwen3 235B A22B" {
+		t.Fatalf("Title = %q, want friendly name", got)
+	}
+}
+
 // newTestModel returns a model in the combo step with a couple of fake models.
 func newTestModel() model {
 	ms := []models.Model{
