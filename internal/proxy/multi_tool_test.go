@@ -122,3 +122,64 @@ func TestStreamToolWithoutIDGetsSyntheticID(t *testing.T) {
 		t.Fatalf("tool_use block emitted with an empty id: %+v", cb)
 	}
 }
+
+// collectText extracts the concatenated text from a translated Anthropic SSE
+// stream (content_block_delta text_delta events), so a test can assert what
+// Claude Code would actually receive.
+func collectText(out string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			continue
+		}
+		if ev["type"] != "content_block_delta" {
+			continue
+		}
+		delta, _ := ev["delta"].(map[string]any)
+		if t, ok := delta["text"].(string); ok {
+			b.WriteString(t)
+		}
+	}
+	return b.String()
+}
+
+// Reasoning-only stream: the model (e.g. glm-5.2, deepseek) answers entirely in
+// reasoning_content with content empty. Claude Code must still receive it as
+// text, not an empty assistant turn. This is the free-model fix: these models
+// are exactly what the free cycle launches.
+func TestStreamReasoningContentSurfacedWhenContentEmpty(t *testing.T) {
+	sse := "data: " + `{"id":"c1","choices":[{"delta":{"role":"assistant","reasoning_content":"Let me think"}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","choices":[{"delta":{"reasoning_content":" carefully about this."}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := streamTranslate(rec, strings.NewReader(sse), "m"); err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	if got := collectText(out); got != "Let me think carefully about this." {
+		t.Fatalf("text = %q, want the reasoning_content surfaced", got)
+	}
+}
+
+// Reasoning + real content: the reasoning is chain-of-thought and must NOT be
+// surfaced; only the actual answer arrives as text.
+func TestStreamReasoningNotSurfacedWhenContentPresent(t *testing.T) {
+	sse := "data: " + `{"id":"c1","choices":[{"delta":{"role":"assistant","reasoning_content":"thinking..."}}]}` + "\n\n" +
+		"data: " + `{"id":"c1","choices":[{"delta":{"content":"The answer is 42."}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := streamTranslate(rec, strings.NewReader(sse), "m"); err != nil {
+		t.Fatal(err)
+	}
+	out := rec.Body.String()
+	if got := collectText(out); got != "The answer is 42." {
+		t.Fatalf("text = %q, want only the real content (reasoning suppressed)", got)
+	}
+	if strings.Contains(out, "thinking...") {
+		t.Fatalf("reasoning_content leaked into the stream")
+	}
+}

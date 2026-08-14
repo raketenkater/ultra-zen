@@ -15,9 +15,10 @@ type streamChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role      string       `json:"role"`
-			Content   string       `json:"content"`
-			ToolCalls []streamTool `json:"tool_calls"`
+			Role             string       `json:"role"`
+			Content          string       `json:"content"`
+			ReasoningContent string       `json:"reasoning_content"`
+			ToolCalls        []streamTool `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -61,6 +62,13 @@ type streamState struct {
 	toolOrder []string
 	finish      string
 	output      int
+	// reasoning buffers reasoning_content deltas. Reasoning models (glm-5.2,
+	// deepseek, kimi) may emit their whole answer in reasoning_content with
+	// content staying empty. We hold it and only surface it at stream end if no
+	// real content arrived — mirroring the non-stream path, where content wins
+	// and reasoning is the fallback so Claude Code is never handed an empty turn.
+	reasoning strings.Builder
+	emittedText bool
 }
 
 // streamTranslate reads OpenAI SSE from upstream and writes Anthropic SSE to
@@ -100,7 +108,12 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		choice := chunk.Choices[0]
 		st.ensureStarted(&chunk)
 		if choice.Delta.Content != "" {
+			st.emittedText = true
 			st.emitText(choice.Delta.Content)
+		} else if choice.Delta.ReasoningContent != "" {
+			// Reasoning content isn't the real answer when content eventually
+			// arrives; buffer it as the fallback for a reasoning-only stream.
+			st.reasoning.WriteString(choice.Delta.ReasoningContent)
 		}
 		for _, tc := range choice.Delta.ToolCalls {
 			st.emitToolDelta(tc)
@@ -222,6 +235,12 @@ func (s *streamState) finishStream() {
 		// Upstream produced nothing usable; emit a minimal valid stream.
 		s.ensureStarted(&streamChunk{})
 		s.emitText("")
+	}
+	// Reasoning-only stream: no real content and no tool calls arrived, but the
+	// model answered in reasoning_content. Surface it as text so Claude Code
+	// isn't handed an empty assistant turn.
+	if !s.emittedText && len(s.toolStarted) == 0 && s.reasoning.Len() > 0 {
+		s.emitText(s.reasoning.String())
 	}
 	if s.textOpen {
 		s.writeEvent("content_block_stop", map[string]any{"type": "content_block_stop", "index": s.blockIndex})
