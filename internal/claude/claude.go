@@ -81,10 +81,13 @@ func Env(proxyURL, model string, contextLength int) []string {
 		// knows exactly when to compact. Without this Claude Code defaults to a
 		// 200k assumption, so the conversation overflows the gateway's real limit
 		// and fails with "context_length" before compation ever triggers. The
-		// percentage override compacts earlier than the default ~92% to leave
-		// headroom for tool-call overhead that the tokeniser doesn't count.
+		// percentage override compacts close to the limit to maximise usable
+		// context, while leaving a little headroom for tool-call overhead that
+		// the tokeniser doesn't count. 85 is a middle ground between the default
+		// ~92% and the old 70% — enough headroom to avoid overflow but far more
+		// usable context than compacting at 70%.
 		fmt.Sprintf("CLAUDE_MAX_SESSION_TOKENS=%d", maxTokens),
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70"),
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "85"),
 	)
 }
 
