@@ -119,7 +119,7 @@ func TestEnvGatewayDiscovery(t *testing.T) {
 // TestEnvAutocompactWindow verifies Claude Code is told the real context window
 // via the env var it actually reads (CLAUDE_CODE_AUTO_COMPACT_WINDOW — verified
 // in the 2.1.233 binary; CLAUDE_MAX_SESSION_TOKENS is ignored by that build),
-// with the PCT override applied as a default.
+// with the PCT override applied as a constant default.
 func TestEnvAutocompactWindow(t *testing.T) {
 	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
 	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
@@ -135,16 +135,23 @@ func TestEnvAutocompactWindow(t *testing.T) {
 	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "85" {
 		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 85 (default)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
 	}
-	// A user's PCT override still wins.
-	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "90")
-	env = Env("http://127.0.0.1:1", "deepseek-v4-flash", 1_000_000)
-	got = map[string]string{}
+}
+
+// TestEnvAutocompactWindowIgnoresInheritedPCT verifies a stray inherited
+// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (exported by the host Claude process) does
+// NOT override ultra-zen's constant default — this was the bug that kept the
+// threshold at 70 despite the 85 default.
+func TestEnvAutocompactWindowIgnoresInheritedPCT(t *testing.T) {
+	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70")
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", 1_000_000)
+	got := map[string]string{}
 	for _, kv := range env {
 		k, v, _ := strings.Cut(kv, "=")
 		got[k] = v
 	}
-	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "90" {
-		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 90 (user env wins)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "85" {
+		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 85 (inherited 70 must be ignored)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
 	}
 }
 

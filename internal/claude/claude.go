@@ -90,20 +90,29 @@ func Env(proxyURL, model string, contextLength int) []string {
 		// MAX_SESSION_TOKENS for older builds that still read it. The percentage
 		// override compacts close to the limit to maximise usable context while
 		// leaving a little headroom for tool-call overhead that the tokeniser
-		// doesn't count — 85 is the default (user env var wins).
+		// doesn't count.
+		//
+		// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is intentionally NOT inherited from the
+		// environment: the Claude Code process itself exports a stray 70 into its
+		// child env (verified in this session), which would silently override the
+		// 85 default below. The inherited value is stripped in the loop above, so
+		// ultra-zen always applies its own default. Users who want a different
+		// threshold can set ultra-zen's own config (e.g. CLAUDE_AUTOCOMPACT_PCT
+		// through the settings file) rather than a raw env var Claude Code also
+		// manages.
 		fmt.Sprintf("CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d", maxTokens),
 		fmt.Sprintf("CLAUDE_MAX_SESSION_TOKENS=%d", maxTokens),
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "85"),
+		fmt.Sprintf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=%d", defaultAutocompactPCT),
 	)
 }
 
-// envOr returns the current environment value for key, or def if unset/empty.
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
+// defaultAutocompactPCT is the fraction of the context window at which Claude
+// Code compacts. 85 is a middle ground between Claude Code's default ~92% and
+// the old 70% — enough headroom to avoid overflow but far more usable context
+// than compacting at 70%. It is a constant (not inherited from the env) so a
+// stray CLAUDE_AUTOCOMPACT_PCT_OVERRIDE exported by the host Claude process
+// cannot silently override it.
+const defaultAutocompactPCT = 85
 
 // GatewayCachePath returns the Claude Code gateway-models cache file that feeds
 // its /model command. The path is resolved exactly as the installed binary does:
