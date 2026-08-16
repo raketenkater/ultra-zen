@@ -116,6 +116,38 @@ func TestEnvGatewayDiscovery(t *testing.T) {
 	}
 }
 
+// TestEnvAutocompactWindow verifies Claude Code is told the real context window
+// via the env var it actually reads (CLAUDE_CODE_AUTO_COMPACT_WINDOW — verified
+// in the 2.1.233 binary; CLAUDE_MAX_SESSION_TOKENS is ignored by that build),
+// with the PCT override applied as a default.
+func TestEnvAutocompactWindow(t *testing.T) {
+	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", 1_000_000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "1000000" {
+		t.Fatalf("CLAUDE_CODE_AUTO_COMPACT_WINDOW = %q, want 1000000 (the real 1M window)", got["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+	}
+	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "85" {
+		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 85 (default)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+	}
+	// A user's PCT override still wins.
+	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "90")
+	env = Env("http://127.0.0.1:1", "deepseek-v4-flash", 1_000_000)
+	got = map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "90" {
+		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 90 (user env wins)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+	}
+}
+
 // TestSettingsJSONCarriesEffortDefault verifies the injected --settings payload
 // carries the ultracode flag AND the effortLevel general default, so a fresh
 // ultra-zen session always starts at full ultracode thinking budget even when

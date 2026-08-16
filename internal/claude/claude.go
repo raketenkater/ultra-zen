@@ -50,6 +50,7 @@ func Env(proxyURL, model string, contextLength int) []string {
 			"API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT", "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS",
 			"CLAUDE_ENABLE_BYTE_WATCHDOG", "CLAUDE_ENABLE_STREAM_WATCHDOG",
 			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_MAX_SESSION_TOKENS",
+			"CLAUDE_CODE_AUTO_COMPACT_WINDOW",
 			"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL":
 			continue
 		}
@@ -80,12 +81,17 @@ func Env(proxyURL, model string, contextLength int) []string {
 		// Set the real context window so Claude Code's autocompaction engine
 		// knows exactly when to compact. Without this Claude Code defaults to a
 		// 200k assumption, so the conversation overflows the gateway's real limit
-		// and fails with "context_length" before compation ever triggers. The
-		// percentage override compacts close to the limit to maximise usable
-		// context, while leaving a little headroom for tool-call overhead that
-		// the tokeniser doesn't count. 85 is a middle ground between the default
-		// ~92% and the old 70% — enough headroom to avoid overflow but far more
-		// usable context than compacting at 70%.
+		// and fails with "context_length" before compaction ever triggers.
+		//
+		// Claude Code 2.1.x reads CLAUDE_CODE_AUTO_COMPACT_WINDOW (a token count,
+		// min'd against the model's window from /v1/models) for this, NOT
+		// CLAUDE_MAX_SESSION_TOKENS (verified: that var is absent from the 2.1.233
+		// binary). We set BOTH: the real one for the window, plus the legacy
+		// MAX_SESSION_TOKENS for older builds that still read it. The percentage
+		// override compacts close to the limit to maximise usable context while
+		// leaving a little headroom for tool-call overhead that the tokeniser
+		// doesn't count — 85 is the default (user env var wins).
+		fmt.Sprintf("CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d", maxTokens),
 		fmt.Sprintf("CLAUDE_MAX_SESSION_TOKENS=%d", maxTokens),
 		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "85"),
 	)
