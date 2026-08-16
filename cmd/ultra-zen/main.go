@@ -814,10 +814,11 @@ func main() {
 		}
 		seenRoutes[key] = true
 		fallbackRoutes = append(fallbackRoutes, proxy.Upstream{
-			Provider: provider,
-			BaseURL:  model.Base,
-			APIKey:   routeKey,
-			Model:    model.ID,
+			Provider:      provider,
+			BaseURL:       model.Base,
+			APIKey:        routeKey,
+			Model:         model.ID,
+			ContextLength: model.ContextLength,
 		})
 	}
 
@@ -1040,12 +1041,13 @@ func main() {
 		primaryKind = proxy.UpstreamResponses
 	}
 	primaryUp := proxy.Upstream{
-		Provider:  *provider,
-		BaseURL:   selected.Base,
-		APIKey:    key,
-		Model:     selected.ID,
-		Kind:      primaryKind,
-		AccountID: codexAccountID,
+		Provider:      *provider,
+		BaseURL:       selected.Base,
+		APIKey:        key,
+		Model:         selected.ID,
+		Kind:          primaryKind,
+		AccountID:     codexAccountID,
+		ContextLength: selected.ContextLength,
 	}
 	upstreams := make([]proxy.Upstream, 0, 1+len(fallbackRoutes))
 	upstreams = append(upstreams, primaryUp)
@@ -1064,6 +1066,7 @@ func main() {
 		Port:          *port,
 		Models:        modelInfos,
 		Upstreams:     upstreams,
+		ContextLength: selected.ContextLength,
 		OnUnavailable: func(route proxy.Upstream) {
 			// Subscription-backed codex models are not account-gated free tiers;
 			// a transient denial should not hide them from future launches.

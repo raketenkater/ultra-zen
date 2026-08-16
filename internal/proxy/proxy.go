@@ -32,13 +32,14 @@ type Config struct {
 	Port             int            // local listen port
 	Models           []ModelInfo    // full model list advertised at /v1/models
 	Upstreams        []Upstream     // every known upstream route (primary + fallbacks); maps /model ids to gateways
+	ContextLength    int            // primary model's context window in tokens (0 = unknown); used to truncate over-limit requests
 	OnUnavailable    func(Upstream) // called after an explicit per-model access denial
 }
 
 // primaryUpstream returns the canonical Upstream for the primary route,
 // carrying the wire protocol kind and ChatGPT account id.
 func (c Config) primaryUpstream() Upstream {
-	return Upstream{Provider: c.Provider, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.Model, Kind: c.Kind, AccountID: c.AccountID}
+	return Upstream{Provider: c.Provider, BaseURL: c.BaseURL, APIKey: c.APIKey, Model: c.Model, Kind: c.Kind, AccountID: c.AccountID, ContextLength: c.ContextLength}
 }
 
 // Upstream identifies one model and the endpoint/key that serves it. Fallbacks
@@ -56,6 +57,10 @@ type Upstream struct {
 	Kind string
 	// AccountID is the ChatGPT-Account-ID header for the codex-sub backend.
 	AccountID string
+	// ContextLength is the model's context window in tokens (0 = unknown). The
+	// proxy uses it to truncate over-limit requests so a session that grew past
+	// the wire limit can still make progress instead of hard-failing with a 400.
+	ContextLength int
 }
 
 // Upstream kinds.
@@ -369,6 +374,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// large values that the Zen gateway rejects with a 400.
 	if oreq.MaxTokens > maxOutputTokens || oreq.MaxTokens <= 0 {
 		oreq.MaxTokens = maxOutputTokens
+	}
+	// Rescue over-limit sessions: if the request's context would exceed the
+	// model's real window, trim the oldest messages so the turn (or a
+	// compaction) can go through instead of hard-failing with a 400. The
+	// window comes from the route's curated ContextLength.
+	if note := oreq.truncateToContext(primary.ContextLength, oreq.MaxTokens); note != "" {
+		log.Printf("ultra-zen proxy: %s for %s", note, primary.Model)
 	}
 
 	payload, resp, used, err := s.forwardWithRateLimit(r.Context(), primary, oreq)

@@ -31,6 +31,64 @@ func TestToOpenAISystem(t *testing.T) {
 	}
 }
 
+// TestTruncateToContext verifies the over-limit rescue: a request whose context
+// exceeds the model's window has its OLDEST non-system messages trimmed (system
+// + most recent kept) so the gateway accepts it instead of hard-failing.
+func TestTruncateToContext(t *testing.T) {
+	mid := strings.Repeat("x", 1000) // ~250 tokens per message
+	req := &openAIRequest{
+		MaxTokens: 1000,
+		Messages: []openAIMessage{
+			{Role: "system", Content: "you are a helper"},
+			{Role: "user", Content: "old " + mid},
+			{Role: "assistant", Content: "reply " + mid},
+			{Role: "user", Content: "old2 " + mid},
+			{Role: "assistant", Content: "reply2 " + mid},
+			{Role: "user", Content: "NEWEST question"},
+		},
+	}
+	// Window ~2500 tokens; 5 non-system messages at ~250 each = ~1250, so the
+	// budget (~2500-1000-1024=476) trims the oldest and keeps the newest.
+	note := req.truncateToContext(2500, 1000)
+	if note == "" {
+		t.Fatalf("expected truncation note for over-limit request")
+	}
+	// System + at least the newest user must survive.
+	if len(req.Messages) < 2 {
+		t.Fatalf("kept %d messages, want >=2 (system + newest)", len(req.Messages))
+	}
+	if req.Messages[0].Role != "system" {
+		t.Fatalf("system message lost: %+v", req.Messages[0])
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if s, ok := last.Content.(string); !ok || s != "NEWEST question" {
+		t.Fatalf("newest message lost: %+v", last)
+	}
+	// The oldest user message ("old ...") should be gone.
+	for _, m := range req.Messages {
+		if s, ok := m.Content.(string); ok && strings.HasPrefix(s, "old ") {
+			t.Fatalf("old message survived truncation: %q", s[:20])
+		}
+	}
+}
+
+// TestTruncateToContextNoOpWhenFits verifies a small request is left untouched.
+func TestTruncateToContextNoOpWhenFits(t *testing.T) {
+	req := &openAIRequest{
+		MaxTokens: 100,
+		Messages: []openAIMessage{
+			{Role: "system", Content: "s"},
+			{Role: "user", Content: "hello"},
+		},
+	}
+	if note := req.truncateToContext(1_000_000, 100); note != "" {
+		t.Fatalf("small request should not truncate, got %q", note)
+	}
+	if len(req.Messages) != 2 {
+		t.Fatalf("messages changed: %d", len(req.Messages))
+	}
+}
+
 func TestToOpenAIToolUseAndResult(t *testing.T) {
 	req := &anthropicRequest{
 		Model:     "claude-sonnet",

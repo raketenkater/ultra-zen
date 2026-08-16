@@ -168,6 +168,91 @@ func (a *anthropicRequest) toOpenAI(model string) (*openAIRequest, error) {
 	return req, nil
 }
 
+// truncateToContext trims the OLDEST non-system messages until the request's
+// estimated token count fits within the model's context window. This rescues a
+// session that grew past the wire limit: without it the gateway rejects the
+// whole request with a 400 and the session is stuck (compaction itself can't
+// run because it must send the full context to summarize it). The system prompt
+// and the most recent context are preserved, so the model keeps what it needs
+// for the current turn.
+//
+// window is the model's context window in tokens; maxTokens is the requested
+// completion budget. Returns a short note about what was trimmed ("" if nothing).
+func (r *openAIRequest) truncateToContext(window, maxTokens int) string {
+	if window <= 0 {
+		return ""
+	}
+	// Reserve the completion budget plus a little overhead for tools/system.
+	budget := window - maxTokens - 1024
+	if budget <= 0 {
+		budget = window / 2
+	}
+	// Rough token estimate: ~4 chars per token (typical English), generous so
+	// we trim conservatively.
+	est := func(m openAIMessage) int {
+		n := 0
+		switch c := m.Content.(type) {
+		case string:
+			n += len(c) / 4
+		case []map[string]any:
+			for _, block := range c {
+				if s, ok := block["text"].(string); ok {
+					n += len(s) / 4
+				}
+				if s, ok := block["content"].(string); ok {
+					n += len(s) / 4
+				}
+			}
+		}
+		if len(m.ToolCalls) > 0 {
+			for _, tc := range m.ToolCalls {
+				n += len(tc.Function.Arguments) / 4
+			}
+		}
+		return n
+	}
+
+	total := 0
+	for _, m := range r.Messages {
+		total += est(m)
+	}
+	if total <= budget {
+		return ""
+	}
+	// Drop the OLDEST non-system messages until under budget, always keeping
+	// the system message and the most recent messages (the current turn). Walk
+	// newest-first to identify what must stay, then keep those.
+	keep := make([]bool, len(r.Messages))
+	if len(r.Messages) > 0 && r.Messages[0].Role == "system" {
+		keep[0] = true
+	}
+	trimmed := 0
+	// Newest-first: mark messages that fit under budget as kept. Always keep the
+	// last non-system message so the request stays a valid turn even if a single
+	// message alone exceeds the window.
+	acc := 0
+	for i := len(r.Messages) - 1; i >= 0; i-- {
+		m := r.Messages[i]
+		if i == 0 && m.Role == "system" {
+			continue
+		}
+		if acc+est(m) > budget && i > 0 && i < len(r.Messages)-1 {
+			trimmed++
+			continue
+		}
+		acc += est(m)
+		keep[i] = true
+	}
+	var kept []openAIMessage
+	for i := range r.Messages {
+		if keep[i] {
+			kept = append(kept, r.Messages[i])
+		}
+	}
+	r.Messages = kept
+	return fmt.Sprintf("truncated %d old message(s) to fit the %d-token context window", trimmed, window)
+}
+
 // sanitizeToolMessages guarantees every "tool" message is a well-formed answer
 // to a tool_call that was actually announced earlier in the conversation.
 //
