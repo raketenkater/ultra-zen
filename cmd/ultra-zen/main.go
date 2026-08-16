@@ -413,6 +413,9 @@ func main() {
 		case strings.HasPrefix(arg, "--port="):
 			*port, _ = strconv.Atoi(strings.TrimPrefix(arg, "--port="))
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--proxy-only":
+			*proxyOnly = true
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		case arg == "--resume-session" && i+1 < len(claudeArgs):
 			*resumeSession = claudeArgs[i+1]
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)

@@ -727,3 +727,81 @@ func TestModelSelectedRouteFallsBackOn429(t *testing.T) {
 		t.Fatalf("expected selected (sel=%d) to fail and fallback (fb=%d) to serve", selCalls, fbCalls)
 	}
 }
+
+// TestWorkerSplitRoutesBackgroundRequests verifies the orchestrator/worker
+// split: a request with no interactive tools (a background sub-agent) that
+// carries the primary model id must be sent to the worker model, while a
+// request WITH interactive tools (the main loop) stays on the primary. A
+// /model-selected id still wins over the worker.
+func TestWorkerSplitRoutesBackgroundRequests(t *testing.T) {
+	// Collect the models the upstream gateway is called with. The proxy rewrites
+	// the echoed model field in the reply back to the client's requested id, so
+	// asserting on the response would always show deepseek-v4-flash; what matters
+	// is which model the upstream actually receives.
+	var gotModels []string
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var oreq openAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&oreq); err != nil {
+			t.Errorf("zen decode: %v", err)
+		}
+		gotModels = append(gotModels, oreq.Model)
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer zen.Close()
+
+	cfg := Config{
+		Provider:    "opencode-go",
+		BaseURL:     zen.URL,
+		APIKey:      "k",
+		Model:       "deepseek-v4-flash",
+		WorkerModel: "mimo-v2.5",
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	send := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.handleMessages(rec, req)
+		return rec.Code
+	}
+
+	// Main loop: carries the interactive/UI tools that only appear in the main
+	// Claude Code loop (AskUserQuestion, Skill, ...), so it stays on primary.
+	if code := send(`{"model":"deepseek-v4-flash","max_tokens":100,
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{}}},
+			{"name":"AskUserQuestion","description":"ask","input_schema":{"type":"object","properties":{}}}
+		]}`); code != 200 {
+		t.Fatalf("interactive request status = %d", code)
+	}
+	// Background sub-agent: same tool list minus the interactive tools -> worker.
+	if code := send(`{"model":"deepseek-v4-flash","max_tokens":100,
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{}}}]}`); code != 200 {
+		t.Fatalf("background request status = %d", code)
+	}
+	// An explicit model id that is NOT a registered route (glm-5.2, no fallback)
+	// must not be hijacked by the worker — it keeps the primary.
+	if code := send(`{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`); code != 200 {
+		t.Fatalf("/model request status = %d", code)
+	}
+
+	if len(gotModels) != 3 {
+		t.Fatalf("expected 3 upstream calls, got %d: %v", len(gotModels), gotModels)
+	}
+	if gotModels[0] != "deepseek-v4-flash" {
+		t.Errorf("main-loop request sent to %q, want deepseek-v4-flash", gotModels[0])
+	}
+	if gotModels[1] != "mimo-v2.5" {
+		t.Errorf("background request sent to %q, want worker mimo-v2.5", gotModels[1])
+	}
+	if gotModels[2] != "deepseek-v4-flash" {
+		t.Errorf("unknown /model id sent to %q, want primary deepseek-v4-flash (not worker)", gotModels[2])
+	}
+}

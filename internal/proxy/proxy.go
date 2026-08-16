@@ -343,27 +343,27 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// resilient route, so a main-loop or subagent request can continue on the
 	// next free model without restarting the session.
 	primary := s.cfg.primaryUpstream()
-	if len(s.cfg.Fallbacks) == 0 && s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
-		// Background sub-agent: run on the worker unless the user explicitly
-		// selected a model via /model, which wins.
-		if u, ok := s.modelRoute[areq.Model]; ok {
-			primary = u
-		} else {
-			primary.Model = s.cfg.WorkerModel
-		}
-	} else if areq.Model != "" {
-		if u, ok := s.modelRoute[areq.Model]; ok {
-			primary = u
-		} else if strings.HasPrefix(areq.Model, "claude-group-") {
-			// A disabled group header (claude-group-*) is advertised at /v1/models
-			// purely as a section label and routes nowhere. If a client still sends
-			// one, fail loudly instead of silently serving the primary — a user who
-			// picked a section should never silently get a model. Any other
-			// unrecognized model id keeps the primary fallback (harmless for
-			// arbitrary/other-client requests).
-			writeError(w, 400, "invalid_request_error", fmt.Sprintf("model group %q is a section header, not a selectable model; run /model to pick one", areq.Model))
-			return
-		}
+	// An explicitly different model id (a /model switch) wins over everything,
+	// including the worker split. The primary's own id is not a switch: it is
+	// the default the client sends when nothing was picked, so it must fall
+	// through to the worker for background sub-agents below.
+	if u, ok := s.modelRoute[areq.Model]; ok && u != primary {
+		primary = u
+	} else if strings.HasPrefix(areq.Model, "claude-group-") {
+		// A disabled group header (claude-group-*) is advertised at /v1/models
+		// purely as a section label and routes nowhere. If a client still sends
+		// one, fail loudly instead of silently serving the primary — a user who
+		// picked a section should never silently get a model. Any other
+		// unrecognized model id keeps the primary fallback (harmless for
+		// arbitrary/other-client requests).
+		writeError(w, 400, "invalid_request_error", fmt.Sprintf("model group %q is a section header, not a selectable model; run /model to pick one", areq.Model))
+		return
+	} else if (areq.Model == "" || areq.Model == primary.Model) && len(s.cfg.Fallbacks) == 0 && s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
+		// Background sub-agent with no explicit /model pick: run on the worker.
+		// Only a request naming the primary id (or nothing) is a candidate — any
+		// other explicit model id, even one not in the route map, is a deliberate
+		// /model choice and must not be overridden by the worker.
+		primary.Model = s.cfg.WorkerModel
 	}
 	oreq, err := areq.toOpenAI(primary.Model)
 	if err != nil {
