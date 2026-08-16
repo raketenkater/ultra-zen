@@ -122,9 +122,9 @@ func TestToAnthropicReasoningFallback(t *testing.T) {
 
 func TestMapStopReason(t *testing.T) {
 	cases := map[string]string{
-		"stop":          "end_turn",
-		"tool_calls":    "tool_use",
-		"length":        "max_tokens",
+		"stop":           "end_turn",
+		"tool_calls":     "tool_use",
+		"length":         "max_tokens",
 		"content_filter": "end_turn",
 	}
 	for in, want := range cases {
@@ -299,8 +299,8 @@ func TestTruncatedToolArgumentsStaySerializable(t *testing.T) {
 	for _, args := range []string{`{"cmd": "l`, ``, `null`, `"scalar"`, `[1,2]`} {
 		r := &openAIResponse{}
 		r.Choices = append(r.Choices, struct {
-			Index        int `json:"index"`
-			Message      struct {
+			Index   int `json:"index"`
+			Message struct {
 				Role      string       `json:"role"`
 				Content   string       `json:"content"`
 				ToolCalls []openAITool `json:"tool_calls"`
@@ -398,9 +398,9 @@ func TestHandleModelsAdvertisesClaudePrefixedIDs(t *testing.T) {
 		APIKey:   "k",
 		Model:    "deepseek-v4-flash",
 		Models: []ModelInfo{
-			{ID: "deepseek-v4-flash", Name: "deepseek-v4-flash", Provider: "opencode-go"},
-			{ID: "glm-5.2", Name: "glm-5.2", Provider: "opencode-go"},
-			{ID: "gpt-5.6-sol", Name: "GPT-5.6-Sol", Provider: "codex"},
+			{ID: "deepseek-v4-flash", Name: "deepseek-v4-flash", Provider: "opencode-go", ContextLength: 1_000_000},
+			{ID: "glm-5.2", Name: "glm-5.2", Provider: "opencode-go", ContextLength: 200_000},
+			{ID: "gpt-5.6-sol", Name: "GPT-5.6-Sol", Provider: "codex", ContextLength: 272_000},
 		},
 	}
 	s := New(cfg)
@@ -412,9 +412,10 @@ func TestHandleModelsAdvertisesClaudePrefixedIDs(t *testing.T) {
 	}
 	var payload struct {
 		Data []struct {
-			ID         string `json:"id"`
-			Name       string `json:"display_name"`
-			Disabled   bool   `json:"disabled"`
+			ID            string `json:"id"`
+			Name          string `json:"display_name"`
+			Disabled      bool   `json:"disabled"`
+			ContextWindow int    `json:"context_window"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
@@ -453,11 +454,25 @@ func TestHandleModelsAdvertisesClaudePrefixedIDs(t *testing.T) {
 	}
 	// Display names identify both the model and its provider.
 	nameByID := map[string]string{}
+	ctxByID := map[string]int{}
 	for _, m := range payload.Data {
 		nameByID[m.ID] = m.Name
+		ctxByID[m.ID] = m.ContextWindow
 	}
 	if got := nameByID["claude-codex-gpt-5.6-sol"]; got != "GPT-5.6-Sol — Codex (ChatGPT sub)" {
 		t.Fatalf("codex display name = %q, want provider-labelled", got)
+	}
+	// The real context window must be advertised so Claude Code autocompacts at
+	// the right point (deepseek-v4-flash is 1M, glm-5.2 is 200k).
+	if got := ctxByID["claude-opencode-go-deepseek-v4-flash"]; got != 1_000_000 {
+		t.Fatalf("deepseek-v4-flash context_window = %d, want 1000000 (autocompaction)", got)
+	}
+	if got := ctxByID["claude-opencode-go-glm-5.2"]; got != 200_000 {
+		t.Fatalf("glm-5.2 context_window = %d, want 200000", got)
+	}
+	// Group headers carry no context.
+	if got := ctxByID["claude-group-opencode-go"]; got != 0 {
+		t.Fatalf("group header context_window = %d, want 0", got)
 	}
 }
 

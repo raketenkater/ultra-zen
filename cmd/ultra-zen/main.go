@@ -1014,13 +1014,19 @@ func main() {
 	// provider's catalog is the launch list, and each fallback route appears once.
 	modelInfos := make([]proxy.ModelInfo, 0, len(list))
 	for _, m := range list {
-		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name, Provider: *provider})
+		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name, Provider: *provider, ContextLength: m.ContextLength})
 	}
 	for _, route := range fallbackRoutes {
 		if models.Find(list, route.Model) == nil {
 			// Fallback routes not in the primary catalog show a friendly name
-			// instead of the raw upstream id, so /model identifies them.
-			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: models.FriendlyName(route.Model), Provider: route.Provider})
+			// instead of the raw upstream id, so /model identifies them. Pull the
+			// context window from the provider catalog when available (it feeds
+			// /v1/models context_window so autocompaction works for fallbacks too).
+			ctx := 0
+			if fm := findFallbackModel(route.Provider, route.Model, openRouterList, zenList, freeTierLists); fm != nil {
+				ctx = fm.ContextLength
+			}
+			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: models.FriendlyName(route.Model), Provider: route.Provider, ContextLength: ctx})
 		}
 	}
 
@@ -1178,6 +1184,27 @@ func main() {
 		die(runErr)
 	}
 	cancel()
+}
+
+// findFallbackModel looks up a fallback route's model (for its context window)
+// across the catalogs that may have loaded it: the primary list, OpenRouter,
+// opencode Zen, and the BYO free-tier lists.
+func findFallbackModel(provider, model string, openRouterList, zenList []models.Model, freeTierLists map[string][]models.Model) *models.Model {
+	var candidates [][]models.Model
+	switch provider {
+	case "openrouter":
+		candidates = [][]models.Model{openRouterList}
+	case "opencode-go":
+		candidates = [][]models.Model{zenList}
+	default:
+		candidates = [][]models.Model{freeTierLists[provider]}
+	}
+	for _, cat := range candidates {
+		if m := models.Find(cat, model); m != nil {
+			return m
+		}
+	}
+	return nil
 }
 
 // waitForHealth polls the proxy health endpoint until it responds or the

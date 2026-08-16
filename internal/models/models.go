@@ -166,6 +166,49 @@ type apiModelEntry struct {
 	ContextLength int    `json:"context_length"`
 }
 
+// knownContextWindows supplies the real context window for models whose
+// gateway's /models endpoint does NOT report one. Verified live: the opencode
+// Zen gateway (go + main tiers) returns entries with only id/object/created/
+// owned_by — no context_length, no context_window. Without this table every
+// Zen model falls back to contextWindowDefault (200k), which badly
+// under-reports 1M-window models (deepseek-v4-flash, minimax-m3) and can
+// over-report smaller ones, so Claude Code autocompacts at the wrong point and
+// the conversation overflows the gateway's true limit. Values cross-checked
+// against live OpenRouter / models + provider docs (see the autocompact
+// diagnosis workflow, 2026-08-16).
+var knownContextWindows = map[string]int{
+	// DeepSeek V4 — 1M context.
+	"deepseek-v4-flash": 1_000_000,
+	"deepseek-v4-pro":   1_000_000,
+	// GLM-5 family — 200k class (GLM-5.2 is 1M on OpenRouter, but the Zen
+	// gateway serves the 200k tier; a safe floor avoids overflow).
+	"glm-5":   200_000,
+	"glm-5.1": 200_000,
+	"glm-5.2": 200_000,
+	"glm-5.3": 200_000,
+	// Kimi K2 family — 256k; K3 is 1M.
+	"kimi-k2.5":      256_000,
+	"kimi-k2.6":      256_000,
+	"kimi-k2.7-code": 256_000,
+	"kimi-k3":        1_000_000,
+	// MiniMax — M2.x 200k, M3 1M.
+	"minimax-m2.5": 204_800,
+	"minimax-m2.7": 204_800,
+	"minimax-m3":   1_000_000,
+	// Mimo (Moonshot) — 200k class.
+	"mimo-v2.5":     200_000,
+	"mimo-v2.5-pro": 200_000,
+	"mimo-v2-omni":  200_000,
+	"mimo-v2-pro":   200_000,
+	// OpenAI GPT-5.6 on the Zen gateway — 272k.
+	"gpt-5.6-luna":  272_000,
+	"gpt-5.6-terra": 272_000,
+	// xAI Grok — 500k.
+	"grok-4.5": 500_000,
+	// Hyperbolic/other — conservative 200k.
+	"hy3": 200_000,
+}
+
 func fetchEntries(c *http.Client, base, key string) ([]apiModelEntry, error) {
 	req, err := http.NewRequest(http.MethodGet, base+"/models", nil)
 	if err != nil {
@@ -188,7 +231,23 @@ func fetchEntries(c *http.Client, base, key string) ([]apiModelEntry, error) {
 		return nil, fmt.Errorf("parse models: %w", err)
 	}
 	sort.SliceStable(payload.Data, func(i, j int) bool { return payload.Data[i].ID < payload.Data[j].ID })
+	fillContextWindows(payload.Data)
 	return payload.Data, nil
+}
+
+// fillContextWindows fills in curated context windows for any entry the
+// gateway left at 0 (the Zen/ModelScope gateways report no context). Real
+// gateway values are never overwritten. The table is keyed by gateway model id
+// (e.g. "deepseek-v4-flash"), which matches the Zen and ModelScope catalogs.
+func fillContextWindows(entries []apiModelEntry) {
+	for i := range entries {
+		if entries[i].ContextLength > 0 {
+			continue
+		}
+		if n, ok := knownContextWindows[entries[i].ID]; ok {
+			entries[i].ContextLength = n
+		}
+	}
 }
 
 // fetchIDs is kept for tests that only need ID strings.

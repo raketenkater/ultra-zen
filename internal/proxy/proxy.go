@@ -60,7 +60,7 @@ type Upstream struct {
 
 // Upstream kinds.
 const (
-	UpstreamChat      = ""    // OpenAI Chat Completions (default)
+	UpstreamChat      = ""          // OpenAI Chat Completions (default)
 	UpstreamResponses = "responses" // OpenAI Responses API (codex-sub)
 )
 
@@ -71,9 +71,10 @@ const (
 // CLI — so a header is a routing-neutral id whose display name carries the
 // group title).
 type ModelInfo struct {
-	ID       string
-	Name     string
-	Provider string // provider name, used to insert a group header before it
+	ID            string
+	Name          string
+	Provider      string // provider name, used to insert a group header before it
+	ContextLength int    // model context window in tokens; 0 = unknown
 }
 
 // maxOutputTokens is the maximum max_tokens the proxy forwards to the Zen
@@ -173,7 +174,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// shape: each entry has type/id/display_name/created_at, and the list has
 	// has_more/first_id/last_id. The OpenAI-style object/owned_by fields are
 	// included too so OpenAI-compatible probes still work.
-	entry := func(id, name string, disabled bool) map[string]any {
+	entry := func(id, name string, disabled bool, contextWindow int) map[string]any {
 		if name == "" {
 			name = id
 		}
@@ -184,6 +185,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			"created_at":   "2026-01-01T00:00:00Z",
 			"object":       "model",
 			"owned_by":     "ultra-zen",
+		}
+		if contextWindow > 0 {
+			// Claude Code reads this to compute its autocompaction threshold. Without
+			// it, it guesses the window (often 1M for known models) and compaction
+			// never fires before the gateway's real limit — the conversation overflows
+			// and /compact fails with a context_length 400.
+			e["context_window"] = contextWindow
 		}
 		if disabled {
 			e["disabled"] = true
@@ -207,21 +215,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	for _, m := range s.cfg.Models {
 		if m.Provider != "" && !seenProvider[m.Provider] {
 			seenProvider[m.Provider] = true
-			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider), true))
+			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider), true, 0))
 		}
 		// Advertise the claude-prefixed id so the /model gateway filter
 		// (/(claude|anthropic)/i) keeps it; the display name is the friendly
 		// model name plus the provider label so the picker identifies both. The
 		// proxy routes the advertised id back to the real upstream model via
-		// modelRoute.
+		// modelRoute. context_window carries the model's real window so Claude
+		// Code's autocompaction fires at the right point.
 		advertisedID := m.ID
 		if m.Provider != "" {
 			advertisedID = ClaudeModelID(m.Provider, m.ID)
 		}
-		models = append(models, entry(advertisedID, ModelDisplayName(m.Name, m.Provider), false))
+		models = append(models, entry(advertisedID, ModelDisplayName(m.Name, m.Provider), false, m.ContextLength))
 	}
 	if len(models) == 0 {
-		models = append(models, entry(s.cfg.Model, "", false))
+		models = append(models, entry(s.cfg.Model, "", false, 0))
 	}
 	out := map[string]any{
 		"object":   "list",
