@@ -681,6 +681,8 @@ func providerSubtitle(provider string) string {
 		return "Codex (ChatGPT sub)"
 	case "groq", "cerebras", "huggingface", "cohere", "modelscope":
 		return provider
+	case "saia":
+		return "GWDG SAIA"
 	default:
 		return "opencode Zen"
 	}

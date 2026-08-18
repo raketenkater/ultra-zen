@@ -169,6 +169,12 @@ environment. Lists `:free` models, including `qwen/qwen3-coder:free`,
 `deepseek/deepseek-chat:free`, `google/gemini-2.5-flash:free`, and
 `openrouter/free` (auto-routes to the best available free model).
 
+**GWDG SAIA** (`--provider saia`): uses the OpenAI-compatible Academic Cloud
+endpoint at `https://chat-ai.academiccloud.de/v1`. Set `SAIA_API_KEY`, or store
+the key once with `ultra-zen keys set saia -` and provide it on stdin. Models
+are discovered live from SAIA; `qwen3-coder-next` is the recommended coding
+model.
+
 OpenRouter currently allows **50 free-model requests per day** on a free
 account. After the account has purchased at least **$10 in credits**, that
 allowance becomes **1,000 free-model requests per day**. The credits remain

@@ -55,6 +55,7 @@ var poolProviders = []string{
 	"huggingface",
 	"cohere",
 	"modelscope",
+	"saia",
 }
 
 // fallbackStatus tracks one provider's fetch state on the fallback screen.

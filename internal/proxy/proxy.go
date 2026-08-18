@@ -271,6 +271,8 @@ func groupTitle(provider string) string {
 		return "opencode Zen"
 	case "openrouter":
 		return "OpenRouter"
+	case "saia":
+		return "GWDG SAIA"
 	case "codex":
 		return "Codex (ChatGPT sub)"
 	case "codex-sub":

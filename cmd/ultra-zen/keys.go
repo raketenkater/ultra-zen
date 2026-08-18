@@ -1,6 +1,6 @@
 // Keys subcommand: manage the persistent API-key store without opening the
 // TUI. `ultra-zen keys` lists stored keys (names only — never the secrets),
-// `ultra-zen keys set <provider> <key>` stores one, and
+// `ultra-zen keys set <provider> <key>` stores one (`-` reads from stdin), and
 // `ultra-zen keys clear <provider>` removes one. Keys are also editable from
 // the TUI model picker (press `k`).
 package main
@@ -18,6 +18,7 @@ import (
 // stdout is an indirection over os.Stdout so tests can capture subcommand
 // output.
 var stdout io.Writer = os.Stdout
+var stdin io.Reader = os.Stdin
 
 // knownKeyProviders is the set of providers ultra-zen can store a key for. It
 // drives validation in the keys subcommand and doubles as a hint list.
@@ -28,6 +29,7 @@ var knownKeyProviders = []string{
 	"cerebras",
 	"huggingface",
 	"cohere",
+	"saia",
 	"opencode-go",
 }
 
@@ -72,6 +74,13 @@ func cmdKeys(args []string) {
 		if !validKeyProvider(provider) {
 			fmt.Fprintf(os.Stderr, "ultra-zen: unknown provider %q; known: %s\n", provider, strings.Join(knownKeyProviders, ", "))
 			os.Exit(1)
+		}
+		if value == "-" {
+			data, err := io.ReadAll(stdin)
+			if err != nil {
+				die(fmt.Errorf("read key from stdin: %w", err))
+			}
+			value = string(data)
 		}
 		if strings.TrimSpace(value) == "" {
 			fmt.Fprintln(os.Stderr, "ultra-zen: key cannot be empty; use `ultra-zen keys clear <provider>` to remove")
@@ -155,13 +164,14 @@ func listKeys() {
 		}
 		fmt.Fprintf(stdout, "%-14s %s\n", p, status)
 	}
-	fmt.Fprintf(stdout, "\nKeys live in %s (mode 0600). Set with `ultra-zen keys set <provider> <key>`.\n", keys.Path())
+	fmt.Fprintf(stdout, "\nKeys live in %s (mode 0600). Set with `ultra-zen keys set <provider> <key>` or pipe to `ultra-zen keys set <provider> -`.\n", keys.Path())
 }
 
 func keysUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "  ultra-zen keys                    list providers and whether a key is set")
 	fmt.Fprintln(os.Stderr, "  ultra-zen keys set <p> <key>      store an API key (e.g. modelscope, openrouter)")
+	fmt.Fprintln(os.Stderr, "  command | ultra-zen keys set <p> -  read an API key from stdin (avoids process arguments)")
 	fmt.Fprintln(os.Stderr, "  ultra-zen keys clear <p>          remove a stored key")
 	fmt.Fprintln(os.Stderr, "  ultra-zen keys path               print the keys directory")
 	fmt.Fprintln(os.Stderr, "  ultra-zen keys --system ...       operate on the machine-wide store (/etc/ultra-zen/keys, needs sudo)")

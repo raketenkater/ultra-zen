@@ -29,6 +29,7 @@ func TestSplitFreeModelSpec(t *testing.T) {
 		{"cerebras:llama-3.3-70b", "cerebras", "llama-3.3-70b"},
 		{"huggingface:qwen/qwen3-14b", "huggingface", "qwen/qwen3-14b"},
 		{"cohere:command-r", "cohere", "command-r"},
+		{"saia:qwen3-coder-next", "saia", "qwen3-coder-next"},
 		{"codex:gpt-5", "codex", "gpt-5"},
 	}
 	for _, test := range tests {
@@ -58,6 +59,7 @@ func TestFreeRouteStringRoundTrips(t *testing.T) {
 		{Provider: "openrouter", Model: "openrouter/free"},
 		{Provider: "opencode-go", Model: "laguna-s-2.1-free"},
 		{Provider: "groq", Model: "llama-3.3-70b-versatile"},
+		{Provider: "saia", Model: "qwen3-coder-next"},
 	}
 	for _, r := range routes {
 		provider, model, err := splitFreeModelSpec(r.String())

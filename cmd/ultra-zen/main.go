@@ -123,7 +123,7 @@ func tuiLaunchArgs(model, provider, worker string, freeModels modelFlag, port, o
 
 // splitFreeModelSpec accepts provider-qualified free routes while keeping bare
 // OpenRouter model IDs backward compatible. The BYO-key providers
-// (modelscope/groq/cerebras/huggingface/cohere) mirror models.FreeTierProviders;
+// (modelscope/groq/cerebras/huggingface/cohere/saia) mirror models.FreeTierProviders;
 // codex is recognized but its models are subscription-backed (Free:false) and
 // are rejected by addRoute. Examples:
 //
@@ -150,6 +150,8 @@ func splitFreeModelSpec(value string) (provider, model string, err error) {
 		provider, model = "huggingface", strings.TrimPrefix(value, "huggingface:")
 	case strings.HasPrefix(value, "cohere:"):
 		provider, model = "cohere", strings.TrimPrefix(value, "cohere:")
+	case strings.HasPrefix(value, "saia:"):
+		provider, model = "saia", strings.TrimPrefix(value, "saia:")
 	case strings.HasPrefix(value, "codex:"):
 		provider, model = "codex", strings.TrimPrefix(value, "codex:")
 	default:
@@ -283,11 +285,11 @@ func main() {
 	var freeModels modelFlag
 	var (
 		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
-		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex (auto-detects the ChatGPT subscription from the codex CLI login)")
+		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, saia, codex, or another supported free-tier provider")
 		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
 		codexBaseURL  = flag.String("codex-url", "", "Codex endpoint base URL (or set CODEX_BASE_URL), e.g. http://127.0.0.1:8000/v1")
 		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
-		apiKey        = flag.String("api-key", "", "API key for --provider groq/cerebras/huggingface/cohere (or set that provider's own env var)")
+		apiKey        = flag.String("api-key", "", "API key for --provider saia/groq/cerebras/huggingface/cohere/modelscope (or set that provider's env var)")
 		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
@@ -308,6 +310,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Providers:")
 		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
 		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
+		fmt.Fprintln(os.Stderr, "  --provider saia          GWDG Academic Cloud SAIA (set SAIA_API_KEY or store a user key)")
 		fmt.Fprintln(os.Stderr, "  --provider codex         Codex: auto-detect the ChatGPT subscription (codex login) or a local endpoint")
 		fmt.Fprintln(os.Stderr, "  --provider groq          Groq free tier (set GROQ_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider cerebras      Cerebras free tier (set CEREBRAS_API_KEY or --api-key)")
@@ -738,7 +741,7 @@ func main() {
 	}
 
 	// ensureFreeTier lazily loads the free-model list for a BYO-key free-tier
-	// provider (modelscope/groq/cerebras/huggingface/cohere). Caches per
+	// provider (modelscope/groq/cerebras/huggingface/cohere/saia). Caches per
 	// provider. Requires the key to already exist (flag/env/keys store) — no
 	// interactive prompt, because a TUI-configured pool already implies the user
 	// saw a key prompt in the picker.
@@ -944,7 +947,7 @@ func main() {
 					continue
 				}
 				addRoute("opencode-go", fallback, zenPoolKey)
-			case "modelscope", "groq", "cerebras", "huggingface", "cohere":
+			case "modelscope", "groq", "cerebras", "huggingface", "cohere", "saia":
 				if err := ensureFreeTier(poolProvider); err != nil {
 					warn("skip %s free fallback %q: %v", poolProvider, id, err)
 					continue

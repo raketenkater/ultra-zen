@@ -29,6 +29,7 @@ const (
 	CohereBase       = "https://api.cohere.ai/compatibility/v1"
 	ModelScopeBase   = "https://api-inference.modelscope.ai/v1"
 	ModelScopeCNBase = "https://api-inference.modelscope.cn/v1"
+	SAIABase         = "https://chat-ai.academiccloud.de/v1"
 	// CodexSubBase is the ChatGPT subscription backend the codex CLI talks to.
 	// It serves the OpenAI Responses API (POST /responses) and a model catalog
 	// at GET /models — NOT chat/completions. There is deliberately no /v1
@@ -60,6 +61,7 @@ var FreeTierProviders = map[string]FreeTierProvider{
 	"huggingface": {Base: HuggingFaceBase, EnvKey: "HF_TOKEN", KeyHint: "https://huggingface.co/settings/tokens"},
 	"cohere":      {Base: CohereBase, EnvKey: "COHERE_API_KEY", KeyHint: "https://dashboard.cohere.com/api-keys"},
 	"modelscope":  {Base: ModelScopeBase, EnvKey: "MODELSCOPE_API_KEY", KeyHint: "https://modelscope.ai/my/myaccesstoken"},
+	"saia":        {Base: SAIABase, EnvKey: "SAIA_API_KEY", KeyHint: "https://saia.gwdg.de/dashboard"},
 }
 
 // ProviderKey resolves the API key ultra-zen uses for a free-pool provider,
@@ -205,6 +207,8 @@ var knownContextWindows = map[string]int{
 	"gpt-5.6-terra": 272_000,
 	// xAI Grok — 500k.
 	"grok-4.5": 500_000,
+	// Qwen3 Coder Next — 256k context (SAIA catalog omits context metadata).
+	"qwen3-coder-next": 262_144,
 	// Hyperbolic/other — conservative 200k.
 	"hy3": 200_000,
 }
@@ -675,6 +679,8 @@ func BaseForProvider(provider string) string {
 		return CohereBase
 	case "modelscope":
 		return ModelScopeBase
+	case "saia":
+		return SAIABase
 	case "codex":
 		// The auto-detected ChatGPT subscription backend (the only codex route
 		// the recheck poller can reach with the shared token; a user-specified

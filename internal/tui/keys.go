@@ -42,6 +42,7 @@ func newKeyManager() keyManager {
 		"cerebras",
 		"huggingface",
 		"cohere",
+		"saia",
 		"opencode-go",
 	}
 	// Keep a stable, readable order rather than map iteration order.
@@ -178,6 +179,7 @@ func buildKeyItems() []list.Item {
 		"cerebras",
 		"huggingface",
 		"cohere",
+		"saia",
 		"opencode-go",
 	}
 	sort.Strings(providers)
@@ -203,6 +205,8 @@ func providerHint(p string) string {
 		return "get one at https://huggingface.co/settings/tokens"
 	case "cohere":
 		return "get one at https://dashboard.cohere.com/api-keys"
+	case "saia":
+		return "manage keys at https://saia.gwdg.de/dashboard"
 	case "opencode-go":
 		return "managed by `opencode auth login`; a saved key overrides it"
 	default:
