@@ -99,6 +99,12 @@ type Server struct {
 	poolMu         sync.Mutex
 	activeRoute    int
 	exhaustedRoute []bool
+	// deadSelectable remembers /model-selectable routes that are NOT in the
+	// rotation pool (full-catalog models) but were hard-denied (403/permanent)
+	// this session. They have no pool index, so exhaustedRoute can't mark them;
+	// this set stops routeOrder re-trying a dead selectable model first on every
+	// subsequent request that re-selects it. Guarded by poolMu.
+	deadSelectable map[string]bool
 	gateMu         sync.Mutex
 	nextOpenRouter time.Time
 	// modelRoute maps every id Claude Code's /model command can hand us (both
@@ -120,6 +126,7 @@ func New(cfg Config) *Server {
 	s := &Server{
 		cfg:            cfg,
 		exhaustedRoute: make([]bool, 1+len(cfg.Fallbacks)),
+		deadSelectable: make(map[string]bool),
 		modelRoute:     buildModelRoute(cfg),
 	}
 	mux := http.NewServeMux()
@@ -315,8 +322,17 @@ func buildModelRoute(cfg Config) map[string]Upstream {
 		}
 	}
 	add(cfg.primaryUpstream())
-	for _, f := range cfg.Fallbacks {
-		add(f)
+	// Prefer cfg.Upstreams (primary + fallbacks + every selectable model the
+	// catalog advertises) so a /model pick of any advertised model routes to the
+	// right gateway. Fall back to cfg.Fallbacks for callers (tests) that only set
+	// the rotation pool. Re-adding the primary is harmless: map keys overwrite
+	// with the identical struct.
+	src := cfg.Upstreams
+	if len(src) == 0 {
+		src = cfg.Fallbacks
+	}
+	for _, u := range src {
+		add(u)
 	}
 	return m
 }
@@ -543,7 +559,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 					if isFreeUsageLimit(prefix) {
 						s.exhaustProviderRoutes(choice.Upstream)
 					} else if isModelAccessDenied(prefix) {
-						s.limitRoute(choice.index, true)
+						s.retireRoute(choice)
 						if s.cfg.OnUnavailable != nil {
 							s.cfg.OnUnavailable(choice.Upstream)
 						}
@@ -572,7 +588,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 				candidate.Body.Close()
 				candidate.Body = io.NopCloser(bytes.NewReader(body))
 				if isModelAccessDenied(body) {
-					s.limitRoute(choice.index, true)
+					s.retireRoute(choice)
 					if s.cfg.OnUnavailable != nil {
 						s.cfg.OnUnavailable(choice.Upstream)
 					}
@@ -701,6 +717,17 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 	if primIdx >= 0 && !s.exhaustedRoute[primIdx] {
 		out = append(out, routeChoice{Upstream: primary, index: primIdx})
 		seen[primIdx] = true
+	} else if primIdx < 0 {
+		// The /model-selected route is a full-catalog model that is NOT in the
+		// rotation pool (its provider was loaded for advertising but the pool was
+		// capped). Attempt it first anyway — index -1 is safe: limitRoute and
+		// promoteRoute no-op on negatives and routeExhausted(-1) is false, so it
+		// is tried once and then the pool rotates. A route permanently retired
+		// this session (retireRoute) is skipped so it is not re-tried first on
+		// every request.
+		if !s.selectableDead(primary) {
+			out = append(out, routeChoice{Upstream: primary, index: -1})
+		}
 	}
 	for offset := 0; offset < len(pool); offset++ {
 		idx := (s.activeRoute + offset) % len(pool)
@@ -745,6 +772,41 @@ func (s *Server) routeExhausted(index int) bool {
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
 	return s.exhaustedRoute[index]
+}
+
+// retireRoute permanently retires a failed route. Pool routes (index >= 0) are
+// marked in exhaustedRoute as usual; a selectable route that is NOT in the
+// rotation pool (index -1) has no pool slot, so it is recorded in
+// deadSelectable so routeOrder stops re-trying it first this session.
+func (s *Server) retireRoute(choice routeChoice) {
+	s.limitRoute(choice.index, true)
+	if choice.index < 0 {
+		s.markSelectableDead(choice.Upstream)
+	}
+}
+
+// selectableDead reports whether a non-pool selectable route was permanently
+// retired this session. Callers must hold poolMu (routeOrder already does).
+func (s *Server) selectableDead(u Upstream) bool {
+	return s.deadSelectable[selectableDeadKey(u)]
+}
+
+// markSelectableDead records a non-pool selectable route as permanently dead
+// for this session.
+func (s *Server) markSelectableDead(u Upstream) {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	s.deadSelectable[selectableDeadKey(u)] = true
+}
+
+// selectableDeadKey uniquely identifies one selectable upstream for the dead
+// set. baseURL+model is sufficient because the proxy routes a given model id to
+// exactly one selectable upstream per base; including base guards against two
+// providers sharing a model id. APIKey is included too so the key matches
+// sameUpstream's equality (two routes sharing base+model but distinct keys stay
+// independent).
+func selectableDeadKey(u Upstream) string {
+	return u.BaseURL + "\x00" + u.APIKey + "\x00" + u.Model
 }
 
 // exhaustProviderRoutes opens the circuit for every route on the exhausted

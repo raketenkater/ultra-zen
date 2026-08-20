@@ -50,7 +50,7 @@ const autoSourceMaxRoutes = 3
 // autoSourceOrder is the display order for probing other BYO free-tier
 // providers during automatic pool discovery (after the active provider, Zen,
 // and OpenRouter). Only providers with an already-stored key are ever loaded.
-var autoSourceOrder = []string{"modelscope", "groq", "cerebras", "huggingface", "cohere"}
+var autoSourceOrder = []string{"modelscope", "groq", "cerebras", "huggingface", "cohere", "saia"}
 
 // codexSub is set when the --provider codex launch auto-detected the ChatGPT
 // subscription (no explicit --codex-url). It switches the proxy's upstream wire
@@ -171,6 +171,104 @@ func freeTierModels(list []models.Model) []models.Model {
 		}
 	}
 	return models.SortByRecent(free, models.LoadRecent())
+}
+
+// advertisedModel is one provider/model pair advertised at /v1/models.
+type advertisedModel struct {
+	provider string
+	m        models.Model
+}
+
+// buildAdvertisedCatalog merges the full model catalogs of every reachable
+// provider into (a) the list Claude Code's /model command shows (cfg.Models)
+// and (b) the selectable upstreams that make each advertised model routable.
+// The primary provider's catalog comes first; OpenRouter, opencode Zen, then
+// the BYO free tiers follow. This deliberately widens the advertised/routable
+// set beyond the capped automatic-rotation pool so /model no longer hides a
+// provider's models — while leaving the rotation pool (cfg.Fallbacks) unchanged.
+//
+// primaryProvider is the active provider, selectedID the launch model the caller
+// already routes via its primary Upstream. The selected model is omitted from
+// the selectable set (it stays owned solely by the primary route so launch-time
+// routing, incl. the orchestrator/worker split, is preserved). primaryKind and
+// accountID carry the primary wire protocol + ChatGPT account id, inherited by
+// the primary provider's other selectable models (codex-sub needs both). The
+// free catalogs (zen/openrouter/BYO tiers) are already restricted to free models
+// by their List functions, so no further free-filtering is applied here.
+func buildAdvertisedCatalog(
+	primaryProvider, selectedID string,
+	primaryList, zenList, openRouterList []models.Model,
+	freeTierLists map[string][]models.Model,
+	byoProviders []string,
+	key, zenKey, openRouterKey string,
+	freeTierKeys map[string]string,
+	primaryKind, accountID string,
+) ([]proxy.ModelInfo, []proxy.Upstream) {
+	var advs []advertisedModel
+	seen := map[string]bool{}
+	keyOf := func(p, id string) string { return p + "\x00" + id }
+	add := func(p string, list []models.Model) {
+		if list == nil {
+			return
+		}
+		for _, m := range list {
+			if k := keyOf(p, m.ID); seen[k] {
+				continue
+			}
+			seen[keyOf(p, m.ID)] = true
+			advs = append(advs, advertisedModel{provider: p, m: m})
+		}
+	}
+
+	// Primary catalog first (paid + free; reachable with the primary key).
+	add(primaryProvider, primaryList)
+	// Each other provider's own free catalog, with its separately stored key.
+	if primaryProvider != "opencode-go" {
+		add("opencode-go", zenList)
+	}
+	if primaryProvider != "openrouter" {
+		add("openrouter", openRouterList)
+	}
+	for _, p := range byoProviders {
+		if p == primaryProvider {
+			continue // already merged via primaryList
+		}
+		add(p, freeTierLists[p])
+	}
+
+	routeKey := func(p string) string {
+		switch {
+		case p == primaryProvider:
+			return key
+		case p == "opencode-go":
+			return zenKey
+		case p == "openrouter":
+			return openRouterKey
+		default:
+			return freeTierKeys[p]
+		}
+	}
+
+	modelInfos := make([]proxy.ModelInfo, 0, len(advs))
+	selectable := make([]proxy.Upstream, 0, len(advs))
+	for _, a := range advs {
+		modelInfos = append(modelInfos, proxy.ModelInfo{
+			ID: a.m.ID, Name: a.m.Name, Provider: a.provider, ContextLength: a.m.ContextLength,
+		})
+		if a.provider == primaryProvider && a.m.ID == selectedID {
+			continue // primary model: owned solely by the primary route
+		}
+		u := proxy.Upstream{
+			Provider: a.provider, BaseURL: a.m.Base, APIKey: routeKey(a.provider),
+			Model: a.m.ID, ContextLength: a.m.ContextLength,
+		}
+		if a.provider == primaryProvider {
+			u.Kind = primaryKind
+			u.AccountID = accountID
+		}
+		selectable = append(selectable, u)
+	}
+	return modelInfos, selectable
 }
 
 // loadTUIProvider switches the primary backend when the all-provider start
@@ -1016,36 +1114,36 @@ func main() {
 		}
 	}
 
-	// Build the model list for /v1/models (Claude Code's /model command). Each
-	// entry carries its provider so the handler groups the list; the primary
-	// provider's catalog is the launch list, and each fallback route appears once.
-	modelInfos := make([]proxy.ModelInfo, 0, len(list))
-	for _, m := range list {
-		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name, Provider: *provider, ContextLength: m.ContextLength})
-	}
-	for _, route := range fallbackRoutes {
-		if models.Find(list, route.Model) == nil {
-			// Fallback routes not in the primary catalog show a friendly name
-			// instead of the raw upstream id, so /model identifies them. Pull the
-			// context window from the provider catalog when available (it feeds
-			// /v1/models context_window so autocompaction works for fallbacks too).
-			ctx := 0
-			if fm := findFallbackModel(route.Provider, route.Model, openRouterList, zenList, freeTierLists); fm != nil {
-				ctx = fm.ContextLength
-			}
-			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: models.FriendlyName(route.Model), Provider: route.Provider, ContextLength: ctx})
-		}
-	}
-
-	// Start the proxy.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	// The codex-sub launch talks the Responses API and threads the account id
-	// header; everything else uses the default chat-completions path.
+	// Build the /v1/models catalog (Claude Code's /model command) from the FULL
+	// catalog of every provider ultra-zen can reach, not just the primary plus
+	// the capped automatic-rotation pool. Each advertised model is also made
+	// selectable (routable) so /model shows — and honors — every available model.
+	//
+	// The ensure* closures load a provider's catalog only when a key exists and
+	// return immediately when already loaded, so this is safe and repeatable
+	// regardless of which free-pool branch ran above. A provider with no key is
+	// simply absent from the catalog.
 	primaryKind := ""
 	if codexSub {
 		primaryKind = proxy.UpstreamResponses
 	}
+	_ = ensureZen()
+	_ = ensureOpenRouter(false)
+	for _, p := range autoSourceOrder {
+		if p != *provider {
+			_ = ensureFreeTier(p)
+		}
+	}
+	modelInfos, selectable := buildAdvertisedCatalog(
+		*provider, selected.ID,
+		list, zenList, openRouterList, freeTierLists, autoSourceOrder,
+		key, zenPoolKey, openRouterPoolKey, freeTierKeys,
+		primaryKind, codexAccountID,
+	)
+
+	// Start the proxy.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	primaryUp := proxy.Upstream{
 		Provider:      *provider,
 		BaseURL:       selected.Base,
@@ -1055,9 +1153,10 @@ func main() {
 		AccountID:     codexAccountID,
 		ContextLength: selected.ContextLength,
 	}
-	upstreams := make([]proxy.Upstream, 0, 1+len(fallbackRoutes))
+	upstreams := make([]proxy.Upstream, 0, 1+len(fallbackRoutes)+len(selectable))
 	upstreams = append(upstreams, primaryUp)
 	upstreams = append(upstreams, fallbackRoutes...)
+	upstreams = append(upstreams, selectable...)
 
 	srv := proxy.New(proxy.Config{
 		Provider:      *provider,
@@ -1193,27 +1292,6 @@ func main() {
 		die(runErr)
 	}
 	cancel()
-}
-
-// findFallbackModel looks up a fallback route's model (for its context window)
-// across the catalogs that may have loaded it: the primary list, OpenRouter,
-// opencode Zen, and the BYO free-tier lists.
-func findFallbackModel(provider, model string, openRouterList, zenList []models.Model, freeTierLists map[string][]models.Model) *models.Model {
-	var candidates [][]models.Model
-	switch provider {
-	case "openrouter":
-		candidates = [][]models.Model{openRouterList}
-	case "opencode-go":
-		candidates = [][]models.Model{zenList}
-	default:
-		candidates = [][]models.Model{freeTierLists[provider]}
-	}
-	for _, cat := range candidates {
-		if m := models.Find(cat, model); m != nil {
-			return m
-		}
-	}
-	return nil
 }
 
 // waitForHealth polls the proxy health endpoint until it responds or the

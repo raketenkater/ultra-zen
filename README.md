@@ -441,9 +441,9 @@ A `PreToolUse` hook rewrites Workflow `agent()` scripts to set `stallMs` to
 the maximum safe value, so background fan-out never aborts a quiet model.
 
 Ultracode is on by default, and every session starts at the highest thinking
-budget (`--effort max`): the injected `--settings` payload carries
-`"ultracode": true` and `"effortLevel": "max"`. Your own `--effort` flag always
-wins.
+budget (`--effort ultracode`): the injected `--settings` payload carries
+`"ultracode": true` and `"effortLevel": "ultracode"`. Your own `--effort` flag
+always wins.
 
 ### Web research
 The Anthropic-only `WebSearch` tool cannot run against the local proxy, so

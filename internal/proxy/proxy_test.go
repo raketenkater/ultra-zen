@@ -863,3 +863,223 @@ func TestWorkerSplitRoutesBackgroundRequests(t *testing.T) {
 		t.Errorf("unknown /model id sent to %q, want primary deepseek-v4-flash (not worker)", gotModels[2])
 	}
 }
+
+// TestHandleModelsAdvertisesAndRoutesFullCatalog verifies that with the full
+// catalog fix (buildAdvertisedCatalog feeding cfg.Models + cfg.Upstreams) the
+// /v1/models endpoint advertises models from EVERY reachable provider —
+// including ones outside the rotation pool — and that buildModelRoute maps each
+// advertised claude-prefixed id back to its own gateway.
+func TestHandleModelsAdvertisesAndRoutesFullCatalog(t *testing.T) {
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  "https://zen.example/v1",
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: "https://zen.example/v1", APIKey: "k", Model: "glm-5.2"},
+		},
+		Models: []ModelInfo{
+			{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", Provider: "opencode-go", ContextLength: 1_000_000},
+			// Non-primary, non-pool providers the catalog now advertises + routes.
+			{ID: "glm-4.7", Name: "GLM 4.7", Provider: "saia", ContextLength: 200_000},
+			{ID: "llama-3.3-70b", Name: "Llama 3.3 70B", Provider: "groq", ContextLength: 128_000},
+		},
+		Upstreams: []Upstream{
+			{Provider: "opencode-go", BaseURL: "https://zen.example/v1", APIKey: "k", Model: "deepseek-v4-flash"},
+			{Provider: "opencode-go", BaseURL: "https://zen.example/v1", APIKey: "k", Model: "glm-5.2"},
+			{Provider: "saia", BaseURL: "https://saia.example/v1", APIKey: "saia-key", Model: "glm-4.7"},
+			{Provider: "groq", BaseURL: "https://groq.example/v1", APIKey: "groq-key", Model: "llama-3.3-70b", ContextLength: 128_000},
+		},
+	}
+	s := New(cfg)
+
+	// /v1/models must advertise the non-pool saia + groq ids too.
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	s.handleModels(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal /v1/models: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range payload.Data {
+		ids[m.ID] = true
+	}
+	// Group headers plus every model, including saia + groq (not just the pool).
+	for _, want := range []string{
+		"claude-group-opencode-go", "claude-group-saia", "claude-group-groq",
+		"claude-opencode-go-deepseek-v4-flash",
+		"claude-saia-glm-4.7",
+		"claude-groq-llama-3.3-70b",
+	} {
+		if !ids[want] {
+			t.Fatalf("advertised id %q missing from /v1/models; ids=%v", want, ids)
+		}
+	}
+	// Every advertised id must be routable: the non-pool saia + groq ids resolve.
+	if u, ok := s.modelRoute[ClaudeModelID("saia", "glm-4.7")]; !ok {
+		t.Fatal("claude-saia-glm-4.7 not routable via modelRoute")
+	} else if u.APIKey != "saia-key" || u.BaseURL != "https://saia.example/v1" {
+		t.Fatalf("saia route = %+v, want saia-key/saia.example", u)
+	}
+	if u, ok := s.modelRoute[ClaudeModelID("groq", "llama-3.3-70b")]; !ok {
+		t.Fatal("claude-groq-llama-3.3-70b not routable via modelRoute")
+	} else if u.APIKey != "groq-key" || u.BaseURL != "https://groq.example/v1" {
+		t.Fatalf("groq route = %+v, want groq-key/groq.example", u)
+	}
+}
+
+// TestPrimaryRouteStructurallyPreserved verifies the launch route is unchanged:
+// the primary's model id resolves to cfg.primaryUpstream() (value-equality) so
+// handleMessages' "u == primary" and the worker split still work with the
+// expanded selectable set present.
+func TestPrimaryRouteStructurallyPreserved(t *testing.T) {
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  "https://zen.example/v1",
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Models: []ModelInfo{
+			{ID: "deepseek-v4-flash", Name: "DeepSeek V4 Flash", Provider: "opencode-go"},
+			{ID: "glm-4.7", Name: "GLM 4.7", Provider: "saia"},
+		},
+		Upstreams: []Upstream{
+			{Provider: "opencode-go", BaseURL: "https://zen.example/v1", APIKey: "k", Model: "deepseek-v4-flash"},
+			{Provider: "saia", BaseURL: "https://saia.example/v1", APIKey: "saia-key", Model: "glm-4.7"},
+		},
+	}
+	s := New(cfg)
+	prim := cfg.primaryUpstream()
+	for _, id := range []string{
+		cfg.Model,
+		cfg.Provider + "/" + cfg.Model,
+		ClaudeModelID(cfg.Provider, cfg.Model),
+	} {
+		if u, ok := s.modelRoute[id]; !ok {
+			t.Fatalf("primary id %q not in modelRoute", id)
+		} else if u != prim {
+			t.Fatalf("primary id %q -> %+v, want exact primary route %+v (worker split)", id, u, prim)
+		}
+	}
+}
+
+// TestSelectedNonPoolRouteIsAttempted verifies the routeOrder index -1 path: a
+// /model-selected model that is in cfg.Upstreams but NOT in the rotation pool is
+// attempted first (not silently rotated away), carrying the selected model id to
+// the right gateway.
+func TestSelectedNonPoolRouteIsAttempted(t *testing.T) {
+	var saiaGot []string
+	saia := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var oreq openAIRequest
+		if err := json.NewDecoder(r.Body).Decode(&oreq); err != nil {
+			t.Errorf("saia decode: %v", err)
+		}
+		saiaGot = append(saiaGot, oreq.Model)
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"saia-ok"}}]}`))
+	}))
+	defer saia.Close()
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"zen-ok"}}]}`))
+	}))
+	defer zen.Close()
+
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  zen.URL,
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "opencode-go", BaseURL: zen.URL, APIKey: "k", Model: "glm-5.2"},
+		},
+		Upstreams: []Upstream{
+			{Provider: "opencode-go", BaseURL: zen.URL, APIKey: "k", Model: "deepseek-v4-flash"},
+			{Provider: "opencode-go", BaseURL: zen.URL, APIKey: "k", Model: "glm-5.2"},
+			{Provider: "saia", BaseURL: saia.URL, APIKey: "saia-key", Model: "glm-4.7"},
+		},
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"claude-saia-glm-4.7","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "saia-ok") {
+		t.Fatalf("expected the saia route to serve, got %s", rec.Body.String())
+	}
+	if len(saiaGot) == 0 || saiaGot[0] != "glm-4.7" {
+		t.Fatalf("saia upstream got %v, want first call model glm-4.7", saiaGot)
+	}
+}
+
+// TestSelectedNonPoolRouteRotatesOn429 verifies that when a selected non-pool
+// (index -1) route returns a temporary 429, the pool still rotates and a healthy
+// fallback serves the request — it must not wedge on the dead selected route.
+func TestSelectedNonPoolRouteRotatesOn429(t *testing.T) {
+	var saiaCalls, fbCalls int
+	saia := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		saiaCalls++
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
+	}))
+	defer saia.Close()
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fbCalls++
+		w.Write([]byte(`{"id":"r","choices":[{"message":{"role":"assistant","content":"fallback-ok"}}]}`))
+	}))
+	defer fb.Close()
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		w.Write([]byte(`{"error":{"message":"ratelimited","type":"rate_limit_error"}}`))
+	}))
+	defer zen.Close()
+
+	cfg := Config{
+		Provider: "opencode-go",
+		BaseURL:  zen.URL, // primary also 429s so only the fallback can serve
+		APIKey:   "k",
+		Model:    "deepseek-v4-flash",
+		Fallbacks: []Upstream{
+			{Provider: "openrouter", BaseURL: fb.URL, APIKey: "or", Model: "vendor/a:free"},
+		},
+		Upstreams: []Upstream{
+			{Provider: "opencode-go", BaseURL: zen.URL, APIKey: "k", Model: "deepseek-v4-flash"},
+			{Provider: "openrouter", BaseURL: fb.URL, APIKey: "or", Model: "vendor/a:free"},
+			{Provider: "saia", BaseURL: saia.URL, APIKey: "saia-key", Model: "glm-4.7"},
+		},
+	}
+	s := New(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"claude-saia-glm-4.7","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 after fallback, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "fallback-ok") {
+		t.Fatalf("expected fallback response, got %s", rec.Body.String())
+	}
+	if saiaCalls == 0 || fbCalls == 0 {
+		t.Fatalf("expected selected saia route (calls=%d) to fail and fallback (calls=%d) to serve", saiaCalls, fbCalls)
+	}
+}

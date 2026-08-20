@@ -725,12 +725,12 @@ func TestAll503RetriesThenReturns(t *testing.T) {
 	defer up.Close()
 
 	cfg := Config{
-		Provider:          "opencode-go",
-		BaseURL:           up.URL,
-		APIKey:            "k",
-		Model:             "deepseek-v4-flash",
-		RateLimitRetries:  1,
-		RateLimitBackoff:  time.Millisecond,
+		Provider:         "opencode-go",
+		BaseURL:          up.URL,
+		APIKey:           "k",
+		Model:            "deepseek-v4-flash",
+		RateLimitRetries: 1,
+		RateLimitBackoff: time.Millisecond,
 	}
 	s := New(cfg)
 	ctx, cancel := context.WithCancel(context.Background())

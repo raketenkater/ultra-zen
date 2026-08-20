@@ -231,9 +231,9 @@ func writeGatewayCacheFile(path string, data []byte) error {
 // replaces the project .claude/settings.json for this session, so if ultracode
 // and effortLevel are not emitted here, a project that opts in via its settings
 // file (or sets an effortLevel there) would launch without either. The effort
-// default is "max" (ultracode's full thinking budget); a user's explicit
-// --effort flag on the CLI wins because Args() only injects --effort when the
-// user didn't pass one.
+// default is "ultracode" (the build's maximum thinking budget); a user's
+// explicit --effort flag on the CLI wins because Args() only injects --effort
+// when the user didn't pass one.
 func SettingsJSON(hookCmd string) string {
 	settings := map[string]any{
 		"ultracode":    true,
@@ -254,9 +254,9 @@ func SettingsJSON(hookCmd string) string {
 }
 
 // defaultEffort is the session-wide effort level ultra-zen sets as the general
-// default (ultracode's full thinking budget). A user's explicit --effort flag
-// on the CLI wins over this injected setting.
-const defaultEffort = "max"
+// default ("ultracode" — the build's maximum thinking budget). A user's
+// explicit --effort flag on the CLI wins over this injected setting.
+const defaultEffort = "ultracode"
 
 // Args returns the claude arguments: the selected model, the inline --settings,
 // and any user-supplied passthrough args. The explicit --model makes ultra-zen
@@ -278,11 +278,11 @@ func Args(model, hookCmd string, userArgs []string) []string {
 	if !hasArg(userArgs, "--settings") {
 		out = append(out, "--settings", SettingsJSON(hookCmd))
 	}
-	// Default to the highest effort ("max") so a fresh ultra-zen session starts
-	// at full thinking budget — matching the "ultracode effort" launch intent.
-	// If the user already passed --effort, leave theirs alone.
+	// Default to the highest effort ("ultracode") so a fresh ultra-zen session
+	// starts at full thinking budget — matching the "ultracode effort" launch
+	// intent. If the user already passed --effort, leave theirs alone.
 	if !hasArg(userArgs, "--effort") {
-		out = append(out, "--effort", "max")
+		out = append(out, "--effort", "ultracode")
 	}
 	out = append(out, workflowPromptArgs(userArgs)...)
 	out = append(out, researchArgs(userArgs)...)

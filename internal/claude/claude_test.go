@@ -156,9 +156,9 @@ func TestEnvAutocompactWindowIgnoresInheritedPCT(t *testing.T) {
 }
 
 // TestSettingsJSONCarriesEffortDefault verifies the injected --settings payload
-// carries the ultracode flag AND the effortLevel general default, so a fresh
-// ultra-zen session always starts at full ultracode thinking budget even when
-// --settings replaces the project's settings.json.
+// carries the ultracode flag AND the effortLevel general default ("ultracode"),
+// so a fresh ultra-zen session always starts at full ultracode thinking budget
+// even when --settings replaces the project's settings.json.
 func TestSettingsJSONCarriesEffortDefault(t *testing.T) {
 	var payload map[string]any
 	if err := json.Unmarshal([]byte(SettingsJSON("bin workflow-hook")), &payload); err != nil {
@@ -167,8 +167,8 @@ func TestSettingsJSONCarriesEffortDefault(t *testing.T) {
 	if payload["ultracode"] != true {
 		t.Fatalf("ultracode = %v, want true", payload["ultracode"])
 	}
-	if got := payload["effortLevel"]; got != "max" {
-		t.Fatalf("effortLevel = %v, want max (ultracode default)", got)
+	if got := payload["effortLevel"]; got != "ultracode" {
+		t.Fatalf("effortLevel = %v, want ultracode", got)
 	}
 	// The Workflow stallMs hook must still be present.
 	hooks, _ := payload["hooks"].(map[string]any)
