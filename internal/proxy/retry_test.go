@@ -541,10 +541,11 @@ func TestErrorBodyWith200Rotates(t *testing.T) {
 	}
 }
 
-// TestDegenerate200IsRetiredAndReported verifies that an empty completion
-// (choices:null served with HTTP 200) retires the route permanently, reports
-// it via OnUnavailable, and rotates to the fallback.
-func TestDegenerate200IsRetiredAndReported(t *testing.T) {
+// TestDegenerate200TemporarilyRotates verifies that an empty completion
+// (choices:null served with HTTP 200) rotates to the fallback for this request
+// but retries the selected model on the next turn. A transient empty response
+// must not poison the proxy until ultra-zen is restarted.
+func TestDegenerate200TemporarilyRotates(t *testing.T) {
 	var emptyCalls int
 	empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		emptyCalls++
@@ -583,18 +584,18 @@ func TestDegenerate200IsRetiredAndReported(t *testing.T) {
 			t.Fatalf("request %d status = %d", i+1, resp.StatusCode)
 		}
 	}
-	if emptyCalls != 1 {
-		t.Fatalf("dud route called %d times, want 1 (retired after first failure)", emptyCalls)
+	if emptyCalls != 2 {
+		t.Fatalf("selected route called %d times, want 2 (retried on next turn)", emptyCalls)
 	}
-	if unavailable.Provider != "modelscope" || unavailable.Model != "dud-model" {
-		t.Fatalf("unavailable callback = %+v", unavailable)
+	if unavailable.Provider != "" || unavailable.Model != "" {
+		t.Fatalf("transient empty response invoked unavailable callback: %+v", unavailable)
 	}
 }
 
 // TestClassifySSEKeepAliveIsNotDegenerate reproduces the field bug that killed
 // healthy free models: a gateway opening a stream with ": keep-alive" comments
 // then a usage-only chunk carrying an empty "choices" must be classified bodyOK,
-// not bodyDegenerate (which would permanently retire the route via OnUnavailable).
+// not bodyDegenerate (which would unnecessarily rotate away from the route).
 func TestClassifySSEKeepAliveIsNotDegenerate(t *testing.T) {
 	cases := []struct {
 		name string

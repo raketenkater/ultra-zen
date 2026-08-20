@@ -89,6 +89,64 @@ func TestTruncateToContextNoOpWhenFits(t *testing.T) {
 	}
 }
 
+// TestTruncateToContextReducesOutputBeforeHistory verifies that Claude Code's
+// oversized max_tokens request consumes the remaining window before any
+// conversation messages are discarded.
+func TestTruncateToContextReducesOutputBeforeHistory(t *testing.T) {
+	req := &openAIRequest{
+		MaxTokens: 8000,
+		Messages: []openAIMessage{
+			{Role: "system", Content: "keep the whole conversation"},
+			{Role: "user", Content: strings.Repeat("context ", 1500)},
+			{Role: "assistant", Content: "still relevant"},
+			{Role: "user", Content: "new question"},
+		},
+	}
+	wantMessages := len(req.Messages)
+	note := req.truncateToContext(10_000, req.MaxTokens)
+	if !strings.Contains(note, "reduced max_tokens") {
+		t.Fatalf("note = %q, want output-budget reduction", note)
+	}
+	if len(req.Messages) != wantMessages {
+		t.Fatalf("history was discarded: got %d messages, want %d", len(req.Messages), wantMessages)
+	}
+	if req.MaxTokens >= 8000 || req.MaxTokens < 1024 {
+		t.Fatalf("max_tokens = %d, want a useful reduced allowance", req.MaxTokens)
+	}
+}
+
+// TestTruncateToContextKeepsToolTurnsAtomic verifies emergency trimming never
+// leaves a tool result without the assistant tool_call that announced it.
+func TestTruncateToContextKeepsToolTurnsAtomic(t *testing.T) {
+	req := &openAIRequest{
+		MaxTokens: 4000,
+		Messages: []openAIMessage{
+			{Role: "system", Content: "system"},
+			{Role: "user", Content: "old task " + strings.Repeat("x", 7000)},
+			{Role: "assistant", ToolCalls: []openAITool{{
+				ID: "call_old", Type: "function",
+				Function: openAIToolFunc{Name: "read_file", Arguments: `{"path":"old"}`},
+			}}},
+			{Role: "tool", ToolCallID: "call_old", Content: strings.Repeat("result", 1400)},
+			{Role: "assistant", Content: "old answer"},
+			{Role: "user", Content: "newest question"},
+		},
+	}
+	note := req.truncateToContext(6000, req.MaxTokens)
+	if !strings.Contains(note, "complete old turn") {
+		t.Fatalf("note = %q, want complete-turn rescue", note)
+	}
+	if len(req.Messages) != 2 {
+		t.Fatalf("messages = %+v, want system + newest user only", req.Messages)
+	}
+	if req.Messages[0].Role != "system" || !strings.Contains(req.Messages[0].Content.(string), "context rescue") {
+		t.Fatalf("missing explicit rescue note: %+v", req.Messages[0])
+	}
+	if req.Messages[1].Role != "user" || req.Messages[1].Content != "newest question" {
+		t.Fatalf("newest turn not preserved: %+v", req.Messages[1])
+	}
+}
+
 func TestToOpenAIToolUseAndResult(t *testing.T) {
 	req := &anthropicRequest{
 		Model:     "claude-sonnet",

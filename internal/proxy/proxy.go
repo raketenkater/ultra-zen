@@ -377,14 +377,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if oreq.MaxTokens > maxOutputTokens || oreq.MaxTokens <= 0 {
 		oreq.MaxTokens = maxOutputTokens
 	}
-	// Rescue over-limit sessions: if the request's context would exceed the
-	// model's real window, trim the oldest messages so the turn (or a
-	// compaction) can go through instead of hard-failing with a 400. The
-	// window comes from the route's curated ContextLength.
-	if note := oreq.truncateToContext(primary.ContextLength, oreq.MaxTokens); note != "" {
-		log.Printf("ultra-zen proxy: %s for %s", note, primary.Model)
-	}
-
 	payload, resp, used, err := s.forwardWithRateLimit(r.Context(), primary, oreq)
 	if err != nil {
 		writeError(w, 502, "api_error", "gateway request failed: "+err.Error())
@@ -494,6 +486,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 	var lastPayload, lastBody []byte
 	var lastResp *http.Response
 	var lastUsed Upstream
+	var lastRequest *openAIRequest
 	var lastRetryAfter time.Duration
 	// lastCallErr records the most recent transport failure so the final return
 	// can surface a real 502 instead of the "every route exhausted" 429 when every
@@ -513,8 +506,16 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			if err := s.waitOpenRouterSlot(ctx, choice.BaseURL); err != nil {
 				return nil, nil, Upstream{}, err
 			}
-			oreq.Model = choice.Model
-			p, candidate, callErr := s.forwardTo(ctx, choice.Upstream, oreq)
+			// Fit a private copy to the route actually being attempted. Pool models
+			// can have different context windows; mutating the shared request for a
+			// small fallback would needlessly damage the prompt later sent to a
+			// larger route.
+			routeReq := oreq.clone()
+			routeReq.Model = choice.Model
+			if note := routeReq.truncateToContext(choice.ContextLength, routeReq.MaxTokens); note != "" {
+				log.Printf("ultra-zen proxy: %s for %s", note, choice.Model)
+			}
+			p, candidate, callErr := s.forwardTo(ctx, choice.Upstream, routeReq)
 			if callErr != nil {
 				// A transport failure (dial timeout, connection refused, TLS error)
 				// is a temporary endpoint outage, not a permanent request error.
@@ -522,7 +523,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 				// straight to Claude Code; if every route is down the outer loop
 				// retries with backoff and the last error is returned.
 				s.limitRoute(choice.index, false)
-				lastPayload, lastBody, lastResp, lastUsed = p, nil, nil, choice.Upstream
+				lastPayload, lastBody, lastResp, lastUsed, lastRequest = p, nil, nil, choice.Upstream, routeReq
 				lastCallErr = callErr
 				temporary = true
 				log.Printf("ultra-zen proxy: transport error on %s: %v; rotating", choice.Model, callErr)
@@ -554,11 +555,14 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 					candidate.Body.Close()
 					continue
 				case bodyDegenerate:
-					s.limitRoute(choice.index, true)
-					if s.cfg.OnUnavailable != nil {
-						s.cfg.OnUnavailable(choice.Upstream)
-					}
-					log.Printf("ultra-zen proxy: empty completion from %s; retiring route (%s)", choice.Model, truncate(string(prefix), 200))
+					// An empty HTTP-200 response is commonly a transient gateway/backend
+					// failure. Permanently retiring the selected model poisoned the rest
+					// of a long-running proxy process, while restarting ultra-zen made
+					// the exact same model and Claude session work again. Rotate for this
+					// request but retry the selected route on the next turn. Explicit
+					// access denials and exhausted allocations remain permanent below.
+					s.limitRoute(choice.index, false)
+					log.Printf("ultra-zen proxy: empty completion from %s; temporarily rotating (%s)", choice.Model, truncate(string(prefix), 200))
 					candidate.Body.Close()
 					continue
 				}
@@ -598,6 +602,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			}
 			if candidate.StatusCode != http.StatusTooManyRequests {
 				s.promoteRoute(choice.index)
+				*oreq = *routeReq
 				return p, candidate, choice.Upstream, nil
 			}
 
@@ -615,7 +620,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 				temporary = true
 			}
 			lastRetryAfter = parseRetryAfter(candidate.Header.Get("Retry-After"))
-			lastPayload, lastBody, lastResp, lastUsed = p, body, candidate, choice.Upstream
+			lastPayload, lastBody, lastResp, lastUsed, lastRequest = p, body, candidate, choice.Upstream, routeReq
 			kind := "temporary rate limit"
 			if accountExhausted {
 				kind = "OpenRouter daily free allowance exhausted"
@@ -643,6 +648,9 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 
 	if lastResp != nil {
 		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
+	}
+	if lastRequest != nil {
+		*oreq = *lastRequest
 	}
 	// Every route was unreachable (no HTTP response at all) — surface the actual
 	// transport error so handleMessages reports a 502, not a bogus "429 all models

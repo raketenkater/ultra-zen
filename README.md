@@ -429,7 +429,7 @@ The launcher sets:
 - `ANTHROPIC_BASE_URL` → the local proxy
 - `ANTHROPIC_AUTH_TOKEN=ultra-zen`, `ANTHROPIC_MODEL` + all tier vars → selected model
 - Watchdog/timeouts relaxed so a remote model never trips idle timers
-- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60` (compact early for smaller context windows)
+- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85` (compact before the proxy's emergency context rescue)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="ultra-zen-launch.png">
