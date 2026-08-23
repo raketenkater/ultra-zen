@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -29,7 +30,7 @@ type streamChunk struct {
 }
 
 type streamTool struct {
-	Index    int `json:"index"`
+	Index    int    `json:"index"`
 	ID       string `json:"id"`
 	Type     string `json:"type"`
 	Function struct {
@@ -40,17 +41,17 @@ type streamTool struct {
 
 // streamState tracks the Anthropic event sequence we are emitting.
 type streamState struct {
-	w           http.ResponseWriter
-	flusher     http.Flusher
-	model       string
-	started     bool
-	blockIndex  int
-	textOpen    bool
+	w          http.ResponseWriter
+	flusher    http.Flusher
+	model      string
+	started    bool
+	blockIndex int
+	textOpen   bool
 	// toolBlocks/toolStarted are keyed by tool id (not openai index): some
 	// providers reuse index 0 for each new tool call, so keying by index would
 	// collapse a second subagent spawn into the first block and the agent
 	// overview would show one agent instead of many.
-	toolBlocks  map[string]int  // tool id -> anthropic block index
+	toolBlocks  map[string]int // tool id -> anthropic block index
 	toolStarted map[string]bool
 	// idForIndex remembers the last tool id announced at each OpenAI stream
 	// index. The standard OpenAI shape sends id+name once and then bare
@@ -60,14 +61,21 @@ type streamState struct {
 	// toolOrder is toolBlocks' keys in creation order, so content_block_stop
 	// events are emitted deterministically in block-index order.
 	toolOrder []string
-	finish      string
-	output      int
+	finish    string
+	output    int
+	// sawDone tracks whether an explicit [DONE] sentinel was consumed from
+	// the upstream stream. Its absence at end-of-input, combined with an empty
+	// finish reason, distinguishes a genuine upstream completion from a
+	// vanished connection (gateway cut, LB timeout) so the latter can be
+	// surfaced as an error instead of a half-finished answer masquerading as
+	// "end_turn".
+	sawDone bool
 	// reasoning buffers reasoning_content deltas. Reasoning models (glm-5.2,
 	// deepseek, kimi) may emit their whole answer in reasoning_content with
 	// content staying empty. We hold it and only surface it at stream end if no
 	// real content arrived — mirroring the non-stream path, where content wins
 	// and reasoning is the fallback so Claude Code is never handed an empty turn.
-	reasoning strings.Builder
+	reasoning   strings.Builder
 	emittedText bool
 }
 
@@ -92,11 +100,17 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			st.sawDone = true
 			st.finishStream()
 			return nil
 		}
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			// A malformed data: line means content the provider sent is being
+			// dropped on the floor — the same silent-truncation family as an
+			// unterminated stream. Surface it in the log instead of swallowing
+			// it, so a provider emitting bad frames is diagnosable.
+			log.Printf("ultra-zen proxy stream: skipping malformed chunk: %v", err)
 			continue
 		}
 		if chunk.Usage != nil {
@@ -123,10 +137,32 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		st.abortStream(fmt.Sprintf("upstream connection failed mid-stream: %v", err))
 		return err
+	}
+	// A clean EOF that carries neither the [DONE] sentinel nor any finish_reason
+	// chunk means the upstream vanished mid-generation (gateway cut, LB idle
+	// timeout) rather than completing. Emit an Anthropic error event so Claude
+	// Code treats the turn as failed and retries, instead of accepting a
+	// half-written answer as a finished "end_turn".
+	if !st.sawDone && st.finish == "" {
+		st.abortStream("upstream stream ended prematurely (no finish_reason, no [DONE])")
+		return io.ErrUnexpectedEOF
 	}
 	st.finishStream()
 	return nil
+}
+
+// abortStream terminates a broken relay with an Anthropic SSE error event.
+// Headers and possibly content deltas have already been written, so the HTTP
+// status cannot change; the error event is the only channel left to tell the
+// client the turn failed. message_stop is deliberately omitted — the message
+// never completed, and emitting it would let the SDK accept the truncation.
+func (s *streamState) abortStream(msg string) {
+	s.writeEvent("error", map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": "api_error", "message": msg},
+	})
 }
 
 func (s *streamState) ensureStarted(chunk *streamChunk) {

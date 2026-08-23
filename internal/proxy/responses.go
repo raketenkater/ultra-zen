@@ -260,7 +260,7 @@ func newScanner(r io.Reader) *bufio.Scanner {
 	return sc
 }
 
-func responsesSSEStream(body io.Reader) io.Reader {
+func responsesSSEStream(ctx context.Context, body io.Reader) io.Reader {
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
@@ -283,8 +283,23 @@ func responsesSSEStream(body io.Reader) io.Reader {
 				if err != nil {
 					continue
 				}
-				_, _ = pw.Write([]byte("data: " + string(raw) + "\n\n"))
+				select {
+				case <-ctx.Done():
+					return // relay abandoned downstream; stop feeding a dead pipe
+				default:
+				}
+				if _, err := pw.Write([]byte("data: " + string(raw) + "\n\n")); err != nil {
+					return // reader gone (e.g. scanner aborted past 8MB line)
+				}
 			}
+		}
+		if err := sc.Err(); err != nil {
+			// Upstream broke mid-stream: propagate the error through the pipe so
+			// streamTranslate aborts with an error event. Writing [DONE] here —
+			// as this path once did unconditionally — would mask every mid-stream
+			// cut as a clean completion and Claude Code would accept a half answer.
+			pw.CloseWithError(err)
+			return
 		}
 		// Terminate the chat-completions stream like any gateway would.
 		_, _ = io.WriteString(pw, "data: [DONE]\n\n")

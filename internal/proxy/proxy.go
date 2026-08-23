@@ -468,7 +468,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if areq.Stream {
-		s.streamResponse(w, resp, areq.Model, used.Kind)
+		s.streamResponse(w, r, resp, areq.Model, used.Kind)
 		return
 	}
 	s.nonStreamResponse(w, resp, areq.Model, used.Kind)
@@ -479,6 +479,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 type routeChoice struct {
 	Upstream
 	index int
+	// explicit marks a route chosen by an authoritative /model selection. Such a
+	// route bypasses the exhaustion/denial gate so a deliberate user pick is
+	// always attempted first, even if its pool slot was previously exhausted.
+	explicit bool
 }
 
 // forwardWithRateLimit sends a request through the current route and rotates
@@ -516,7 +520,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 		}
 		temporary := false
 		for _, choice := range routes {
-			if s.routeExhausted(choice.index) {
+			if !choice.explicit && s.routeExhausted(choice.index) {
 				continue
 			}
 			if err := s.waitOpenRouterSlot(ctx, choice.BaseURL); err != nil {
@@ -704,6 +708,13 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 
 	out := make([]routeChoice, 0, len(pool))
 	seen := make(map[int]bool, len(pool))
+	// An explicit /model selection (primary != the configured launch model) is
+	// authoritative and must be attempted first, even if its pool route was
+	// previously marked exhausted (FreeUsageLimitError opened the provider
+	// circuit) or denied (403). Auto-rotation exhaustion governs only the
+	// automatic pool and must never override a deliberate user pick.
+	explicit := !sameUpstream(primary, s.cfg.primaryUpstream())
+
 	// The request's primary (the /model-selected route when one is active)
 	// goes first, deduped against the pool so the same gateway isn't tried
 	// twice. Everything else is walked in activeRoute rotation order.
@@ -714,19 +725,34 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 			break
 		}
 	}
-	if primIdx >= 0 && !s.exhaustedRoute[primIdx] {
-		out = append(out, routeChoice{Upstream: primary, index: primIdx})
-		seen[primIdx] = true
-	} else if primIdx < 0 {
-		// The /model-selected route is a full-catalog model that is NOT in the
-		// rotation pool (its provider was loaded for advertising but the pool was
-		// capped). Attempt it first anyway — index -1 is safe: limitRoute and
-		// promoteRoute no-op on negatives and routeExhausted(-1) is false, so it
-		// is tried once and then the pool rotates. A route permanently retired
-		// this session (retireRoute) is skipped so it is not re-tried first on
-		// every request.
-		if !s.selectableDead(primary) {
-			out = append(out, routeChoice{Upstream: primary, index: -1})
+	if explicit {
+		if primIdx >= 0 {
+			// Attempt the explicit pool route FIRST even if
+			// exhaustedRoute[primIdx] is true — the user deliberately picked it.
+			out = append(out, routeChoice{Upstream: primary, index: primIdx, explicit: true})
+			seen[primIdx] = true
+		} else {
+			// A full-catalog model outside the pool: attempt once, bypassing
+			// selectableDead. index -1 is safe: limitRoute/promoteRoute no-op on
+			// negatives and routeExhausted(-1) is false, so it is tried once and
+			// then the pool rotates.
+			out = append(out, routeChoice{Upstream: primary, index: -1, explicit: true})
+		}
+	} else {
+		if primIdx >= 0 && !s.exhaustedRoute[primIdx] {
+			out = append(out, routeChoice{Upstream: primary, index: primIdx})
+			seen[primIdx] = true
+		} else if primIdx < 0 {
+			// The /model-selected route is a full-catalog model that is NOT in the
+			// rotation pool (its provider was loaded for advertising but the pool was
+			// capped). Attempt it first anyway — index -1 is safe: limitRoute and
+			// promoteRoute no-op on negatives and routeExhausted(-1) is false, so it
+			// is tried once and then the pool rotates. A route permanently retired
+			// this session (retireRoute) is skipped so it is not re-tried first on
+			// every request.
+			if !s.selectableDead(primary) {
+				out = append(out, routeChoice{Upstream: primary, index: -1})
+			}
 		}
 	}
 	for offset := 0; offset < len(pool); offset++ {
@@ -1070,7 +1096,11 @@ func truncate(s string, n int) string {
 // inspected without truncation. Overwrites on each 400.
 func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
 	dir := os.Getenv("HOME") + "/.cache/ultra-zen"
-	_ = os.MkdirAll(dir, 0755)
+	// 0700/0600: the dump holds the full request payload — the entire
+	// conversation, including any file contents Claude Code read into context.
+	// World-readable modes would expose it to every local user, which matters
+	// on the shared-key multi-user setup this tool supports.
+	_ = os.MkdirAll(dir, 0700)
 	dump := struct {
 		Model       string          `json:"model"`
 		Upstream    string          `json:"upstream"`
@@ -1089,7 +1119,7 @@ func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
 	_ = json.Unmarshal(payload, &p)
 	dump.MaxTokens = p.MaxTokens
 	b, _ := json.MarshalIndent(dump, "", "  ")
-	_ = os.WriteFile(dir+"/last-400.json", b, 0644)
+	_ = os.WriteFile(dir+"/last-400.json", b, 0600)
 }
 
 // nonStreamResponse converts a non-streaming upstream response to Anthropic.
@@ -1212,14 +1242,14 @@ func chunksToOpenAIResponse(chunks []chatChunk) openAIResponse {
 // Responses-API kind the upstream body is a Responses SSE stream that is first
 // translated into chat-completions chunks, which streamTranslate then converts
 // to the Anthropic SSE stream Claude Code reads.
-func (s *Server) streamResponse(w http.ResponseWriter, resp *http.Response, model, kind string) {
+func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, model, kind string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	var body io.Reader = resp.Body
 	if kind == UpstreamResponses {
-		body = responsesSSEStream(resp.Body)
+		body = responsesSSEStream(r.Context(), resp.Body)
 	}
 	if err := streamTranslate(w, body, model); err != nil {
 		log.Printf("ultra-zen proxy stream: %v", err)

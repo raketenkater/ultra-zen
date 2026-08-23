@@ -1083,3 +1083,106 @@ func TestSelectedNonPoolRouteRotatesOn429(t *testing.T) {
 		t.Fatalf("expected selected saia route (calls=%d) to fail and fallback (calls=%d) to serve", saiaCalls, fbCalls)
 	}
 }
+
+// TestModelSwitchHonorsExplicitPick is a permanent regression test for the bug
+// where a /model switch to a different model on the SAME provider was silently
+// ignored after the launch primary free model was exhausted.
+//
+// Sequence:
+//  1. Send one request with model="modelA". zenSrv returns HTTP 429 with a
+//     FreeUsageLimitError body, which triggers exhaustProviderRoutes(). Because
+//     modelB shares the same provider family + site + API key as modelA,
+//     exhaustProviderRoutes marks BOTH the modelA route (idx0) and the modelB
+//     route (idx1) as exhausted.
+//  2. Send a second request with model="modelB" (simulating the user's /model
+//     switch to B). modelB is healthy (zenSrv returns 200) and MUST serve it.
+//
+// The explicit /model selection is authoritative: routeOrder must attempt the
+// chosen route first even though it was previously marked exhausted.
+func TestModelSwitchHonorsExplicitPick(t *testing.T) {
+	var modelACalls, modelBCalls int
+
+	zenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		switch req.Model {
+		case "modelA":
+			// Free daily allocation exhausted for model A.
+			modelACalls++
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Free usage limit reached for today"}}`))
+		case "modelB":
+			// model B is healthy and should be usable after a /model switch.
+			modelBCalls++
+			w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok-from-b"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"message":"unexpected model"}}`))
+		}
+	}))
+	defer zenSrv.Close()
+
+	srv := New(Config{
+		Provider: "opencode-go",
+		BaseURL:  zenSrv.URL,
+		APIKey:   "zen-key",
+		Model:    "modelA",
+		Fallbacks: []Upstream{{
+			Provider: "opencode-go",
+			BaseURL:  zenSrv.URL,
+			APIKey:   "zen-key",
+			Model:    "modelB",
+		}},
+		Port: 0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Request 1: exhaust model A (FreeUsageLimitError marks both idx0 and idx1).
+	req1Body := `{"model":"modelA","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	resp1, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(req1Body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1.Body.Close()
+
+	if modelACalls == 0 {
+		t.Fatalf("modelA upstream was never called on the first request")
+	}
+
+	// Request 2: simulate the user's /model switch to model B.
+	modelACallsBefore := modelACalls
+	modelBCallsBefore := modelBCalls
+	req2Body := `{"model":"modelB","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	resp2, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(req2Body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("second request (model switch to modelB) returned %d, want 200; body=%s",
+			resp2.StatusCode, readClamped(resp2))
+	}
+	if modelBCalls <= modelBCallsBefore {
+		t.Fatalf("modelB upstream was not called for the second request (modelBCalls=%d before=%d); the /model switch was silently ignored",
+			modelBCalls, modelBCallsBefore)
+	}
+	if modelACalls != modelACallsBefore {
+		t.Fatalf("modelA upstream was called again on the second request (modelACalls=%d before=%d); expected the explicit modelB pick to be tried first instead of modelA",
+			modelACalls, modelACallsBefore)
+	}
+}
+
+// readClamped reads at most a small prefix of the response body for error
+// reporting without consuming a streamed body.
+func readClamped(resp *http.Response) string {
+	buf := make([]byte, 512)
+	n, _ := resp.Body.Read(buf)
+	return string(buf[:n])
+}

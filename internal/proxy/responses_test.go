@@ -127,7 +127,7 @@ func TestResponsesEventToChatChunks(t *testing.T) {
 
 func TestResponsesSSEStreamTranslation(t *testing.T) {
 	sse := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n"
-	out := responsesSSEStream(strings.NewReader(sse))
+	out := responsesSSEStream(t.Context(), strings.NewReader(sse))
 	data, _ := io.ReadAll(out)
 	s := string(data)
 	if !strings.Contains(s, `"content":"Hello"`) {
