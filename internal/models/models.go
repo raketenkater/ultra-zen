@@ -492,6 +492,101 @@ func ListOpenRouterAll(httpClient *http.Client, apiKey string) ([]Model, error) 
 	return FilterUnavailable("openrouter", out), nil
 }
 
+// ListOpenRouterRanked fetches every OpenRouter model and orders them by real
+// usage (total tokens over the trailing window) using the OpenRouter
+// rankings-daily dataset. Models absent from the rankings fall to the end,
+// sorted alphabetically. The returned slice is the full catalog in usage order;
+// callers cap it (e.g. TopN) for a default view. Requires an API key.
+func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	entries, err := fetchEntries(httpClient, OpenRouterBase, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("openrouter: %w", err)
+	}
+	// Base models from /models.
+	var out []Model
+	for _, e := range entries {
+		out = append(out, Model{
+			ID:            e.ID,
+			Name:          pretty(e.ID),
+			Base:          OpenRouterBase,
+			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
+			ContextLength: e.ContextLength,
+		})
+	}
+	rank := fetchOpenRouterRanking(httpClient, apiKey)
+	// Stable sort: ranked models first (by usage desc), then unranked (alpha).
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := rank[out[i].ID], rank[out[j].ID]
+		if ri.tokens != rj.tokens {
+			return ri.tokens > rj.tokens // higher usage first
+		}
+		return out[i].Name < out[j].Name
+	})
+	return FilterUnavailable("openrouter", out), nil
+}
+
+// rankingEntry holds an aggregated usage rank for one model.
+type rankingEntry struct {
+	tokens int64
+}
+
+// fetchOpenRouterRanking queries /datasets/rankings-daily for the trailing
+// window and aggregates total_tokens per model_permaslug. Transport errors or
+// an empty dataset return an empty map, leaving models unranked (alpha order).
+func fetchOpenRouterRanking(httpClient *http.Client, apiKey string) map[string]rankingEntry {
+	out := map[string]rankingEntry{}
+	now := time.Now()
+	start := now.AddDate(0, 0, -7).UTC().Format("2006-01-02")
+	end := now.UTC().Format("2006-01-02")
+	url := fmt.Sprintf("%s/datasets/rankings-daily?start_date=%s&end_date=%s", OpenRouterBase, start, end)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return out
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return out
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return out
+	}
+	var payload struct {
+		Data []struct {
+			Model string `json:"model_permaslug"`
+			Total string `json:"total_tokens"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return out
+	}
+	for _, row := range payload.Data {
+		if row.Model == "" {
+			continue
+		}
+		var t int64
+		fmt.Sscanf(strings.TrimSpace(row.Total), "%d", &t)
+		e := out[row.Model]
+		e.tokens += t
+		out[row.Model] = e
+	}
+	return out
+}
+
+// TopN returns at most the first n models from a list. Used to cap the default
+// OpenRouter picker view to the most-used models.
+func TopN(ms []Model, n int) []Model {
+	if n <= 0 || len(ms) <= n {
+		return ms
+	}
+	return ms[:n]
+}
+
 // ListZenAll fetches BOTH the opencode-go (paid) tier and the main tier
 // (free + any non-free main models), unlike List/ListZenFree which restrict to
 // free models. Go-tier entries are Free=false; main entries are Free when their

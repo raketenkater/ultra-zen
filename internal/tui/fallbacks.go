@@ -337,7 +337,13 @@ func loadProvider(provider string, showAll bool) fallbackLoaded {
 		if showAll {
 			list, err = models.ListOpenRouterAll(client, key)
 		} else {
-			list, err = models.ListOpenRouter(client, key)
+			// Default: most-used OpenRouter models (real usage ranking), capped
+			// at the top 100 so the picker stays usable.
+			var ranked []models.Model
+			ranked, err = models.ListOpenRouterRanked(client, key)
+			if err == nil {
+				list = models.TopN(ranked, 100)
+			}
 		}
 	case "opencode-go":
 		if key == "" {

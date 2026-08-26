@@ -399,7 +399,7 @@ func main() {
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
-		allModels     = flag.Bool("all-models", true, "expose every model (paid+free) from every provider, organized by provider with free/paid sections (default true; pass -all-models=false for free-only)")
+		allModels     = flag.Bool("all-models", false, "expose EVERY model (paid+free) from every provider; default shows the top 100 most-used OpenRouter models (by real usage) for a usable picker")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
 		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")
@@ -622,7 +622,13 @@ func main() {
 		if *allModels {
 			list, err = models.ListOpenRouterAll(httpClient, key)
 		} else {
-			list, err = models.ListOpenRouter(httpClient, key)
+			// Default: the most-used OpenRouter models (real usage ranking),
+			// capped at the top 100 so the picker stays usable.
+			var ranked []models.Model
+			ranked, err = models.ListOpenRouterRanked(httpClient, key)
+			if err == nil {
+				list = models.TopN(ranked, 100)
+			}
 		}
 		if err != nil {
 			die(err)
