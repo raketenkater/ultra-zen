@@ -104,6 +104,11 @@ type Model struct {
 	Base          string // gateway base URL this model lives on
 	Free          bool   // whether the model is a *-free variant
 	ContextLength int    // maximum context length in tokens (0 = unknown)
+	// CanonicalSlug is the model's canonical_slug from the gateway /models
+	// endpoint (e.g. "deepseek/deepseek-v4-flash-20260731"). It is undated for
+	// some models and dated for others; use normalizeSlug to match it against
+	// ranking permaslugs. Empty when the gateway does not report it.
+	CanonicalSlug string
 }
 
 // List fetches all usable models for the given API key: every model on the
@@ -166,7 +171,33 @@ func ListZenFree(httpClient *http.Client, apiKey string) ([]Model, error) {
 type apiModelEntry struct {
 	ID            string `json:"id"`
 	ContextLength int    `json:"context_length"`
+	CanonicalSlug string `json:"canonical_slug"`
 }
+
+// normalizeSlug strips a trailing -YYYYMMDD date suffix from a model slug so
+// that the dated canonical_slugs used in the rankings-daily dataset
+// (e.g. "deepseek/deepseek-v4-flash-20260731") and the undated /models ids
+// (e.g. "deepseek/deepseek-v4-flash") can be matched. It also trims whitespace.
+// It does NOT touch the existing ":free"/":batch" variant markers.
+func normalizeSlug(s string) string {
+	s = strings.TrimSpace(s)
+	if n := len(s); n > 9 && s[n-9] == '-' {
+		// candidate suffix is exactly 8 ASCII digits
+		suffix := s[n-8:]
+		ok := true
+		for i := 0; i < 8; i++ {
+			if suffix[i] < '0' || suffix[i] > '9' {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			s = s[:n-9]
+		}
+	}
+	return s
+}
+
 
 // knownContextWindows supplies the real context window for models whose
 // gateway's /models endpoint does NOT report one. Verified live: the opencode
@@ -484,6 +515,7 @@ func ListOpenRouterAll(httpClient *http.Client, apiKey string) ([]Model, error) 
 			Base:          OpenRouterBase,
 			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
 			ContextLength: e.ContextLength,
+			CanonicalSlug: e.CanonicalSlug,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -514,12 +546,30 @@ func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, erro
 			Base:          OpenRouterBase,
 			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
 			ContextLength: e.ContextLength,
+			CanonicalSlug: e.CanonicalSlug,
 		})
 	}
 	rank := fetchOpenRouterRanking(httpClient, apiKey)
+	// rankOf resolves a usage rank for a model. The rankings-daily dataset keys
+	// rows by model_permaslug, which for some models is the bare /models id and
+	// for others the dated canonical_slug (e.g. "...-20260731"). Normalize both
+	// sides by stripping the trailing -YYYYMMDD date before matching so dated
+	// high-volume models rank by their real volume instead of falling to the
+	// bottom as unranked.
+	rankOf := func(m Model) rankingEntry {
+		if e, ok := rank[normalizeSlug(m.ID)]; ok {
+			return e
+		}
+		if m.CanonicalSlug != "" {
+			if e, ok := rank[normalizeSlug(m.CanonicalSlug)]; ok {
+				return e
+			}
+		}
+		return rankingEntry{}
+	}
 	// Stable sort: ranked models first (by usage desc), then unranked (alpha).
 	sort.SliceStable(out, func(i, j int) bool {
-		ri, rj := rank[out[i].ID], rank[out[j].ID]
+		ri, rj := rankOf(out[i]), rankOf(out[j])
 		if ri.tokens != rj.tokens {
 			return ri.tokens > rj.tokens // higher usage first
 		}
@@ -539,6 +589,12 @@ type rankingEntry struct {
 // A short window keeps recent / latest-model usage dominant so old, high-volume
 // but deprecated models don't accumulate to the top. Transport errors or an
 // empty dataset return an empty map, leaving models unranked (alpha order).
+//
+// The ranking rows are keyed by model_permaslug, which uses dated
+// canonical_slugs for some models (e.g. "deepseek/deepseek-v4-flash-20260731")
+// and the bare id for others. We normalize each permaslug by stripping the
+// trailing -YYYYMMDD date so the resulting map keys align with the /models ids
+// and canonical_slugs used by ListOpenRouterRanked.
 func fetchOpenRouterRanking(httpClient *http.Client, apiKey string) map[string]rankingEntry {
 	out := map[string]rankingEntry{}
 	now := time.Now()
@@ -572,11 +628,17 @@ func fetchOpenRouterRanking(httpClient *http.Client, apiKey string) map[string]r
 		if row.Model == "" {
 			continue
 		}
+		// Normalize the permaslug: strip any trailing -YYYYMMDD date so it
+		// matches the undated /models ids and undated canonical_slugs.
+		key := normalizeSlug(row.Model)
+		if key == "" {
+			continue
+		}
 		var t int64
 		fmt.Sscanf(strings.TrimSpace(row.Total), "%d", &t)
-		e := out[row.Model]
+		e := out[key]
 		e.tokens += t
-		out[row.Model] = e
+		out[key] = e
 	}
 	return out
 }

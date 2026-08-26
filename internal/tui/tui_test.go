@@ -523,3 +523,67 @@ func TestWorkerSelectionSetsWorker(t *testing.T) {
 		t.Fatal("selecting a worker should quit the picker (return tea.Quit)")
 	}
 }
+
+// TestStartScreenGroupsModelsByProvider verifies the picker emits collapsible
+// group headers (groupHeaderItem) so models read as categorized sections
+// rather than one flat list, and that the OpenRouter group is titled "Most
+// used" while secondary providers keep their friendly subtitle.
+func TestStartScreenGroupsModelsByProvider(t *testing.T) {
+	m := newCatalogTestModel()
+	if _, ok := m.list.Items()[0].(groupHeaderItem); ok {
+		t.Fatal("first item must not be a group header (cycle first)")
+	}
+	var headers []groupHeaderItem
+	for _, item := range m.list.Items() {
+		if h, ok := item.(groupHeaderItem); ok {
+			headers = append(headers, h)
+		}
+	}
+	if len(headers) == 0 {
+		t.Fatal("start screen has no group headers — models are not categorized")
+	}
+	var sawZen, sawMostUsed bool
+	for _, h := range headers {
+		switch h.label {
+		case "opencode Zen":
+			sawZen = true
+		case "Most used":
+			sawMostUsed = true
+		}
+	}
+	if !sawZen {
+		t.Error("missing 'opencode Zen' group header")
+	}
+	if !sawMostUsed {
+		t.Error("missing 'Most used' (OpenRouter) group header")
+	}
+}
+
+// TestGroupHeadersAreNotSelectable verifies that landing the cursor on a
+// groupHeaderItem never chooses it as a model: Enter skips to the next real
+// row, and ensureSelectable keeps the cursor off headers during navigation.
+func TestGroupHeadersAreNotSelectable(t *testing.T) {
+	m := newCatalogTestModel()
+	hdrIdx := -1
+	for i, item := range m.list.Items() {
+		if _, ok := item.(groupHeaderItem); ok {
+			hdrIdx = i
+			break
+		}
+	}
+	if hdrIdx < 0 {
+		t.Fatal("no group header to test")
+	}
+	m.list.Select(hdrIdx)
+	navd, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	nm := navd.(model)
+	if _, ok := nm.list.SelectedItem().(groupHeaderItem); ok {
+		t.Fatal("cursor landed on a group header after navigation")
+	}
+	m.list.Select(hdrIdx)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.choice != "" || mm.choiceVia != "" || mm.quit {
+		t.Fatalf("header Enter produced a choice: choice=%q via=%q quit=%v", mm.choice, mm.choiceVia, mm.quit)
+	}
+}

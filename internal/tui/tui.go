@@ -7,10 +7,12 @@ package tui
 
 import (
 	"fmt"
+	"io"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
@@ -23,7 +25,77 @@ var (
 	// status banner above the model list. It is informational, never selectable,
 	// so it can never be mistaken for a model.
 	usageBannerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Italic(true)
+	// groupHeaderStyle renders a collapsible-style category banner above a
+	// provider's model rows: bold accent label with a count badge, so the picker
+	// reads as grouped sections rather than one undifferentiated scroll.
+	groupHeaderStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("#C8B5FF")).
+				Background(lipgloss.Color("#2A2140")).
+				Padding(0, 1)
+	// freeTagStyle / paidTagStyle add a subtle colored tier marker to a model
+	// row's description so free vs paid stays readable at a glance without
+	// being noisy. Free = green, paid = muted.
+	freeTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#3FB950"))
+	paidTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B6B6B"))
 )
+
+// pickerDelegate renders the start-screen list like bubbles' DefaultDelegate,
+// but (a) emits descriptions verbatim so the colored free/paid tier tags keep
+// their ANSI, and (b) renders groupHeaderItem rows as a single styled banner
+// with no selection chrome. It implements list.ItemDelegate.
+type pickerDelegate struct {
+	list.DefaultDelegate
+}
+
+func (d pickerDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	if header, ok := listItem.(groupHeaderItem); ok {
+		fmt.Fprintf(w, "%s", header.Title())
+		return
+	}
+	var (
+		title, desc string
+		s           = &d.Styles
+	)
+	if i, ok := listItem.(list.DefaultItem); ok {
+		title = i.Title()
+		desc = i.Description()
+	} else {
+		return
+	}
+	if m.Width() <= 0 {
+		return
+	}
+	textwidth := m.Width() - s.NormalTitle.GetPaddingLeft() - s.NormalTitle.GetPaddingRight()
+	isSelected := index == m.Index()
+	emptyFilter := m.FilterState() == list.Filtering && m.FilterValue() == ""
+	if emptyFilter {
+		title = s.DimmedTitle.Render(title)
+	} else if isSelected && m.FilterState() != list.Filtering {
+		title = s.SelectedTitle.Render(title)
+	} else {
+		title = s.NormalTitle.Render(title)
+	}
+	title = ansiTruncate(title, textwidth)
+	// The description is emitted verbatim (NOT wrapped in a delegate style): its
+	// inner ANSI — the colored free/paid tier tag — must survive, and the muted
+	// styling is already baked into Description() itself.
+	desc = ansiTruncate(desc, textwidth)
+	if d.ShowDescription {
+		fmt.Fprintf(w, "%s\n%s", title, desc)
+		return
+	}
+	fmt.Fprintf(w, "%s", title)
+}
+
+// ansiTruncate truncates a (possibly ANSI-styled) string to textwidth display
+// columns, preserving embedded styling.
+func ansiTruncate(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	return ansi.Truncate(s, width, "…")
+}
 
 // modelItem is a single model row in the orchestrator/worker lists.
 type modelItem struct {
@@ -61,30 +133,37 @@ func (i modelItem) Description() string {
 	var tier string
 	switch i.m.Base {
 	case baseOpenRouter:
-		tier = "OpenRouter free"
+		tier = "OpenRouter"
 	case baseModelScope:
-		tier = "ModelScope free"
+		tier = "ModelScope"
 	case baseGroq:
-		tier = "Groq free"
+		tier = "Groq"
 	case baseCerebras:
-		tier = "Cerebras free"
+		tier = "Cerebras"
 	case baseHuggingFace:
-		tier = "HuggingFace free"
+		tier = "HuggingFace"
 	case baseCohere:
-		tier = "Cohere free"
+		tier = "Cohere"
 	case models.CodexSubBase:
 		tier = "ChatGPT subscription"
 	default:
 		if i.m.Free {
-			tier = "zen free tier"
+			tier = "zen free"
 		} else {
-			tier = "opencode-go tier"
+			tier = "opencode-go"
 		}
 	}
 	if i.m.ContextLength > 0 {
 		tier += fmt.Sprintf(" · %dk ctx", i.m.ContextLength/1024)
 	}
-	return tier
+	// A subtle colored tier tag (free = green, paid = muted) so the free/paid
+	// split stays visible at a glance. The delegate renders this description
+	// verbatim, preserving the inner ANSI.
+	tag := paidTagStyle.Render("paid")
+	if i.m.Free {
+		tag = freeTagStyle.Render("free")
+	}
+	return tag + mutedStyle.Render("  "+tier)
 }
 func (i modelItem) FilterValue() string { return i.m.ID }
 
@@ -147,16 +226,17 @@ func (i providerModelItem) Title() string {
 	return title
 }
 func (i providerModelItem) Description() string {
-	tier := "model"
+	// A subtle colored tier tag (free = green, paid = muted) so the free/paid
+	// split stays visible at a glance; the delegate renders verbatim, keeping
+	// the inner ANSI.
+	tag := paidTagStyle.Render("paid")
 	if i.model.Free {
-		tier = "free"
-	} else {
-		tier = "paid"
+		tag = freeTagStyle.Render("free")
 	}
 	if i.provider == "codex-sub" {
-		return "ChatGPT subscription · auto-detected from the codex CLI login"
+		return tag + mutedStyle.Render("  ChatGPT subscription · auto-detected from the codex CLI login")
 	}
-	return i.provider + " " + tier + " · provider discovered automatically"
+	return tag + mutedStyle.Render("  "+i.provider+" · provider discovered automatically")
 }
 func (i providerModelItem) FilterValue() string {
 	return i.provider + " " + i.model.ID
@@ -222,6 +302,22 @@ func (i usageStatusItem) Description() string {
 }
 func (i usageStatusItem) FilterValue() string { return "usage credits remaining providers" }
 
+// groupHeaderItem is a non-selectable category banner on the start screen that
+// labels a block of model rows belonging to one provider (e.g. "OpenRouter · 100").
+// It is rendered with groupHeaderStyle and is skipped on Enter (see Update):
+// landing the cursor on one moves to the next real row, so headers never get
+// mistaken for models and never block selection.
+type groupHeaderItem struct {
+	label string // e.g. "OpenRouter" or "Most used"
+	count int
+}
+
+func (i groupHeaderItem) Title() string {
+	return groupHeaderStyle.Render(fmt.Sprintf("%s · %d", i.label, i.count))
+}
+func (i groupHeaderItem) Description() string { return "" }
+func (i groupHeaderItem) FilterValue() string { return "" }
+
 func (i comboItem) Title() string {
 	if i.manual {
 		return "Pick models manually →"
@@ -273,27 +369,27 @@ const (
 )
 
 type model struct {
-	list      list.Model
-	all       []models.Model // for rebuilding lists between steps
-	choice    string
-	provider  string
-	choiceVia string
-	worker    string
-	resumeID  string
-	quit      bool
-	subtitle  string
-	step      step
-	hasCombos bool
-	keys      *keyManager      // non-nil while the key manager screen is open
-	fallbacks *fallbackManager // non-nil while the fallback pool screen is open
-	catalog   *fallbackManager // background free-provider discovery
-	freePool   []FreeRoute      // configured rotation pool (nil = auto-discover)
-	poolTouched bool            // true once the user engages the pool (free cycle / f editor)
-	prevStep   step             // step to restore when a sub-screen closes
-	resume     *ResumeOption
-	poolErr    string
-	usage      map[string]usageSnapshot // launch-time per-provider usage (set when usageLoaded arrives)
-	allModels  bool                     // --all-models: show paid+free, grouped by tier
+	list        list.Model
+	all         []models.Model // for rebuilding lists between steps
+	choice      string
+	provider    string
+	choiceVia   string
+	worker      string
+	resumeID    string
+	quit        bool
+	subtitle    string
+	step        step
+	hasCombos   bool
+	keys        *keyManager      // non-nil while the key manager screen is open
+	fallbacks   *fallbackManager // non-nil while the fallback pool screen is open
+	catalog     *fallbackManager // background free-provider discovery
+	freePool    []FreeRoute      // configured rotation pool (nil = auto-discover)
+	poolTouched bool             // true once the user engages the pool (free cycle / f editor)
+	prevStep    step             // step to restore when a sub-screen closes
+	resume      *ResumeOption
+	poolErr     string
+	usage       map[string]usageSnapshot // launch-time per-provider usage (set when usageLoaded arrives)
+	allModels   bool                     // --all-models: show paid+free, grouped by tier
 }
 
 func (m model) Init() tea.Cmd {
@@ -349,13 +445,19 @@ func (m *model) startItems() []list.Item {
 		}
 	}
 	if m.resume != nil {
-		items = append([]list.Item{resumeItem{opt: *m.resume}}, items...)
+		items = append(items, resumeItem{opt: *m.resume})
 	}
+	// Presets group: recommended + recent combos, then the manual fall-through.
 	combos := buildComboItems(m.all)
+	var presets []list.Item
 	for _, item := range combos {
-		if combo, ok := item.(comboItem); ok && !combo.manual {
-			items = append(items, combo)
+		if combo, ok := item.(comboItem); ok {
+			presets = append(presets, combo)
 		}
+	}
+	if len(presets) > 0 {
+		items = append(items, groupHeaderItem{label: "Presets", count: len(presets)})
+		items = append(items, presets...)
 	}
 	// Every model from the initially selected provider is directly launchable;
 	// the manual row remains for the legacy orchestrator/worker flow. The free
@@ -366,24 +468,83 @@ func (m *model) startItems() []list.Item {
 	for _, model := range m.all {
 		local[model.ID] = true
 	}
-	for _, item := range buildModelItems(m.all) {
-		items = append(items, item)
+	primaryModels := buildModelItems(m.all)
+	if len(primaryModels) > 0 {
+		items = append(items, groupHeaderItem{label: groupLabel(m.provider), count: len(primaryModels)})
+		items = append(items, primaryModels...)
 	}
-	// NOTE: the primary provider's paid models arrive here via m.all when
-	// --all-models is set. Cross-provider paid models are intentionally left out
-	// of the TUI picker for v1 — they remain reachable via /model and the
-	// pre-written gateway cache.
-	// Free models from every other configured provider appear as their live
-	// catalogs load. Provider models that duplicate the primary catalog are
-	// skipped so each model shows once.
+	// Secondary providers are grouped into their own sections, rendered in the
+	// stable poolProviders display order. OpenRouter is labeled "Most used"
+	// because its catalog is usage-ranked. Provider models that duplicate the
+	// primary catalog are skipped so each model shows once; the usage ranking
+	// inside OpenRouter is preserved (it is just wrapped in a header).
+	secondary := make(map[string][]list.Item)
 	for _, option := range catalogModels {
 		if option.Provider == m.provider && local[option.Model.ID] {
 			continue
 		}
-		items = append(items, providerModelItem{provider: option.Provider, model: option.Model})
+		secondary[option.Provider] = append(secondary[option.Provider],
+			providerModelItem{provider: option.Provider, model: option.Model})
 	}
-	items = append(items, comboItem{manual: true})
+	for _, p := range poolProviders {
+		rows, ok := secondary[p]
+		if !ok {
+			continue
+		}
+		items = append(items, groupHeaderItem{label: groupLabel(p), count: len(rows)})
+		items = append(items, rows...)
+	}
 	return items
+}
+
+// groupLabel returns the display name for a provider section header. OpenRouter
+// is usage-ranked, so its group reads "Most used" rather than just the name;
+// every other provider uses its friendly subtitle.
+func groupLabel(provider string) string {
+	if provider == "openrouter" {
+		return "Most used"
+	}
+	return providerSubtitle(provider)
+}
+
+// nextSelectable returns the index of the nearest non-header row at or after
+// from+dir (dir +1 downward, -1 upward), or -1 if none exists. It lets the
+// picker skip non-selectable groupHeaderItem rows during navigation/selection.
+func (m *model) nextSelectable(from, dir int) int {
+	items := m.list.Items()
+	n := len(items)
+	if n == 0 {
+		return -1
+	}
+	for k := 1; k <= n; k++ {
+		i := from + dir*k
+		if i < 0 || i >= n {
+			continue
+		}
+		if _, ok := items[i].(groupHeaderItem); !ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// ensureSelectable nudges the cursor off a group header if one is currently
+// selected, preferring the next row downward, then upward.
+func (m *model) ensureSelectable() {
+	items := m.list.Items()
+	if len(items) == 0 {
+		return
+	}
+	if _, ok := items[m.list.Index()].(groupHeaderItem); !ok {
+		return
+	}
+	if i := m.nextSelectable(m.list.Index(), 1); i >= 0 {
+		m.list.Select(i)
+		return
+	}
+	if i := m.nextSelectable(m.list.Index(), -1); i >= 0 {
+		m.list.Select(i)
+	}
 }
 
 func (m *model) rebuildStart() tea.Cmd {
@@ -397,6 +558,7 @@ func (m *model) rebuildStart() tea.Cmd {
 		for i, item := range m.list.Items() {
 			if startItemKey(item) == want {
 				m.list.Select(i)
+				m.ensureSelectable()
 				return cmd
 			}
 		}
@@ -404,6 +566,7 @@ func (m *model) rebuildStart() tea.Cmd {
 	if count := len(m.list.Items()); count > 0 {
 		m.list.Select(min(index, count-1))
 	}
+	m.ensureSelectable()
 	return cmd
 }
 
@@ -424,6 +587,8 @@ func startItemKey(item list.Item) string {
 		return "provider\x00" + item.provider + "\x00" + item.model.ID
 	case providerStatusItem:
 		return "status\x00" + item.provider
+	case groupHeaderItem:
+		return "header\x00" + item.label + "\x00" + fmt.Sprint(item.count)
 	default:
 		return ""
 	}
@@ -551,6 +716,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resumeID = item.opt.SessionID
 				return m, tea.Quit
 			}
+			// Group headers are non-selectable: landing on one (via keyboard
+			// nav) is treated as "move to the next real row" rather than a
+			// choice, so a header can never be mistaken for a model.
+			if _, ok := m.list.SelectedItem().(groupHeaderItem); ok {
+				if i := m.nextSelectable(m.list.Index(), 1); i >= 0 {
+					m.list.Select(i)
+				}
+				return m, nil
+			}
 			switch m.step {
 			case stepCombo:
 				if item, ok := m.list.SelectedItem().(cycleItem); ok {
@@ -624,6 +798,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
+	// Keep the cursor off non-selectable group headers: after the list has moved
+	// the cursor, nudge it past any header it landed on so a section banner is
+	// never shown as the "current" row. Runs after the list update, not before.
+	if m.step == stepCombo {
+		m.ensureSelectable()
+	}
 	return m, cmd
 }
 
@@ -794,7 +974,7 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 	}
 	items := m.startItems()
 
-	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
+	l := list.New(items, pickerDelegate{DefaultDelegate: list.NewDefaultDelegate()}, 60, 20)
 	l.Title = ""
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
