@@ -9,7 +9,6 @@ package tui
 
 import (
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -17,13 +16,20 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/raketenkater/ultra-zen/internal/models"
+	"github.com/raketenkater/ultra-zen/internal/proxy"
+	"github.com/raketenkater/ultra-zen/internal/usagefmt"
 )
 
-// usageSnapshot is the launch-time usage summary for one provider.
+// usageSnapshot is the launch-time usage summary for one provider. The picker
+// runs before the proxy exists, so it fetches the same upstream signals
+// directly and stores the canonical ProviderUsage row — the banner is then
+// rendered by the shared usagefmt formatter, identical to the in-session
+// statusline.
 type usageSnapshot struct {
 	Provider string
-	Line     string // human-readable one-liner, e.g. "OpenRouter $0.42 left today"
-	Ready    bool   // false while fetching / on error (Line then holds the error)
+	Usage    *proxy.ProviderUsage // canonical row; may be nil on hard error
+	Line     string               // human-readable one-liner (error/fallback text)
+	Ready    bool                 // false while fetching / on error (Line then holds the error)
 }
 
 // usageLoaded is emitted when the background usage fetch completes, prompting
@@ -60,6 +66,7 @@ func fetchUsageSync(providers map[string]string) map[string]usageSnapshot {
 			// them in-session via /v1/usage.
 			rows[provider] = usageSnapshot{
 				Provider: provider,
+				Usage:    &proxy.ProviderUsage{Name: provider, Kind: proxy.UsageUnknown, Window: proxy.WindowNone},
 				Line:     provider + ": live tracking once session starts",
 				Ready:    true,
 			}
@@ -70,7 +77,8 @@ func fetchUsageSync(providers map[string]string) map[string]usageSnapshot {
 
 // fetchOpenRouterUsage queries GET /api/v1/key with the normal API key (NOT
 // /credits, which 403s on non-management keys). Parses the remaining credit
-// balance and today's usage.
+// balance, the free-tier daily cap + reset, and today's usage into a canonical
+// ProviderUsage row rendered by the shared usagefmt formatter.
 func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
 	req, err := http.NewRequest(http.MethodGet, models.OpenRouterBase+"/key", nil)
 	if err != nil {
@@ -88,6 +96,8 @@ func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
 			LimitRemaining *float64 `json:"limit_remaining"`
 			UsageDaily     *float64 `json:"usage_daily"`
 			IsFreeTier     bool     `json:"is_free_tier"`
+			Limit          *float64 `json:"limit"`
+			LimitReset     *string  `json:"limit_reset"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -96,18 +106,27 @@ func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
 	if payload.Data.LimitRemaining == nil {
 		return usageSnapshot{Provider: "openrouter", Line: "OpenRouter: unlimited credits", Ready: true}
 	}
-	line := fmt.Sprintf("OpenRouter: $%.3f left", *payload.Data.LimitRemaining)
+	row := &proxy.ProviderUsage{Name: "openrouter", Kind: proxy.UsageCredits, Window: proxy.WindowDaily}
+	rem := *payload.Data.LimitRemaining
+	row.Remaining = &rem
 	if payload.Data.UsageDaily != nil {
-		line += fmt.Sprintf(" · $%.3f today", *payload.Data.UsageDaily)
+		used := *payload.Data.UsageDaily
+		row.Used = &used
 	}
 	if payload.Data.IsFreeTier {
-		line += " (free tier)"
+		if payload.Data.Limit != nil {
+			capv := *payload.Data.Limit
+			row.FreeLimit = &capv
+		}
+		if payload.Data.LimitReset != nil && *payload.Data.LimitReset != "" {
+			row.Daily = &proxy.WindowStat{Status: "daily", ResetsAt: *payload.Data.LimitReset}
+		}
 	}
-	return usageSnapshot{Provider: "openrouter", Line: line, Ready: true}
+	return usageSnapshot{Provider: "openrouter", Usage: row, Ready: true}
 }
 
-// fetchZenGoUsage queries the opencode-go /usage endpoint for the rolling 5h
-// window percent. Defensive: tolerates missing fields.
+// fetchZenGoUsage queries the opencode-go /usage endpoint for the
+// rolling/weekly/monthly windows. Defensive: tolerates missing fields.
 func fetchZenGoUsage(client *http.Client, key string) usageSnapshot {
 	req, err := http.NewRequest(http.MethodGet, models.GoBase+"/usage", nil)
 	if err != nil {
@@ -121,41 +140,52 @@ func fetchZenGoUsage(client *http.Client, key string) usageSnapshot {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	var payload struct {
-		Rolling  *windowPercent `json:"rolling"`
-		Weekly   *windowPercent `json:"weekly"`
-		Monthly  *windowPercent `json:"monthly"`
+		Rolling  *windowPayloadTUI `json:"rolling"`
+		Weekly   *windowPayloadTUI `json:"weekly"`
+		Monthly  *windowPayloadTUI `json:"monthly"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return usageSnapshot{Provider: "opencode-go", Line: "Zen: parse error"}
 	}
+	row := &proxy.ProviderUsage{Name: "opencode-go", Kind: proxy.UsageCredits, Window: proxy.Window5h}
 	if payload.Rolling != nil {
-		return usageSnapshot{
-			Provider: "opencode-go",
-			Line:     fmt.Sprintf("Zen: 5h window %d%% used", payload.Rolling.Percent),
-			Ready:    true,
-		}
+		w := payload.Rolling
+		row.Rolling = &proxy.WindowStat{Status: "rolling", Percent: w.Percent, ResetsAt: w.ResetsAt}
 	}
-	return usageSnapshot{Provider: "opencode-go", Line: "Zen: usage window unavailable", Ready: true}
+	if payload.Weekly != nil {
+		w := payload.Weekly
+		row.Weekly = &proxy.WindowStat{Status: "weekly", Percent: w.Percent, ResetsAt: w.ResetsAt}
+	}
+	if payload.Monthly != nil {
+		w := payload.Monthly
+		row.Monthly = &proxy.WindowStat{Status: "monthly", Percent: w.Percent, ResetsAt: w.ResetsAt}
+	}
+	return usageSnapshot{Provider: "opencode-go", Usage: row, Ready: true}
 }
 
-// windowPercent mirrors the opencode-go /usage window shape ({percent,...}).
-type windowPercent struct {
+// windowPayloadTUI mirrors the opencode-go /usage window shape ({percent,...}).
+type windowPayloadTUI struct {
 	Status   string `json:"status"`
 	Percent  int    `json:"percent"`
 	ResetsAt string `json:"resetsAt"`
 }
 
-// usageSummaryText joins every provider's line into one display string for the
-// picker's usage row.
+// usageSummaryText joins every provider's canonical usage row into one display
+// string for the picker's usage banner. It uses the SAME shared formatter as
+// the in-session statusline so the two views stay consistent.
 func usageSummaryText(rows map[string]usageSnapshot) string {
 	if len(rows) == 0 {
 		return "no provider usage available"
 	}
 	parts := make([]string, 0, len(rows))
 	for _, r := range rows {
-		parts = append(parts, r.Line)
+		if r.Usage != nil {
+			parts = append(parts, usagefmt.FormatProviderUsage(*r.Usage))
+		} else {
+			parts = append(parts, r.Line)
+		}
 	}
-	return strings.Join(parts, "  ·  ")
+	return strings.Join(parts, " ")
 }
 
 // configuredProviderKeys returns the provider->API-key map for every provider

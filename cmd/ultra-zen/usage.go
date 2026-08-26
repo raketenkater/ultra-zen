@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/raketenkater/ultra-zen/internal/proxy"
+	"github.com/raketenkater/ultra-zen/internal/usagefmt"
 )
 
 // cmdUsage prints a single compact statusline summarizing per-provider usage,
@@ -21,7 +24,7 @@ import (
 // hook that runs `ultra-zen usage` (or `ultra-zen statusline`); the output is a
 // single line suitable for the statusline:
 //
-//	[OpenRouter $0.013 left] [Zen 5h 42%] [Groq 912 req] [SAIA 880/d]
+//	[OR $0.013 left] [Zen 5h 42% · wk 10% · mo 5%] [Groq 880/1000 · reset 12m]
 //	[Cohere 642/1000] [Cerebras hit] [ModelScope —]
 func cmdUsage() {
 	path := proxyInfoPath()
@@ -45,7 +48,7 @@ func cmdUsage() {
 	}
 	defer resp.Body.Close()
 	var payload struct {
-		Providers []proxyUsageView `json:"providers"`
+		Providers []proxy.ProviderUsage `json:"providers"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		fmt.Println("no running ultra-zen proxy")
@@ -53,67 +56,13 @@ func cmdUsage() {
 	}
 	var parts []string
 	for _, p := range payload.Providers {
-		parts = append(parts, renderUsagePart(p))
+		parts = append(parts, usagefmt.FormatProviderUsage(p))
 	}
 	if len(parts) == 0 {
 		fmt.Println("no running ultra-zen proxy")
 		return
 	}
 	fmt.Println(strings.Join(parts, " "))
-}
-
-// proxyUsageView is a local mirror of proxy.ProviderUsage for decoding; reusing
-// the proxy type directly would force an import cycle-free copy, so we decode
-// the fields we render.
-type proxyUsageView struct {
-	Name         string  `json:"name"`
-	Kind         string  `json:"kind"`
-	Remaining    *float64 `json:"remaining,omitempty"`
-	Percent      *int    `json:"percent,omitempty"`
-	RequestsUsed *int64  `json:"requestsUsed,omitempty"`
-	RequestsLimit *int64 `json:"requestsLimit,omitempty"`
-	Rolling      *windowView `json:"rolling,omitempty"`
-	Weekly       *windowView `json:"weekly,omitempty"`
-	Monthly      *windowView `json:"monthly,omitempty"`
-	Exhausted    bool    `json:"exhausted"`
-	Detail       string  `json:"detail,omitempty"`
-}
-
-type windowView struct {
-	Percent  int    `json:"percent"`
-	ResetsAt string `json:"resetsAt"`
-}
-
-// renderUsagePart formats one provider into a bracketed statusline token.
-func renderUsagePart(p proxyUsageView) string {
-	title := p.Name
-	if p.Exhausted {
-		return fmt.Sprintf("[%s hit]", title)
-	}
-	switch p.Kind {
-	case "credits":
-		// Prefer Zen's rolling 5h window percent; otherwise OpenRouter remaining.
-		if p.Rolling != nil {
-			return fmt.Sprintf("[%s 5h %d%%]", title, p.Rolling.Percent)
-		}
-		if p.Remaining != nil {
-			return fmt.Sprintf("[%s $%.3f left]", title, *p.Remaining)
-		}
-	case "requests":
-		if p.RequestsLimit != nil && p.RequestsUsed != nil {
-			return fmt.Sprintf("[%s %d/%d]", title, *p.RequestsUsed, *p.RequestsLimit)
-		}
-		if p.RequestsUsed != nil {
-			return fmt.Sprintf("[%s %d req]", title, *p.RequestsUsed)
-		}
-		if p.Percent != nil {
-			return fmt.Sprintf("[%s %d%%]", title, *p.Percent)
-		}
-	}
-	if p.Detail == "" {
-		return fmt.Sprintf("[%s —]", title)
-	}
-	return fmt.Sprintf("[%s —]", title)
 }
 
 // proxyInfoPath resolves ~/.cache/ultra-zen/proxy.json.

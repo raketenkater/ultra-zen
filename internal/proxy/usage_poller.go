@@ -107,10 +107,12 @@ func (s *Server) fetchOpenRouterUsage(httpClient *http.Client, key string) {
 			LimitRemaining *float64 `json:"limit_remaining"`
 			UsageDaily     *float64 `json:"usage_daily"`
 			IsFreeTier     *bool    `json:"is_free_tier"`
+			Limit          *float64 `json:"limit"`
+			LimitReset     *string  `json:"limit_reset"`
 		} `json:"data"`
 		Error *struct {
-		Message string `json:"message"`
-	} `json:"error"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		row := s.usage.getRowSnapshot("openrouter")
@@ -136,6 +138,17 @@ func (s *Server) fetchOpenRouterUsage(httpClient *http.Client, key string) {
 	if payload.Data.UsageDaily != nil {
 		used := *payload.Data.UsageDaily
 		row.Used = &used
+	}
+	if payload.Data.IsFreeTier != nil && *payload.Data.IsFreeTier {
+		// Free tier resets daily: `limit` is the daily cap and `limit_reset` the
+		// next daily reset time.
+		if payload.Data.Limit != nil {
+			capv := *payload.Data.Limit
+			row.FreeLimit = &capv
+		}
+		if payload.Data.LimitReset != nil && *payload.Data.LimitReset != "" {
+			row.Daily = &WindowStat{Status: "daily", ResetsAt: *payload.Data.LimitReset}
+		}
 	}
 	s.usage.setRow("openrouter", row)
 }

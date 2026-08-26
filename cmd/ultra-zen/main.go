@@ -399,7 +399,7 @@ func main() {
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
-		allModels     = flag.Bool("all-models", false, "expose every model (paid+free) from every provider, organized by provider with free/paid sections")
+		allModels     = flag.Bool("all-models", true, "expose every model (paid+free) from every provider, organized by provider with free/paid sections (default true; pass -all-models=false for free-only)")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
 		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")

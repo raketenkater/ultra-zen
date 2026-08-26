@@ -52,6 +52,13 @@ type ProviderUsage struct {
 	Rolling    *WindowStat `json:"rolling,omitempty"`
 	Weekly     *WindowStat `json:"weekly,omitempty"`
 	Monthly    *WindowStat `json:"monthly,omitempty"`
+	// FreeLimit is the periodic cap for a credits provider (e.g. OpenRouter's
+	// free-tier daily limit, captured from the /key `limit` field). It is set
+	// only when the provider exposes a finite periodic allowance.
+	FreeLimit  *float64    `json:"freeLimit,omitempty"`
+	// Daily is a daily reset window (e.g. OpenRouter free-tier limit_reset),
+	// carrying the ISO timestamp of the next reset in ResetsAt.
+	Daily      *WindowStat `json:"daily,omitempty"`
 	Exhausted  bool        `json:"exhausted"`
 	LastUpdated string     `json:"lastUpdated"` // ISO timestamp of the last good fetch
 	Detail     string      `json:"detail,omitempty"`
