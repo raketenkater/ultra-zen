@@ -190,6 +190,28 @@ func (i providerStatusItem) Description() string {
 }
 func (i providerStatusItem) FilterValue() string { return i.provider + " status" }
 
+// usageStatusItem is a non-selectable row on the start screen showing the
+// launch-time per-provider usage summary (OpenRouter credits, Zen 5h window,
+// etc.). It complements the in-session /v1/usage statusline: the picker runs
+// before the proxy exists, so it fetches the same upstream signals directly.
+type usageStatusItem struct {
+	rows map[string]usageSnapshot
+}
+
+func (i usageStatusItem) Title() string {
+	if len(i.rows) == 0 {
+		return "Usage — fetching…"
+	}
+	return "Usage — per provider"
+}
+func (i usageStatusItem) Description() string {
+	if len(i.rows) == 0 {
+		return "querying OpenRouter / Zen for remaining credits"
+	}
+	return usageSummaryText(i.rows)
+}
+func (i usageStatusItem) FilterValue() string { return "usage credits remaining providers" }
+
 func (i comboItem) Title() string {
 	if i.manual {
 		return "Pick models manually →"
@@ -260,13 +282,19 @@ type model struct {
 	prevStep   step             // step to restore when a sub-screen closes
 	resume     *ResumeOption
 	poolErr    string
+	usage      map[string]usageSnapshot // launch-time per-provider usage (set when usageLoaded arrives)
 }
 
 func (m model) Init() tea.Cmd {
+	var cmds []tea.Cmd
 	if m.catalog != nil {
-		return m.catalog.Init()
+		cmds = append(cmds, m.catalog.Init())
 	}
-	return nil
+	// Kick off the launch-time usage fetch (OpenRouter credits, Zen 5h window)
+	// alongside catalog discovery. It emits usageLoaded when done, refreshing
+	// the picker's usage row.
+	cmds = append(cmds, fetchUsage(configuredProviderKeys(m.provider)))
+	return tea.Batch(cmds...)
 }
 
 func (m *model) openFallbacks() tea.Cmd {
@@ -298,6 +326,12 @@ func (m *model) startItems() []list.Item {
 		cycle.first = m.freePool[0].String()
 	}
 	items := []list.Item{cycle}
+	// Launch-time per-provider usage summary (OpenRouter credits, Zen 5h window).
+	// Fetched live on a background goroutine; the row refreshes when usageLoaded
+	// arrives. It is non-selectable — purely informational while choosing a model.
+	if m.usage != nil {
+		items = append(items, usageStatusItem{rows: m.usage})
+	}
 	// Providers that haven't produced a model list yet are still surfaced as
 	// status rows so the user sees free models exist but aren't ready — not a
 	// blank screen that implies no free provider is configured.
@@ -327,6 +361,10 @@ func (m *model) startItems() []list.Item {
 	for _, item := range buildModelItems(m.all) {
 		items = append(items, item)
 	}
+	// NOTE: the primary provider's paid models arrive here via m.all when
+	// --all-models is set. Cross-provider paid models are intentionally left out
+	// of the TUI picker for v1 — they remain reachable via /model and the
+	// pre-written gateway cache.
 	// Free models from every other configured provider appear as their live
 	// catalogs load. Provider models that duplicate the primary catalog are
 	// skipped so each model shows once.
@@ -431,6 +469,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if loaded, ok := msg.(fallbackLoaded); ok && m.fallbacks == nil && m.catalog != nil {
 		catalogCmd := m.catalog.applyLoad(loaded)
 		return m, tea.Batch(catalogCmd, m.rebuildStart())
+	}
+	// Launch-time usage summary arrived; refresh the usage row in place.
+	if ul, ok := msg.(usageLoaded); ok {
+		m.usage = ul.rows
+		return m, m.rebuildStart()
 	}
 	// While the key manager is open, it owns all input.
 	if m.keys != nil {

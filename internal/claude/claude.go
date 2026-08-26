@@ -224,8 +224,14 @@ func writeGatewayCacheFile(path string, data []byte) error {
 // binary so the hook works even if ultra-zen is not on PATH.
 
 // SettingsJSON returns the settings payload passed via --settings. hookCmd is
-// the command to run for the Workflow PreToolUse hook (typically the absolute
-// path to the ultra-zen binary plus "workflow-hook").
+// the absolute path to the ultra-zen binary; it is used for the Workflow
+// PreToolUse hook (hookCmd + " workflow-hook") and the always-visible usage
+// statusline (hookCmd + " usage").
+//
+// GATING: this payload is injected ONLY when ultra-zen launches Claude Code
+// (claude.Args adds --settings unless the user passed their own). Running
+// `claude` directly never sees it, so the statusline appears solely in uz->
+// launched sessions — never in standalone claude invocations.
 //
 // The payload carries the ultracode flag and the effort level. --settings
 // replaces the project .claude/settings.json for this session, so if ultracode
@@ -235,9 +241,21 @@ func writeGatewayCacheFile(path string, data []byte) error {
 // explicit --effort flag on the CLI wins because Args() only injects --effort
 // when the user didn't pass one.
 func SettingsJSON(hookCmd string) string {
+	// statusLine runs `uz usage` (also aliased `uz statusline`), which queries the
+	// running proxy's GET /v1/usage and prints one compact per-provider line.
+	// refreshInterval keeps it live even when the session is idle (e.g. after a
+	// free-tier limit resets); the command itself is <1ms on loopback and exits 0
+	// with "no running ultra-zen proxy" if the proxy file is missing, so it never
+	// error-spams the statusline.
+	statusLine := map[string]any{
+		"type":            "command",
+		"command":         hookCmd + " usage",
+		"refreshInterval": 30,
+	}
 	settings := map[string]any{
 		"ultracode":    true,
 		"effortLevel":  defaultEffort,
+		"statusLine":   statusLine,
 		"hooks": map[string]any{
 			"PreToolUse": []map[string]any{
 				{

@@ -463,6 +463,65 @@ func ListOpenRouter(httpClient *http.Client, apiKey string) ([]Model, error) {
 	return FilterUnavailable("openrouter", out), nil
 }
 
+// ListOpenRouterAll fetches EVERY model available via OpenRouter (paid + free),
+// unlike ListOpenRouter which keeps only the :free models. Free is derived from
+// the id (":free" suffix or the openrouter/free router). Used by the
+// --all-models flag to expose the complete catalog. The default ListOpenRouter
+// behavior is unchanged.
+func ListOpenRouterAll(httpClient *http.Client, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	entries, err := fetchEntries(httpClient, OpenRouterBase, apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("openrouter: %w", err)
+	}
+	var out []Model
+	for _, e := range entries {
+		out = append(out, Model{
+			ID:            e.ID,
+			Name:          pretty(e.ID),
+			Base:          OpenRouterBase,
+			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
+			ContextLength: e.ContextLength,
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].Name < out[j].Name
+	})
+	return FilterUnavailable("openrouter", out), nil
+}
+
+// ListZenAll fetches BOTH the opencode-go (paid) tier and the main tier
+// (free + any non-free main models), unlike List/ListZenFree which restrict to
+// free models. Go-tier entries are Free=false; main entries are Free when their
+// id ends in "-free". Used by the --all-models flag. The default List/ListZenFree
+// behavior is unchanged.
+func ListZenAll(httpClient *http.Client, apiKey string) ([]Model, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 20 * time.Second}
+	}
+	goEntries, goErr := fetchEntries(httpClient, GoBase, apiKey)
+	mainEntries, mainErr := fetchEntries(httpClient, MainBase, apiKey)
+	if goErr != nil && mainErr != nil {
+		return nil, fmt.Errorf("go tier: %v; main tier: %w", goErr, mainErr)
+	}
+	var out []Model
+	for _, e := range goEntries {
+		out = append(out, Model{ID: e.ID, Name: pretty(e.ID), Base: GoBase, Free: false, ContextLength: e.ContextLength})
+	}
+	for _, e := range mainEntries {
+		out = append(out, Model{ID: e.ID, Name: pretty(e.ID), Base: MainBase, Free: strings.HasSuffix(e.ID, "-free"), ContextLength: e.ContextLength})
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Free != out[j].Free {
+			return !out[i].Free // paid go-tier first, free tier second
+		}
+		return out[i].Name < out[j].Name
+	})
+	return FilterUnavailable("opencode-go", out), nil
+}
+
 // ListCodex fetches the model list from a local Codex-compatible endpoint
 // (e.g. ChatMock, an OAuth bridge that serves OpenAI-compatible chat/completions
 // backed by a ChatGPT Plus/Pro subscription). The endpoint already proxies
@@ -646,6 +705,46 @@ func ListFreeTierProvider(httpClient *http.Client, provider, apiKey string) ([]M
 			return FilterUnavailable(provider, list), nil
 		}
 		failures = append(failures, err.Error())
+	}
+	return nil, fmt.Errorf("%s endpoints failed: %s", provider, strings.Join(failures, "; "))
+}
+
+// ListFreeTierProviderAll loads a named BYO-key provider and keeps EVERY model
+// it advertises (paid + free), unlike ListFreeTierProvider which treats every
+// entry as free. Free is derived from the id ("-free" suffix or ":free"
+// substring). ModelScope's international/China dual-site logic is preserved.
+// Used by the --all-models flag. The default ListFreeTierProvider behavior is
+// unchanged.
+func ListFreeTierProviderAll(httpClient *http.Client, provider, apiKey string) ([]Model, error) {
+	def, ok := FreeTierProviders[provider]
+	if !ok {
+		return nil, fmt.Errorf("unknown free-tier provider %q", provider)
+	}
+	bases := []string{def.Base}
+	if provider == "modelscope" {
+		bases = append(bases, ModelScopeCNBase)
+	}
+	var failures []string
+	for _, base := range bases {
+		entries, err := fetchEntries(httpClient, base, apiKey)
+		if err != nil {
+			failures = append(failures, err.Error())
+			continue
+		}
+		var out []Model
+		for _, e := range entries {
+			out = append(out, Model{
+				ID:            e.ID,
+				Name:          pretty(e.ID),
+				Base:          base,
+				Free:          strings.HasSuffix(e.ID, "-free") || strings.Contains(e.ID, ":free"),
+				ContextLength: e.ContextLength,
+			})
+		}
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].Name < out[j].Name
+		})
+		return FilterUnavailable(provider, out), nil
 	}
 	return nil, fmt.Errorf("%s endpoints failed: %s", provider, strings.Join(failures, "; "))
 }

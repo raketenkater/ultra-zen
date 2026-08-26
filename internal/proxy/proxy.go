@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +34,10 @@ type Config struct {
 	Port             int            // local listen port
 	Models           []ModelInfo    // full model list advertised at /v1/models
 	Upstreams        []Upstream     // every known upstream route (primary + fallbacks); maps /model ids to gateways
+	// AllModels reorganizes /v1/models into per-provider free/paid sub-sections
+	// (the --all-models flag). When false, the advertised list is byte-identical
+	// to the legacy single-header-per-provider layout.
+	AllModels bool
 	ContextLength    int            // primary model's context window in tokens (0 = unknown); used to truncate over-limit requests
 	OnUnavailable    func(Upstream) // called after an explicit per-model access denial
 }
@@ -80,6 +86,7 @@ type ModelInfo struct {
 	Name          string
 	Provider      string // provider name, used to insert a group header before it
 	ContextLength int    // model context window in tokens; 0 = unknown
+	Free          bool   // whether this model is the free tier of its provider
 }
 
 // maxOutputTokens is the maximum max_tokens the proxy forwards to the Zen
@@ -111,6 +118,9 @@ type Server struct {
 	// the plain Zen id and the provider-qualified id) to the upstream that
 	// serves it. It is built once at New from cfg.Upstreams.
 	modelRoute map[string]Upstream
+	// usageTracker records per-provider usage exposed at /v1/usage and fed by the
+	// request path (rate-limit headers, exhaustion) and the background poller.
+	usage *usageTracker
 }
 
 const (
@@ -128,10 +138,12 @@ func New(cfg Config) *Server {
 		exhaustedRoute: make([]bool, 1+len(cfg.Fallbacks)),
 		deadSelectable: make(map[string]bool),
 		modelRoute:     buildModelRoute(cfg),
+		usage:          newUsageTracker(),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", s.handleMessages)
 	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/usage", s.handleUsage)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/", s.handleHealth) // any other path -> health
 	s.srv = &http.Server{
@@ -151,6 +163,10 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 	s.baseURL = "http://" + ln.Addr().String()
+	// Persist the listen address so `ultra-zen usage` (statusline) can find the
+	// running proxy without a shared PID file. Best-effort: a failure to write
+	// is logged and otherwise ignored — it must never break the launch.
+	s.writeProxyInfo()
 	go func() {
 		<-ctx.Done()
 		shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -168,9 +184,65 @@ func (s *Server) Start(ctx context.Context) error {
 // BaseURL returns the local address the proxy is reachable on.
 func (s *Server) BaseURL() string { return s.baseURL }
 
+// writeProxyInfo persists {url, pid, port, startedAt} to
+// ~/.cache/ultra-zen/proxy.json (temp file + rename, mirroring the gateway-cache
+// atomic-write pattern). Non-fatal on error: the statusline simply falls back to
+// reporting "no running proxy" when the file is absent.
+func (s *Server) writeProxyInfo() {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		log.Printf("ultra-zen: proxy info dir unavailable: %v", err)
+		return
+	}
+	dir = filepath.Join(dir, "ultra-zen")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("ultra-zen: proxy info dir: %v", err)
+		return
+	}
+	info := map[string]any{
+		"url":       s.baseURL,
+		"pid":       os.Getpid(),
+		"port":      s.cfg.Port,
+		"startedAt": time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		log.Printf("ultra-zen: proxy info encode: %v", err)
+		return
+	}
+	path := filepath.Join(dir, "proxy.json")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		log.Printf("ultra-zen: proxy info write: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		log.Printf("ultra-zen: proxy info rename: %v", err)
+	}
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, `{"status":"ok"}`)
+}
+
+// handleUsage exposes the per-provider usage snapshot at GET /v1/usage for the
+// Claude Code statusline (`ultra-zen usage`). It is a sub-millisecond read-locked
+// JSON dump; it never touches the request path.
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := json.Marshal(map[string]any{
+		"schema":   "ultra-zen/usage/v1",
+		"server":   map[string]any{"url": s.baseURL},
+		"providers": s.usage.getRows(),
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
 }
 
 // handleModels advertises every usable model at GET /v1/models so Claude
@@ -223,23 +295,128 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 		return "claude-group-" + provider
 	}
-	seenProvider := map[string]bool{}
-	for _, m := range s.cfg.Models {
-		if m.Provider != "" && !seenProvider[m.Provider] {
-			seenProvider[m.Provider] = true
-			models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider), true, 0))
+	// When --all-models is set, a provider that exposes BOTH free and paid models
+	// gets two sub-headers ("Provider · free" / "Provider · paid") so the picker
+	// cleanly separates tiers. Both ids start with "claude-group-" so they
+	// survive the gateway filter and render disabled.
+	tierHeaderID := func(provider string, free bool) string {
+		if provider == "" {
+			return ""
 		}
-		// Advertise the claude-prefixed id so the /model gateway filter
-		// (/(claude|anthropic)/i) keeps it; the display name is the friendly
-		// model name plus the provider label so the picker identifies both. The
-		// proxy routes the advertised id back to the real upstream model via
-		// modelRoute. context_window carries the model's real window so Claude
-		// Code's autocompaction fires at the right point.
-		advertisedID := m.ID
-		if m.Provider != "" {
-			advertisedID = ClaudeModelID(m.Provider, m.ID)
+		if free {
+			return "claude-group-" + provider + "-free"
 		}
-		models = append(models, entry(advertisedID, ModelDisplayName(m.Name, m.Provider), false, m.ContextLength))
+		return "claude-group-" + provider + "-paid"
+	}
+	tierHeaderTitle := func(provider string, free bool) string {
+		if free {
+			return groupTitle(provider) + " · free"
+		}
+		return groupTitle(provider) + " · paid"
+	}
+	// ModelTierDisplayName renders the /v1/models display_name for a model when
+	// the --all-models layout is active: the friendly name plus the provider
+	// label plus a free/paid tier tag, so the picker identifies model, provider,
+	// and tier at a glance. Falls back to ModelDisplayName when no tier tag is
+	// wanted.
+	ModelTierDisplayName := func(name, provider string, free bool) string {
+		base := ModelDisplayName(name, provider)
+		if free {
+			return base + " (free)"
+		}
+		return base + " (paid)"
+	}
+
+	if !s.cfg.AllModels {
+		// Legacy layout: one header per provider, models listed beneath it.
+		seenProvider := map[string]bool{}
+		for _, m := range s.cfg.Models {
+			if m.Provider != "" && !seenProvider[m.Provider] {
+				seenProvider[m.Provider] = true
+				models = append(models, entry(headerID(m.Provider), groupTitle(m.Provider), true, 0))
+			}
+			advertisedID := m.ID
+			if m.Provider != "" {
+				advertisedID = ClaudeModelID(m.Provider, m.ID)
+			}
+			models = append(models, entry(advertisedID, ModelDisplayName(m.Name, m.Provider), false, m.ContextLength))
+		}
+	} else {
+		// --all-models layout: per provider, emit free-then-paid sub-sections.
+		// Group models by provider, then by tier, so each provider shows first
+		// its free models and then its paid models (each tier sorted by name).
+		type grouped struct {
+			free []ModelInfo
+			paid []ModelInfo
+		}
+		byProvider := map[string]*grouped{}
+		var order []string
+		seenProvider := map[string]bool{}
+		for _, m := range s.cfg.Models {
+			if m.Provider == "" {
+				// Models without a provider keep the legacy single-header
+				// treatment so we never drop them.
+				continue
+			}
+			g, ok := byProvider[m.Provider]
+			if !ok {
+				g = &grouped{}
+				byProvider[m.Provider] = g
+				order = append(order, m.Provider)
+				seenProvider[m.Provider] = true
+			}
+			if m.Free {
+				g.free = append(g.free, m)
+			} else {
+				g.paid = append(g.paid, m)
+			}
+		}
+		// Models without a provider: still render under a single header.
+		var orphan []ModelInfo
+		for _, m := range s.cfg.Models {
+			if m.Provider == "" {
+				orphan = append(orphan, m)
+			}
+		}
+		sortProviderGroups := func(infos []ModelInfo) {
+			sort.SliceStable(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+		}
+		emitProvider := func(provider string) {
+			g := byProvider[provider]
+			hasFree := len(g.free) > 0
+			hasPaid := len(g.paid) > 0
+			if hasFree && hasPaid {
+				// Two sub-headers: free then paid.
+				models = append(models, entry(tierHeaderID(provider, true), tierHeaderTitle(provider, true), true, 0))
+				sortProviderGroups(g.free)
+				for _, m := range g.free {
+					models = append(models, entry(ClaudeModelID(provider, m.ID), ModelTierDisplayName(m.Name, provider, true), false, m.ContextLength))
+				}
+				models = append(models, entry(tierHeaderID(provider, false), tierHeaderTitle(provider, false), true, 0))
+				sortProviderGroups(g.paid)
+				for _, m := range g.paid {
+					models = append(models, entry(ClaudeModelID(provider, m.ID), ModelTierDisplayName(m.Name, provider, false), false, m.ContextLength))
+				}
+			} else if hasFree {
+				models = append(models, entry(headerID(provider), groupTitle(provider), true, 0))
+				sortProviderGroups(g.free)
+				for _, m := range g.free {
+					models = append(models, entry(ClaudeModelID(provider, m.ID), ModelTierDisplayName(m.Name, provider, true), false, m.ContextLength))
+				}
+			} else if hasPaid {
+				models = append(models, entry(headerID(provider), groupTitle(provider), true, 0))
+				sortProviderGroups(g.paid)
+				for _, m := range g.paid {
+					models = append(models, entry(ClaudeModelID(provider, m.ID), ModelTierDisplayName(m.Name, provider, false), false, m.ContextLength))
+				}
+			}
+		}
+		for _, provider := range order {
+			emitProvider(provider)
+		}
+		for _, m := range orphan {
+			models = append(models, entry(m.ID, m.Name, false, m.ContextLength))
+		}
 	}
 	if len(models) == 0 {
 		models = append(models, entry(s.cfg.Model, "", false, 0))
@@ -622,6 +799,10 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			}
 			if candidate.StatusCode != http.StatusTooManyRequests {
 				s.promoteRoute(choice.index)
+				// Success: count the served request and clear any prior exhaustion
+				// so a provider that came back online stops showing as "hit".
+				s.usage.recordRequest(choice.Upstream.Provider)
+				s.usage.setExhausted(choice.Upstream.Provider, false)
 				*oreq = *routeReq
 				return p, candidate, choice.Upstream, nil
 			}
@@ -633,9 +814,17 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			providerExhausted := accountExhausted || isFreeUsageLimit(body)
 			if providerExhausted {
 				s.exhaustProviderRoutes(choice.Upstream)
+				// Mark the provider exhausted for the statusline. SAIA and other
+				// free tiers that should NOT permanently retire still get cleared
+				// on the next 200 above (setExhausted(...,false)).
+				s.usage.setExhausted(choice.Upstream.Provider, true)
 			} else {
 				s.limitRoute(choice.index, false)
 			}
+			// Capture any rate-limit response headers for the provider so the
+			// statusline can show remaining-request counts even for providers
+			// without a live usage endpoint.
+			s.usage.recordRateLimit(choice.Upstream.Provider, candidate.Header)
 			if !providerExhausted {
 				temporary = true
 			}

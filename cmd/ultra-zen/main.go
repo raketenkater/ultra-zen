@@ -253,7 +253,7 @@ func buildAdvertisedCatalog(
 	selectable := make([]proxy.Upstream, 0, len(advs))
 	for _, a := range advs {
 		modelInfos = append(modelInfos, proxy.ModelInfo{
-			ID: a.m.ID, Name: a.m.Name, Provider: a.provider, ContextLength: a.m.ContextLength,
+			ID: a.m.ID, Name: a.m.Name, Provider: a.provider, ContextLength: a.m.ContextLength, Free: a.m.Free,
 		})
 		if a.provider == primaryProvider && a.m.ID == selectedID {
 			continue // primary model: owned solely by the primary route
@@ -357,6 +357,13 @@ func main() {
 		cmdKeys(os.Args[2:])
 		return
 	}
+	// `usage` (alias `statusline`) prints a one-line per-provider usage snapshot
+	// for Claude Code's statusline from the running proxy. Missing proxy => print
+	// "no running ultra-zen proxy" and exit 0 so the statusline never error-spams.
+	if len(os.Args) > 1 && (os.Args[1] == "usage" || os.Args[1] == "statusline") {
+		cmdUsage()
+		return
+	}
 	// `setup` installs the binary + `uz` symlink system-wide and initialises the
 	// shared key store at /etc/ultra-zen/keys so any user on the machine can
 	// launch ultra-zen. See setup.go.
@@ -392,6 +399,7 @@ func main() {
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
+		allModels     = flag.Bool("all-models", false, "expose every model (paid+free) from every provider, organized by provider with free/paid sections")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
 		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")
@@ -611,7 +619,11 @@ func main() {
 		}
 		key = k
 		var err error
-		list, err = models.ListOpenRouter(httpClient, key)
+		if *allModels {
+			list, err = models.ListOpenRouterAll(httpClient, key)
+		} else {
+			list, err = models.ListOpenRouter(httpClient, key)
+		}
 		if err != nil {
 			die(err)
 		}
@@ -673,7 +685,11 @@ func main() {
 		if storedKey != "" {
 			key = storedKey
 			var err error
-			list, err = models.List(httpClient, key)
+			if *allModels {
+				list, err = models.ListZenAll(httpClient, key)
+			} else {
+				list, err = models.List(httpClient, key)
+			}
 			if err != nil {
 				die(err)
 			}
@@ -693,7 +709,11 @@ func main() {
 		if err != nil {
 			die(err)
 		}
-		list, err = models.List(httpClient, key)
+		if *allModels {
+			list, err = models.ListZenAll(httpClient, key)
+		} else {
+			list, err = models.List(httpClient, key)
+		}
 		if err != nil {
 			die(err)
 		}
@@ -830,7 +850,11 @@ func main() {
 			return fmt.Errorf("set OPENROUTER_API_KEY or pass --openrouter-key")
 		}
 		var err error
-		openRouterList, err = models.ListOpenRouter(httpClient, openRouterPoolKey)
+		if *allModels {
+			openRouterList, err = models.ListOpenRouterAll(httpClient, openRouterPoolKey)
+		} else {
+			openRouterList, err = models.ListOpenRouter(httpClient, openRouterPoolKey)
+		}
 		if err != nil {
 			return err
 		}
@@ -863,7 +887,13 @@ func main() {
 			return fmt.Errorf("no key for %s; set %s or --api-key", p, def.EnvKey)
 		}
 		freeTierKeys[p] = k
-		list, err := models.ListFreeTierProvider(httpClient, p, k)
+		var list []models.Model
+		var err error
+		if *allModels {
+			list, err = models.ListFreeTierProviderAll(httpClient, p, k)
+		} else {
+			list, err = models.ListFreeTierProvider(httpClient, p, k)
+		}
 		if err != nil {
 			return err
 		}
@@ -884,7 +914,11 @@ func main() {
 		zenPoolKey = keys.Load("opencode-go")
 		if zenPoolKey != "" {
 			var err error
-			zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+			if *allModels {
+				zenList, err = models.ListZenAll(httpClient, zenPoolKey)
+			} else {
+				zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+			}
 			if err != nil {
 				return err
 			}
@@ -899,7 +933,11 @@ func main() {
 		if err != nil {
 			return err
 		}
-		zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+		if *allModels {
+			zenList, err = models.ListZenAll(httpClient, zenPoolKey)
+		} else {
+			zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+		}
 		if err != nil {
 			return err
 		}
@@ -1171,6 +1209,7 @@ func main() {
 		Port:          *port,
 		Models:        modelInfos,
 		Upstreams:     upstreams,
+		AllModels:     *allModels,
 		ContextLength: selected.ContextLength,
 		OnUnavailable: func(route proxy.Upstream) {
 			// Subscription-backed codex models are not account-gated free tiers;
@@ -1197,9 +1236,17 @@ func main() {
 	// advertised ids so they survive the /(claude|anthropic)/i picker filter.
 	gatewayModels := make([]claude.GatewayCacheModel, 0, len(modelInfos))
 	for _, m := range modelInfos {
+		display := proxy.ModelDisplayName(m.Name, m.Provider)
+		if *allModels {
+			if m.Free {
+				display = display + " (free)"
+			} else {
+				display = display + " (paid)"
+			}
+		}
 		gatewayModels = append(gatewayModels, claude.GatewayCacheModel{
 			ID:          proxy.ClaudeModelID(m.Provider, m.ID),
-			DisplayName: proxy.ModelDisplayName(m.Name, m.Provider),
+			DisplayName: display,
 		})
 	}
 	if err := claude.WriteGatewayCache(srv.BaseURL(), gatewayModels); err != nil {
@@ -1210,6 +1257,7 @@ func main() {
 	// (daily free limit reset, access restored) shows up again without waiting
 	// out the full 24h TTL in unavailable-models.json. Stops with ctx on exit.
 	models.StartRecheckPoller(ctx, httpClient, key)
+	srv.StartUsagePoller(ctx, httpClient)
 
 	if *proxyOnly {
 		fmt.Fprintf(os.Stderr, "ultra-zen proxy ready on %s (model=%s, upstream=%s)\n", srv.BaseURL(), selected.ID, selected.Base)
