@@ -62,7 +62,7 @@ func TestLoadProviderCodexSubDetected(t *testing.T) {
 
 func TestLoadProviderCodexSubNotLoggedIn(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir()) // empty -> no auth.json
-	res := loadProvider("codex-sub")
+	res := loadProvider("codex-sub", false)
 	if res.key != "" {
 		t.Fatalf("keyless provider key = %q, want empty", res.key)
 	}

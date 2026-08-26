@@ -91,6 +91,11 @@ type fallbackManager struct {
 	// allModelsProvider is set only on the background start-screen catalog.
 	// Its primary provider loads every model; the pool UI still shows only Free.
 	allModelsProvider string
+	// showAll gates the background discovery catalog: when true, secondary
+	// providers (openrouter, opencode-go, BYO free tiers) load their full
+	// paid+free catalog (ListOpenRouterAll etc.) instead of the free-only list,
+	// so the picker surfaces every model — matching `uz --list`.
+	showAll bool
 	listReady         bool
 	editor            *inlineKeyEditor
 	editing           string
@@ -274,15 +279,6 @@ func (m *fallbackManager) refreshCredentials() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// fetchProvider returns a cmd that resolves the provider's key and model list
-// and reports back with a fallbackLoaded message. Always sends a message so the
-// TUI never hangs on a slow or dead endpoint.
-func fetchProvider(provider string) tea.Cmd {
-	return func() tea.Msg {
-		return loadProvider(provider)
-	}
-}
-
 func (m *fallbackManager) fetch(provider string) tea.Cmd {
 	if provider == m.allModelsProvider && provider == "opencode-go" {
 		return func() tea.Msg {
@@ -294,10 +290,20 @@ func (m *fallbackManager) fetch(provider string) tea.Cmd {
 			return fallbackLoaded{provider: provider, models: models.FilterUnavailable(provider, list), key: key, err: err}
 		}
 	}
-	return fetchProvider(provider)
+	return fetchProviderWithAll(provider, m.showAll)
 }
 
-func loadProvider(provider string) fallbackLoaded {
+// fetchProviderWithAll resolves a provider's model list (or key resolution) and
+// reports back with a fallbackLoaded message. When showAll is true it uses the
+// paid-inclusive fetchers (ListOpenRouterAll, ListZenAll, ListFreeTierProviderAll)
+// so the picker shows every model; otherwise it uses the free-only variants.
+func fetchProviderWithAll(provider string, showAll bool) tea.Cmd {
+	return func() tea.Msg {
+		return loadProvider(provider, showAll)
+	}
+}
+
+func loadProvider(provider string, showAll bool) fallbackLoaded {
 	client := &http.Client{Timeout: 4 * time.Second}
 	var (
 		list []models.Model
@@ -328,12 +334,20 @@ func loadProvider(provider string) fallbackLoaded {
 		if key == "" {
 			return fallbackLoaded{provider: provider, key: ""}
 		}
-		list, err = models.ListOpenRouter(client, key)
+		if showAll {
+			list, err = models.ListOpenRouterAll(client, key)
+		} else {
+			list, err = models.ListOpenRouter(client, key)
+		}
 	case "opencode-go":
 		if key == "" {
 			return fallbackLoaded{provider: provider, key: ""}
 		}
-		list, err = models.ListZenFree(client, key)
+		if showAll {
+			list, err = models.ListZenAll(client, key)
+		} else {
+			list, err = models.ListZenFree(client, key)
+		}
 	default:
 		if key == "" {
 			return fallbackLoaded{provider: provider, key: ""}
@@ -342,7 +356,11 @@ func loadProvider(provider string) fallbackLoaded {
 		if !ok {
 			return fallbackLoaded{provider: provider, err: errUnknownProvider(provider)}
 		}
-		list, err = models.ListFreeTierProvider(client, provider, key)
+		if showAll {
+			list, err = models.ListFreeTierProviderAll(client, provider, key)
+		} else {
+			list, err = models.ListFreeTierProvider(client, provider, key)
+		}
 	}
 	list = models.FilterUnavailable(provider, list)
 	return fallbackLoaded{provider: provider, models: list, key: key, err: err}

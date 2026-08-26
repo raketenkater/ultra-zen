@@ -777,6 +777,7 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 	savedPool := LoadFreePool()
 	catalog := newFallbackManager("", savedPool)
 	catalog.allModelsProvider = provider
+	catalog.showAll = allModels
 	if len(ms) > 0 {
 		catalog.seedProvider(provider, ms)
 	}
