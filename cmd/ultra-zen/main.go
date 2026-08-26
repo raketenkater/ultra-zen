@@ -744,7 +744,7 @@ func main() {
 	if modelID == "" {
 		var workerPick, resumeID, tuiProvider string
 		var quit bool
-		res := tui.Run(list, *provider, buildResumeOption())
+		res := tui.Run(list, *provider, buildResumeOption(), *allModels)
 		modelID, tuiProvider, workerPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.ResumeSessionID, res.Quit
 		tuiFreePool = res.FreePool
 		if resumeID != "" {

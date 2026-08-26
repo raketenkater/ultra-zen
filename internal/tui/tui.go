@@ -19,6 +19,10 @@ var (
 	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))
 	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
 	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4EC9B0"))
+	// usageBannerStyle renders the launch-time per-provider usage summary as a
+	// status banner above the model list. It is informational, never selectable,
+	// so it can never be mistaken for a model.
+	usageBannerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Italic(true)
 )
 
 // modelItem is a single model row in the orchestrator/worker lists.
@@ -29,7 +33,8 @@ type modelItem struct {
 
 func (i modelItem) Title() string {
 	// Prefer the friendly Name when set; fall back to the id so the row is
-	// never blank.
+	// never blank. The paid/free tier is shown in Description(), not here —
+	// tagging the title would double-label rows and break the id-fallback test.
 	t := i.m.Name
 	if t == "" || t == i.m.ID {
 		t = i.m.ID
@@ -136,12 +141,17 @@ func (i providerModelItem) Title() string {
 	if i.model.Free {
 		title += "  (free)"
 	}
+	// Paid cross-provider models are reachable via /model + the gateway cache,
+	// but not from the TUI picker (which only shows the primary provider's paid
+	// models under --all-models). Their tier shows in Description(), not here.
 	return title
 }
 func (i providerModelItem) Description() string {
 	tier := "model"
 	if i.model.Free {
 		tier = "free"
+	} else {
+		tier = "paid"
 	}
 	if i.provider == "codex-sub" {
 		return "ChatGPT subscription · auto-detected from the codex CLI login"
@@ -283,6 +293,7 @@ type model struct {
 	resume     *ResumeOption
 	poolErr    string
 	usage      map[string]usageSnapshot // launch-time per-provider usage (set when usageLoaded arrives)
+	allModels  bool                     // --all-models: show paid+free, grouped by tier
 }
 
 func (m model) Init() tea.Cmd {
@@ -326,12 +337,9 @@ func (m *model) startItems() []list.Item {
 		cycle.first = m.freePool[0].String()
 	}
 	items := []list.Item{cycle}
-	// Launch-time per-provider usage summary (OpenRouter credits, Zen 5h window).
-	// Fetched live on a background goroutine; the row refreshes when usageLoaded
-	// arrives. It is non-selectable — purely informational while choosing a model.
-	if m.usage != nil {
-		items = append(items, usageStatusItem{rows: m.usage})
-	}
+	// Launch-time per-provider usage summary (OpenRouter credits, Zen 5h window)
+	// is rendered as a status banner in View(), NOT as a list item — it is
+	// informational, never selectable, so it can never be mistaken for a model.
 	// Providers that haven't produced a model list yet are still surfaced as
 	// status rows so the user sees free models exist but aren't ready — not a
 	// blank screen that implies no free provider is configured.
@@ -624,7 +632,14 @@ func (m model) View() string {
 	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
 	switch m.step {
 	case stepCombo:
-		b += subtitleStyle.Render("  all configured providers — select a model, combo, or free cycle") + "\n\n"
+		b += subtitleStyle.Render("  all configured providers — select a model, combo, or free cycle") + "\n"
+		// Launch-time per-provider usage banner (OpenRouter credits, Zen 5h
+		// window). Informational only — never selectable, so it cannot be
+		// mistaken for a model row. Refreshed when usageLoaded arrives.
+		if m.usage != nil {
+			b += usageBannerStyle.Render("  💰 "+usageSummaryText(m.usage)) + "\n"
+		}
+		b += "\n"
 		b += m.list.View() + "\n"
 		if m.poolErr != "" {
 			b += mutedStyle.Render("  could not save free cycle: "+m.poolErr) + "\n"
@@ -754,7 +769,11 @@ type Result struct {
 // only; choosing it sets ResumeSessionID and returns immediately with an
 // empty Choice, so the caller can reopen that session instead of launching a
 // fresh one.
-func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
+//
+// allModels gates the --all-models catalog: when true every model (paid+free)
+// from the primary provider is shown, grouped into free/paid sub-sections with
+// tier tags, matching the /model picker. When false only free models show.
+func Run(ms []models.Model, provider string, resume *ResumeOption, allModels bool) Result {
 	savedPool := LoadFreePool()
 	catalog := newFallbackManager("", savedPool)
 	catalog.allModelsProvider = provider
@@ -770,6 +789,7 @@ func Run(ms []models.Model, provider string, resume *ResumeOption) Result {
 		catalog:   &catalog,
 		resume:    resume,
 		freePool:  savedPool,
+		allModels: allModels,
 	}
 	items := m.startItems()
 
