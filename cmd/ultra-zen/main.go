@@ -276,7 +276,7 @@ func buildAdvertisedCatalog(
 // only offers providers whose credentials were discovered, so this path never
 // opens another prompt; it resolves the same flag/env/store/auth precedence as
 // the normal startup path and verifies the model list again before launch.
-func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string) ([]models.Model, string, error) {
+func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string, allModels bool) ([]models.Model, string, error) {
 	switch {
 	case provider == "codex-sub":
 		// Re-detect the ChatGPT subscription (same path as the --provider codex
@@ -307,8 +307,18 @@ func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, ap
 		if key == "" {
 			return nil, "", fmt.Errorf("OpenRouter key is no longer available")
 		}
-		list, err := models.ListOpenRouter(client, key)
-		return list, key, err
+		// Must match the primary fetch so a model picked in the picker (paid or
+		// ranked-top-100) is found here too — otherwise models.Find returns nil
+		// and the launch fails. Default = ranked top 100; --all-models = full.
+		if allModels {
+			list, err := models.ListOpenRouterAll(client, key)
+			return list, key, err
+		}
+		ranked, err := models.ListOpenRouterRanked(client, key)
+		if err != nil {
+			return nil, "", err
+		}
+		return models.TopN(ranked, 100), key, nil
 	case provider == "opencode-go":
 		key := keys.Load("opencode-go")
 		if key == "" {
@@ -763,7 +773,7 @@ func main() {
 		launchedFromTUI = true
 		if tuiProvider != "" && (tuiProvider != *provider || len(list) == 0 || key == "") {
 			var err error
-			list, key, err = loadTUIProvider(httpClient, tuiProvider, *authPath, *openRouterKey, *apiKey)
+			list, key, err = loadTUIProvider(httpClient, tuiProvider, *authPath, *openRouterKey, *apiKey, *allModels)
 			if err != nil {
 				die(fmt.Errorf("load TUI provider %s: %w", tuiProvider, err))
 			}
@@ -798,7 +808,7 @@ func main() {
 			}
 			plist, pkey := list, key
 			if poolProvider != *provider {
-				plist, pkey, err = loadTUIProvider(httpClient, poolProvider, *authPath, *openRouterKey, *apiKey)
+				plist, pkey, err = loadTUIProvider(httpClient, poolProvider, *authPath, *openRouterKey, *apiKey, *allModels)
 				if err != nil {
 					continue
 				}

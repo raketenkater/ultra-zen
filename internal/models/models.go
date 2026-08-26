@@ -533,13 +533,15 @@ type rankingEntry struct {
 	tokens int64
 }
 
-// fetchOpenRouterRanking queries /datasets/rankings-daily for the trailing
-// window and aggregates total_tokens per model_permaslug. Transport errors or
-// an empty dataset return an empty map, leaving models unranked (alpha order).
+// fetchOpenRouterRanking queries /datasets/rankings-daily across a trailing
+// ~30-day window and aggregates total_tokens per model_permaslug, giving a
+// month-to-date usage ranking (the daily dataset has no separate monthly
+// endpoint). Transport errors or an empty dataset return an empty map, leaving
+// models unranked (alpha order).
 func fetchOpenRouterRanking(httpClient *http.Client, apiKey string) map[string]rankingEntry {
 	out := map[string]rankingEntry{}
 	now := time.Now()
-	start := now.AddDate(0, 0, -7).UTC().Format("2006-01-02")
+	start := now.AddDate(0, 0, -30).UTC().Format("2006-01-02")
 	end := now.UTC().Format("2006-01-02")
 	url := fmt.Sprintf("%s/datasets/rankings-daily?start_date=%s&end_date=%s", OpenRouterBase, start, end)
 	req, err := http.NewRequest(http.MethodGet, url, nil)

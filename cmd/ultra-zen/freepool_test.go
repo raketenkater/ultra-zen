@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/raketenkater/ultra-zen/internal/keys"
+	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/tui"
 )
 
@@ -142,20 +143,26 @@ func TestLoadTUIProviderOpenRouter(t *testing.T) {
 			Request: req,
 		}, nil
 	})}
-	list, key, err := loadTUIProvider(client, "openrouter", "", "", "")
+	list, key, err := loadTUIProvider(client, "openrouter", "", "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if key != "stored-or-key" {
 		t.Fatalf("key = %q, want stored key", key)
 	}
-	if len(list) != 1 || list[0].ID != "vendor/free:free" {
-		t.Fatalf("models = %+v, want only free OpenRouter model", list)
+	// The reload now mirrors the picker (ranked top-100 / full catalog), so it
+	// must include paid models too — not just the free-only list. With no ranking
+	// data the models sort alphabetically; both are present.
+	if len(list) != 2 {
+		t.Fatalf("models = %+v, want both free and paid OpenRouter models", list)
+	}
+	if models.Find(list, "vendor/paid") == nil {
+		t.Fatal("paid model missing from TUI reload; picker selection would fail to resolve")
 	}
 }
 
 func TestLoadTUIProviderRejectsUnknown(t *testing.T) {
-	if _, _, err := loadTUIProvider(http.DefaultClient, "unknown", "", "", ""); err == nil {
+	if _, _, err := loadTUIProvider(http.DefaultClient, "unknown", "", "", "", false); err == nil {
 		t.Fatal("unknown TUI provider was accepted")
 	}
 }
