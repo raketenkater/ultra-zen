@@ -1307,7 +1307,7 @@ func main() {
 	if exe, err := os.Executable(); err == nil {
 		hookBin = exe
 	}
-	args := claude.Args(selected.ID, hookBin+" workflow-hook", claudeArgs)
+	args := claude.Args(selected.ID, hookBin, claudeArgs)
 
 	cacheDir := sessionCacheDir()
 	sessionLaunchArgs := originalArgs

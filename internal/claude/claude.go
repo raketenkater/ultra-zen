@@ -261,7 +261,7 @@ func SettingsJSON(hookCmd string) string {
 				{
 					"matcher": "Workflow",
 					"hooks": []map[string]any{
-						{"type": "command", "command": hookCmd},
+						{"type": "command", "command": hookCmd + " workflow-hook"},
 					},
 				},
 			},
