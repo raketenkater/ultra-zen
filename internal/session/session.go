@@ -42,6 +42,7 @@ type Record struct {
 	Provider    string    `json:"provider,omitempty"`
 	Model       string    `json:"model,omitempty"`
 	WorkerModel string    `json:"worker_model,omitempty"`
+	FastModel   string    `json:"fast_model,omitempty"`
 	Port        int       `json:"port,omitempty"`
 	LaunchArgs  []string  `json:"launch_args,omitempty"`
 	Workflow    *Workflow `json:"workflow,omitempty"`

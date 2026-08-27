@@ -115,13 +115,31 @@ func TestApplySavedFreePoolHonorsExplicitOverrides(t *testing.T) {
 }
 
 func TestTUILaunchArgsRecordFinalProviderAndPool(t *testing.T) {
-	got := tuiLaunchArgs("zai-org/GLM-5.2", "modelscope", "", modelFlag{
+	got := tuiLaunchArgs("zai-org/GLM-5.2", "modelscope", "", "", modelFlag{
 		"modelscope:zai-org/GLM-5.2",
 		"opencode-go:deepseek-free",
 	}, 0, 20)
 	want := "zai-org/GLM-5.2,--provider,modelscope,--free-model,modelscope:zai-org/GLM-5.2,--free-model,opencode-go:deepseek-free"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("tuiLaunchArgs = %v, want %s", got, want)
+	}
+
+	// "auto" records as nothing (it is the launch default); "none" and explicit
+	// ids record verbatim so resume reproduces the original tier split.
+	got = tuiLaunchArgs("glm-5.2", "opencode-go", "", "auto", nil, 0, 20)
+	want = "glm-5.2,--provider,opencode-go"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs auto = %v, want %s", got, want)
+	}
+	got = tuiLaunchArgs("glm-5.2", "opencode-go", "", "none", nil, 0, 20)
+	want = "glm-5.2,--provider,opencode-go,--fast-model,none"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs none = %v, want %s", got, want)
+	}
+	got = tuiLaunchArgs("glm-5.2", "opencode-go", "", "glm-5.3-flash", nil, 0, 20)
+	want = "glm-5.2,--provider,opencode-go,--fast-model,glm-5.3-flash"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs explicit = %v, want %s", got, want)
 	}
 }
 

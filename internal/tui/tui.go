@@ -364,6 +364,7 @@ const (
 	stepCombo step = iota
 	stepOrchestrator
 	stepWorker
+	stepFast
 	stepKeys
 	stepFallbacks
 )
@@ -375,6 +376,7 @@ type model struct {
 	provider    string
 	choiceVia   string
 	worker      string
+	fast        string // chosen small-fast (classifier) model; "" = auto
 	resumeID    string
 	quit        bool
 	subtitle    string
@@ -605,9 +607,8 @@ func (m model) enterWorkerStep() (tea.Model, tea.Cmd) {
 	items := buildWorkerItems(m.all, m.choice)
 	if len(items) == 0 {
 		// The chosen orchestrator is the only model; there is no worker to
-		// pick. Launch immediately without one.
-		m.worker = ""
-		return m, tea.Quit
+		// pick. Go straight to the fast step (which always offers auto).
+		return m.enterFastStep()
 	}
 	m.step = stepWorker
 	m.list.SetItems(items)
@@ -615,6 +616,58 @@ func (m model) enterWorkerStep() (tea.Model, tea.Cmd) {
 	m.list.ResetFilter()
 	return m, nil
 }
+
+// enterFastStep shows the small-fast (classifier) tier picker. The first row
+// is always the auto option; the orchestrator itself is excluded (pinning the
+// classifier to the main model is what the none row does).
+func (m model) enterFastStep() (tea.Model, tea.Cmd) {
+	items := buildFastItems(m.all, m.choice)
+	m.step = stepFast
+	m.list.SetItems(items)
+	m.list.ResetSelected()
+	m.list.ResetFilter()
+	return m, nil
+}
+
+// buildFastItems lists candidate small-fast models for the chosen orchestrator.
+// Row zero is the auto row (launch-time auto-pick); the "none" row pins every
+// tier to the main model. The orchestrator itself is excluded from the model
+// rows — that would duplicate "none"'s meaning.
+func buildFastItems(ms []models.Model, orchestrator string) []list.Item {
+	items := []list.Item{fastItem{mode: "auto"}, fastItem{mode: "none"}}
+	recent := models.LoadRecent()
+	ordered := models.SortByRecent(ms, recent)
+	isRecent := make(map[string]bool, len(recent))
+	for _, id := range recent {
+		isRecent[id] = true
+	}
+	for _, mdl := range ordered {
+		if mdl.ID == orchestrator {
+			continue
+		}
+		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID]})
+	}
+	return items
+}
+
+// fastItem is one of the two special rows at the top of the fast-step list.
+type fastItem struct{ mode string }
+
+func (i fastItem) Title() string {
+	if i.mode == "auto" {
+		return "auto — pick a flash-tier model at launch"
+	}
+	return "none — run the small-fast tier on the main model"
+}
+
+func (i fastItem) Description() string {
+	if i.mode == "auto" {
+		return "recommended: cheapest-looking model (flash/mini/lite) from the same provider, free variants first"
+	}
+	return "legacy behavior: every tier on the orchestrator"
+}
+
+func (i fastItem) FilterValue() string { return "fast " + i.mode }
 
 // buildWorkerItems lists candidate worker models for the chosen orchestrator.
 // The orchestrator itself is excluded (selecting it as its own worker is a
@@ -692,7 +745,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "k":
-			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker {
+			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast {
 				km := newKeyManager()
 				m.keys = &km
 				m.prevStep = m.step
@@ -700,7 +753,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "f":
-			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker {
+			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast {
 				return m, m.openFallbacks()
 			}
 		case "ctrl+c":
@@ -709,6 +762,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.step == stepWorker {
 				m.worker = ""
+				m.fast = ""
+				return m, tea.Quit
+			}
+			if m.step == stepFast {
+				// Esc on the fast step = auto-pick: keep whatever the launch
+				// resolves, do not pin "none".
+				m.fast = ""
 				return m, tea.Quit
 			}
 		case "enter":
@@ -791,6 +851,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case stepWorker:
 				if item, ok := m.list.SelectedItem().(modelItem); ok {
 					m.worker = item.m.ID
+					return m.enterFastStep()
+				}
+			case stepFast:
+				if item, ok := m.list.SelectedItem().(fastItem); ok {
+					m.fast = item.mode // "" is not stored: "auto"/"none" only
+					return m, tea.Quit
+				}
+				if item, ok := m.list.SelectedItem().(modelItem); ok {
+					m.fast = item.m.ID
 					return m, tea.Quit
 				}
 			}
@@ -834,6 +903,14 @@ func (m model) View() string {
 		b += subtitleStyle.Render("  pick worker for sub-agents (Esc to skip)") + "\n\n"
 		b += m.list.View() + "\n"
 		b += mutedStyle.Render("  / filter · Enter select · Esc skip · k keys · f pool · Ctrl+C quit")
+	case stepFast:
+		b += subtitleStyle.Render("  orchestrator: "+m.choice) + "\n"
+		if m.worker != "" {
+			b += subtitleStyle.Render("  worker:       "+m.worker) + "\n"
+		}
+		b += subtitleStyle.Render("  pick fast model for the small-fast tier — permission classifier and other cheap background calls (Esc = auto)") + "\n\n"
+		b += m.list.View() + "\n"
+		b += mutedStyle.Render("  / filter · Enter select · Esc auto · k keys · f pool · Ctrl+C quit")
 	case stepKeys:
 		if m.keys != nil {
 			return m.keys.View()
@@ -928,13 +1005,16 @@ func providerSubtitle(provider string) string {
 
 // Result is what the selector returns to the caller. Choice is the selected
 // model id ("" when quitting/resuming/error). Worker is the chosen worker
-// model id ("" if skipped). ResumeSessionID is non-empty when the user picked
-// a resume row. Quit is true when the user Ctrl+C'd. FreePool holds any
-// rotation pool configured via the 'f' screen (nil = auto-discover).
+// model id ("" if skipped). Fast is the chosen small-fast (classifier) model
+// id ("" = auto-pick at launch; the special value "none" pins every tier to
+// the main model). ResumeSessionID is non-empty when the user picked a resume
+// row. Quit is true when the user Ctrl+C'd. FreePool holds any rotation pool
+// configured via the 'f' screen (nil = auto-discover).
 type Result struct {
 	Choice          string
 	Provider        string
 	Worker          string
+	Fast            string
 	ResumeSessionID string
 	Quit            bool
 	FreePool        []FreeRoute
@@ -1003,5 +1083,5 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 	if mm.quit || mm.choice == "" {
 		return Result{Quit: mm.quit, FreePool: pool}
 	}
-	return Result{Choice: mm.choice, Provider: mm.choiceVia, Worker: mm.worker, FreePool: pool}
+	return Result{Choice: mm.choice, Provider: mm.choiceVia, Worker: mm.worker, Fast: mm.fast, FreePool: pool}
 }

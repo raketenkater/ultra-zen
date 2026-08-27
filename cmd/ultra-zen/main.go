@@ -104,10 +104,16 @@ func applySavedFreePool(freeModels modelFlag, modelID string, cliWorkerRequested
 // argv that opened the picker. Without this, a TUI launch records no model and
 // resume either opens the picker again or replays the model on the wrong
 // default provider.
-func tuiLaunchArgs(model, provider, worker string, freeModels modelFlag, port, openRouterRPM int) []string {
+func tuiLaunchArgs(model, provider, worker, fast string, freeModels modelFlag, port, openRouterRPM int) []string {
 	args := []string{model, "--provider", provider}
 	if worker != "" {
 		args = append(args, "--worker", worker)
+	}
+	// "auto" records as nothing: it is the default, and replaying an explicit
+	// auto from an old session whose catalog has changed could pick differently
+	// than the original launch did. "none" and explicit ids record verbatim.
+	if fast != "" && fast != "auto" {
+		args = append(args, "--fast-model", fast)
 	}
 	for _, route := range freeModels {
 		args = append(args, "--free-model", route)
@@ -406,6 +412,7 @@ func main() {
 		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
 		apiKey        = flag.String("api-key", "", "API key for --provider saia/groq/cerebras/huggingface/cohere/modelscope (or set that provider's env var)")
 		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
+		fastModel     = flag.String("fast-model", "", "cheap model for Claude Code's small-fast tier (permission classifier etc.); default auto-picks a flash-tier model from the same provider, \"none\" keeps every tier on the main model")
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
@@ -441,13 +448,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Legacy orchestrator/worker split:")
 		fmt.Fprintln(os.Stderr, "  --worker <model>         Use a cheaper model for background sub-agents")
 		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Small-fast tier (permission classifier):")
+		fmt.Fprintln(os.Stderr, "  --fast-model <model>     Cheap model for Claude Code's small-fast tier")
+		fmt.Fprintln(os.Stderr, "                           (default: auto-pick a flash-tier model; \"none\" = main model)")
+		fmt.Fprintln(os.Stderr, "")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	cliWorkerRequested := false
+	cliFastRequested := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "worker" {
 			cliWorkerRequested = true
+		}
+		if f.Name == "fast-model" {
+			cliFastRequested = true
 		}
 	})
 
@@ -486,6 +501,12 @@ func main() {
 		case strings.HasPrefix(arg, "--worker="):
 			*workerModel = strings.TrimPrefix(arg, "--worker=")
 			cliWorkerRequested = true
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--fast-model" && i+1 < len(claudeArgs):
+			*fastModel = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--fast-model="):
+			*fastModel = strings.TrimPrefix(arg, "--fast-model=")
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		case arg == "--free-model" && i+1 < len(claudeArgs):
 			_ = freeModels.Set(claudeArgs[i+1])
@@ -758,10 +779,10 @@ func main() {
 	var tuiFreePool []tui.FreeRoute
 	launchedFromTUI := false
 	if modelID == "" {
-		var workerPick, resumeID, tuiProvider string
+		var workerPick, fastPick, resumeID, tuiProvider string
 		var quit bool
 		res := tui.Run(list, *provider, buildResumeOption(), *allModels)
-		modelID, tuiProvider, workerPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.ResumeSessionID, res.Quit
+		modelID, tuiProvider, workerPick, fastPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.Fast, res.ResumeSessionID, res.Quit
 		tuiFreePool = res.FreePool
 		if resumeID != "" {
 			cmdSessionResume(resumeID, nil)
@@ -782,6 +803,11 @@ func main() {
 		// CLI --worker flag overrides TUI pick; TUI pick fills the default.
 		if *workerModel == "" && workerPick != "" && !freePoolRequested {
 			*workerModel = workerPick
+		}
+		// CLI --fast-model flag overrides TUI pick ("none"/explicit id/auto);
+		// the TUI's "" (Esc = auto) only fills when no flag was passed.
+		if !cliFastRequested && fastPick != "" {
+			*fastModel = fastPick
 		}
 	}
 	// A TUI-configured pool (from the 'f' screen) is folded into freeModels when
@@ -1285,6 +1311,9 @@ func main() {
 	if *workerModel != "" {
 		fmt.Fprintf(os.Stderr, "  worker    ▸ %s\n", *workerModel)
 	}
+	if fast := resolveFastModel(*fastModel, *provider, selected, list); fast != "" && fast != selected.ID {
+		fmt.Fprintf(os.Stderr, "  fast      ▸ %s  (small-fast tier)\n", fast)
+	}
 	for i, fallback := range fallbackRoutes {
 		fmt.Fprintf(os.Stderr, "  fallback %d ▸ %s  (%s)\n", i+1, fallback.Model, fallback.BaseURL)
 	}
@@ -1298,7 +1327,8 @@ func main() {
 		cancel()
 	}()
 
-	env := claude.Env(srv.BaseURL(), selected.ID, selected.ContextLength)
+	fast := resolveFastModel(*fastModel, *provider, selected, list)
+	env := claude.Env(srv.BaseURL(), selected.ID, fast, selected.ContextLength)
 
 	// Resolve the ultra-zen binary path so the Workflow PreToolUse hook can
 	// invoke `ultra-zen workflow-hook` by absolute path (works even if ultra-zen
@@ -1312,9 +1342,9 @@ func main() {
 	cacheDir := sessionCacheDir()
 	sessionLaunchArgs := originalArgs
 	if launchedFromTUI {
-		sessionLaunchArgs = tuiLaunchArgs(selected.ID, *provider, *workerModel, freeModels, *port, *openRouterRPM)
+		sessionLaunchArgs = tuiLaunchArgs(selected.ID, *provider, *workerModel, *fastModel, freeModels, *port, *openRouterRPM)
 	}
-	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *port, sessionLaunchArgs)
+	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *fastModel, *port, sessionLaunchArgs)
 	if sessionErr != nil {
 		cancel()
 		die(fmt.Errorf("resume: %w", sessionErr))
@@ -1347,7 +1377,7 @@ func main() {
 	runErr := cmd.Run()
 	// Record on exit as well as on launch: the workflow run ID is assigned
 	// inside Claude Code, so only now is the resume handle complete.
-	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *port, sessionLaunchArgs)
+	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *fastModel, *port, sessionLaunchArgs)
 	if runErr != nil {
 		cancel()
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
@@ -1356,6 +1386,82 @@ func main() {
 		die(runErr)
 	}
 	cancel()
+}
+
+// resolveFastModel picks the model for Claude Code's small-fast tier (the
+// permission classifier and other cheap background calls), so those calls stop
+// competing with the main loop on the primary model's rate limit.
+//
+//   - "none" (or "off") returns "" → Env keeps every tier on the main model
+//     (the pre-fast-model behavior).
+//   - An explicit model id resolves against the provider catalog and dies on an
+//     unknown id — a typo'd --fast-model should fail loudly, not silently fall
+//     back to a frontier model for every permission check.
+//   - Empty (the default) auto-picks the cheapest-looking model from the same
+//     provider's catalog: a speed-tier keyword in the id or name — flash,
+//     lightning, mini, lite, nano, tiny, small, xs (covering both opencode
+//     Zen's "glm-5.3-flash" and OpenRouter's free-catalog names like
+//     "nemotron-3.5-lightning" and "north-mini-code") — preferring free
+//     variants, and never the primary itself. If nothing matches — or the
+//     only candidate IS the primary — the main model is kept.
+//
+// The returned id is a plain gateway id; Env only emits env vars, and the proxy's
+// modelRoute resolves both plain and claude-prefixed spellings.
+func resolveFastModel(flagValue, provider string, primary *models.Model, list []models.Model) string {
+	switch strings.ToLower(strings.TrimSpace(flagValue)) {
+	case "", "auto":
+	case "none", "off":
+		return ""
+	default:
+		m := models.Find(list, flagValue)
+		if m == nil {
+			die(fmt.Errorf("fast model %q not found in %s catalog; run `ultra-zen --list` to see available models", flagValue, provider))
+		}
+		return m.ID
+	}
+	if primary == nil || len(list) == 0 {
+		return ""
+	}
+	best := ""
+	bestScore := -1
+	for _, m := range list {
+		if m.ID == primary.ID {
+			continue // never demote the classifier to the primary itself via auto-pick
+		}
+		// Segment match, not substring: "minimax-m3" contains "mini" but is a
+		// huge model — a plain Contains would misroute the classifier to it.
+		// Splitting on non-alphanumerics makes "glm-5.3-flash" → [glm 5.3 flash]
+		// while "minimax-m3" → [minimax m3] matches nothing.
+		hay := strings.ToLower(m.ID + " " + m.Name)
+		segs := strings.FieldsFunc(hay, func(r rune) bool {
+			return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+		})
+		var score int
+		for _, seg := range segs {
+			switch {
+			case seg == "flash", seg == "lightning":
+				score = 100
+			case seg == "mini", seg == "lite":
+				if score < 80 {
+					score = 80
+				}
+			case seg == "nano", seg == "tiny", seg == "small", seg == "xs":
+				if score < 70 {
+					score = 70
+				}
+			}
+		}
+		if score == 0 {
+			continue
+		}
+		if m.Free {
+			score += 10 // free variants spare the paid quota too
+		}
+		if score > bestScore {
+			best, bestScore = m.ID, score
+		}
+	}
+	return best
 }
 
 // waitForHealth polls the proxy health endpoint until it responds or the

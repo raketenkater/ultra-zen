@@ -27,15 +27,21 @@ const noTimeoutMS = 2147483647
 const contextWindowDefault = 200_000
 
 // Env returns the child environment that points Claude Code at the local proxy.
-// Every inference tier maps to the same model so background/subagent work stays
-// on the selected Zen model. The real ANTHROPIC_API_KEY is dropped so the dummy
-// auth token + base URL take effect.
+// Sonnet/opus tiers map to the selected Zen model; the small-fast tier (Claude
+// Code's permission classifier and other cheap background calls) maps to
+// fastModel, so those calls run on a cheap tier instead of competing with the
+// main loop on the same model's rate limit. An empty fastModel keeps the old
+// behavior: every tier on the selected model. The real ANTHROPIC_API_KEY is
+// dropped so the dummy auth token + base URL take effect.
 //
 // contextLength is the model's real context window in tokens as reported by the
 // gateway's GET /models endpoint. It sets CLAUDE_MAX_SESSION_TOKENS so Claude
 // Code knows the actual window and can compute the autocompact threshold
 // correctly. When zero (gateway didn't report it), a safe default is used.
-func Env(proxyURL, model string, contextLength int) []string {
+func Env(proxyURL, model, fastModel string, contextLength int) []string {
+	if fastModel == "" {
+		fastModel = model
+	}
 	maxTokens := contextLength
 	if maxTokens <= 0 {
 		maxTokens = contextWindowDefault
@@ -60,8 +66,8 @@ func Env(proxyURL, model string, contextLength int) []string {
 		"ANTHROPIC_BASE_URL="+proxyURL,
 		"ANTHROPIC_AUTH_TOKEN=ultra-zen",
 		"ANTHROPIC_MODEL="+model,
-		"ANTHROPIC_SMALL_FAST_MODEL="+model,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+model,
+		"ANTHROPIC_SMALL_FAST_MODEL="+fastModel,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+fastModel,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL="+model,
 		"ANTHROPIC_DEFAULT_OPUS_MODEL="+model,
 		// /model gateway discovery: Claude Code fetches /v1/models from the

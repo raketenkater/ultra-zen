@@ -93,7 +93,7 @@ func TestEnvGatewayDiscovery(t *testing.T) {
 		os.Unsetenv(k)
 	}
 
-	env := Env("http://127.0.0.1:1234", "deepseek-v4-flash", 200000)
+	env := Env("http://127.0.0.1:1234", "deepseek-v4-flash", "", 200000)
 	got := map[string]string{}
 	for _, kv := range env {
 		k, v, _ := strings.Cut(kv, "=")
@@ -123,7 +123,7 @@ func TestEnvGatewayDiscovery(t *testing.T) {
 func TestEnvAutocompactWindow(t *testing.T) {
 	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
 	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
-	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", 1_000_000)
+	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", "", 1_000_000)
 	got := map[string]string{}
 	for _, kv := range env {
 		k, v, _ := strings.Cut(kv, "=")
@@ -144,7 +144,7 @@ func TestEnvAutocompactWindow(t *testing.T) {
 func TestEnvAutocompactWindowIgnoresInheritedPCT(t *testing.T) {
 	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70")
 	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
-	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", 1_000_000)
+	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", "", 1_000_000)
 	got := map[string]string{}
 	for _, kv := range env {
 		k, v, _ := strings.Cut(kv, "=")
@@ -152,6 +152,42 @@ func TestEnvAutocompactWindowIgnoresInheritedPCT(t *testing.T) {
 	}
 	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "85" {
 		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 85 (inherited 70 must be ignored)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+	}
+}
+
+// TestEnvFastModelTier verifies the small-fast tier (permission classifier and
+// other cheap background calls) rides the fast model while sonnet/opus stay on
+// the primary — and that an empty fastModel keeps every tier on the primary
+// (the pre-fast-model behavior).
+func TestEnvFastModelTier(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+	env := Env("http://127.0.0.1:1", "glm-5.2", "glm-5.3-flash", 200_000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["ANTHROPIC_MODEL"] != "glm-5.2" {
+		t.Fatalf("ANTHROPIC_MODEL = %q, want glm-5.2", got["ANTHROPIC_MODEL"])
+	}
+	if got["ANTHROPIC_SMALL_FAST_MODEL"] != "glm-5.3-flash" {
+		t.Fatalf("ANTHROPIC_SMALL_FAST_MODEL = %q, want glm-5.3-flash", got["ANTHROPIC_SMALL_FAST_MODEL"])
+	}
+	if got["ANTHROPIC_DEFAULT_HAIKU_MODEL"] != "glm-5.3-flash" {
+		t.Fatalf("ANTHROPIC_DEFAULT_HAIKU_MODEL = %q, want glm-5.3-flash", got["ANTHROPIC_DEFAULT_HAIKU_MODEL"])
+	}
+	if got["ANTHROPIC_DEFAULT_SONNET_MODEL"] != "glm-5.2" || got["ANTHROPIC_DEFAULT_OPUS_MODEL"] != "glm-5.2" {
+		t.Fatalf("sonnet/opus = %q/%q, want both glm-5.2", got["ANTHROPIC_DEFAULT_SONNET_MODEL"], got["ANTHROPIC_DEFAULT_OPUS_MODEL"])
+	}
+
+	env = Env("http://127.0.0.1:1", "glm-5.2", "", 200_000)
+	got = map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["ANTHROPIC_SMALL_FAST_MODEL"] != "glm-5.2" {
+		t.Fatalf("empty fastModel: ANTHROPIC_SMALL_FAST_MODEL = %q, want glm-5.2 (legacy behavior)", got["ANTHROPIC_SMALL_FAST_MODEL"])
 	}
 }
 

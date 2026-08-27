@@ -108,7 +108,7 @@ func sessionSpecFromRecord(rec session.Record) *sessionSpec {
 
 // recordSession stores the session and the exact shape it ran under.
 // Recording is evidence, not a dependency: a failure must not stop a launch.
-func recordSession(cacheDir string, spec *sessionSpec, provider, model, workerModel string, port int, launchArgs []string) {
+func recordSession(cacheDir string, spec *sessionSpec, provider, model, workerModel, fastModel string, port int, launchArgs []string) {
 	if spec == nil || cacheDir == "" {
 		return
 	}
@@ -122,6 +122,7 @@ func recordSession(cacheDir string, spec *sessionSpec, provider, model, workerMo
 		Provider:    provider,
 		Model:       model,
 		WorkerModel: workerModel,
+		FastModel:   fastModel,
 		Port:        port,
 		LaunchArgs:  launchArgs,
 		Workflow:    spec.Workflow,
@@ -134,7 +135,7 @@ func recordSession(cacheDir string, spec *sessionSpec, provider, model, workerMo
 // resolveLaunchSession resolves the session for this launch: either a
 // recorded one being resumed (resumeValue set), or a freshly minted ID that
 // is recorded for next time.
-func resolveLaunchSession(cacheDir, resumeValue, provider, model, workerModel string, port int, launchArgs []string) (*sessionSpec, error) {
+func resolveLaunchSession(cacheDir, resumeValue, provider, model, workerModel, fastModel string, port int, launchArgs []string) (*sessionSpec, error) {
 	if resumeValue != "" {
 		workDir, err := os.Getwd()
 		if err != nil {
@@ -153,7 +154,7 @@ func resolveLaunchSession(cacheDir, resumeValue, provider, model, workerModel st
 		fmt.Fprintf(os.Stderr, "[ultra-zen] could not mint a session id: %v\n", err)
 		return nil, nil
 	}
-	recordSession(cacheDir, spec, provider, model, workerModel, port, launchArgs)
+	recordSession(cacheDir, spec, provider, model, workerModel, fastModel, port, launchArgs)
 	return spec, nil
 }
 
@@ -220,7 +221,7 @@ func describeSessionResume(spec *sessionSpec) string {
 // refreshSessionRecord re-records the session once Claude Code exits, so a
 // workflow started during the session is part of the resume handle. The run
 // ID is assigned inside Claude Code and cannot be known at launch.
-func refreshSessionRecord(cacheDir string, spec *sessionSpec, provider, model, workerModel string, port int, launchArgs []string) {
+func refreshSessionRecord(cacheDir string, spec *sessionSpec, provider, model, workerModel, fastModel string, port int, launchArgs []string) {
 	if spec == nil || spec.ID == "" || cacheDir == "" {
 		return
 	}
@@ -244,7 +245,7 @@ func refreshSessionRecord(cacheDir string, spec *sessionSpec, provider, model, w
 			return
 		}
 	}
-	recordSession(cacheDir, spec, provider, model, workerModel, port, launchArgs)
+	recordSession(cacheDir, spec, provider, model, workerModel, fastModel, port, launchArgs)
 }
 
 // stripResumeArgs removes the resume flag from a recorded launch so
@@ -384,6 +385,9 @@ func replayLaunchArgs(rec session.Record) ([]string, error) {
 	}
 	if rec.WorkerModel != "" {
 		launchArgs = append(launchArgs, "--worker", rec.WorkerModel)
+	}
+	if rec.FastModel != "" {
+		launchArgs = append(launchArgs, "--fast-model", rec.FastModel)
 	}
 	// The recorded --port is deliberately not replayed: resume should always
 	// bind a fresh OS-assigned free port so it can never collide with a

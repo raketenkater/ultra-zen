@@ -519,9 +519,10 @@ func TestWorkerSelectionSetsWorker(t *testing.T) {
 	if mm.worker != "worker-model" {
 		t.Fatalf("worker = %q, want worker-model", mm.worker)
 	}
-	if cmd == nil {
-		t.Fatal("selecting a worker should quit the picker (return tea.Quit)")
+	if mm.step != stepFast {
+		t.Fatalf("step = %v, want stepFast (worker pick continues to the fast step)", mm.step)
 	}
+	_ = cmd
 }
 
 // TestStartScreenGroupsModelsByProvider verifies the picker emits collapsible
@@ -585,5 +586,205 @@ func TestGroupHeadersAreNotSelectable(t *testing.T) {
 	mm := updated.(model)
 	if mm.choice != "" || mm.choiceVia != "" || mm.quit {
 		t.Fatalf("header Enter produced a choice: choice=%q via=%q quit=%v", mm.choice, mm.choiceVia, mm.quit)
+	}
+}
+
+// TestFastStepFlowAfterWorker verifies the picker now walks
+// orchestrator -> worker -> fast, that Esc on the fast step means auto
+// (empty Fast, quit), and that picking the auto/none rows records the
+// corresponding mode.
+func TestFastStepFlowAfterWorker(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ms := []models.Model{
+		{ID: "orchestrator", Name: "orchestrator"},
+		{ID: "worker-model", Name: "worker-model"},
+		{ID: "flash-model", Name: "flash-model"},
+	}
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+
+	// Pick orchestrator -> worker step.
+	for i, item := range m.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "orchestrator" {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.step != stepWorker {
+		t.Fatalf("step = %v, want stepWorker", mm.step)
+	}
+
+	// Pick worker -> fast step.
+	for i, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "worker-model" {
+			mm.list.Select(i)
+			break
+		}
+	}
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(model)
+	if mm.step != stepFast {
+		t.Fatalf("step = %v, want stepFast", mm.step)
+	}
+	// The fast list must start with the auto row and exclude the orchestrator.
+	first, ok := mm.list.Items()[0].(fastItem)
+	if !ok || first.mode != "auto" {
+		t.Fatalf("first fast row = %#v, want auto", mm.list.Items()[0])
+	}
+	for _, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "orchestrator" {
+			t.Fatal("fast list must exclude the orchestrator")
+		}
+	}
+
+	// Esc on the fast step = auto: empty Fast and quit.
+	updated, escCmd := mm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mm = updated.(model)
+	if mm.fast != "" {
+		t.Fatalf("Esc on fast step should leave fast empty (auto), got %q", mm.fast)
+	}
+	if escCmd == nil {
+		t.Fatal("Esc on fast step should quit the picker")
+	}
+}
+
+// TestFastStepAutoAndNoneRows verifies the auto and none rows set the
+// corresponding fast mode and quit.
+func TestFastStepAutoAndNoneRows(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ms := []models.Model{
+		{ID: "orchestrator", Name: "orchestrator"},
+		{ID: "flash-model", Name: "flash-model"},
+	}
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+
+	for i, item := range m.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "orchestrator" {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	// Only one non-orchestrator model exists, so the worker list has exactly
+	// one entry; picking it lands on the fast step.
+	for i, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "flash-model" {
+			mm.list.Select(i)
+			break
+		}
+	}
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(model)
+	if mm.step != stepFast {
+		t.Fatalf("step = %v, want stepFast", mm.step)
+	}
+
+	// Pick the auto row.
+	mm.list.Select(0)
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(model)
+	if mm.fast != "auto" {
+		t.Fatalf("auto row: fast = %q, want auto", mm.fast)
+	}
+
+	// Re-enter the step and pick none.
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEsc}) // quit
+	mm = updated.(model)
+	mm2 := model{all: ms, provider: "opencode-go", subtitle: "opencode Zen", step: stepCombo, choice: "orchestrator"}
+	l2 := list.New(mm2.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l2.SetShowStatusBar(false)
+	l2.SetFilteringEnabled(true)
+	l2.SetShowHelp(false)
+	mm2.list = l2
+	st, _ := mm2.enterWorkerStep()
+	mm3 := st.(model)
+	for i, item := range mm3.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "flash-model" {
+			mm3.list.Select(i)
+			break
+		}
+	}
+	st2, _ := mm3.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm4 := st2.(model)
+	if mm4.step != stepFast {
+		t.Fatalf("step = %v, want stepFast", mm4.step)
+	}
+	mm4.list.Select(1) // the none row
+	updated, _ = mm4.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm5 := updated.(model)
+	if mm5.fast != "none" {
+		t.Fatalf("none row: fast = %q, want none", mm5.fast)
+	}
+}
+
+// TestFastStepExplicitModel verifies picking a concrete model row in the fast
+// step records that id.
+func TestFastStepExplicitModel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ms := []models.Model{
+		{ID: "orchestrator", Name: "orchestrator"},
+		{ID: "worker-model", Name: "worker-model"},
+		{ID: "flash-model", Name: "flash-model"},
+	}
+	m := model{
+		all:      ms,
+		provider: "opencode-go",
+		subtitle: "opencode Zen",
+		step:     stepCombo,
+	}
+	l := list.New(m.startItems(), list.NewDefaultDelegate(), 80, 30)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	m.list = l
+
+	for i, item := range m.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "orchestrator" {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	for i, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "worker-model" {
+			mm.list.Select(i)
+			break
+		}
+	}
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(model)
+	for i, item := range mm.list.Items() {
+		if mi, ok := item.(modelItem); ok && mi.m.ID == "flash-model" {
+			mm.list.Select(i)
+			break
+		}
+	}
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm = updated.(model)
+	if mm.fast != "flash-model" {
+		t.Fatalf("explicit fast pick = %q, want flash-model", mm.fast)
 	}
 }
