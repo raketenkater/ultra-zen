@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -392,10 +393,11 @@ func (m *fallbackManager) rebuildList() tea.Cmd {
 		st := m.states[p]
 		switch st.status {
 		case statusLoading:
-			items = append(items, fallbackRow{provider: p, kind: rowLoading})
+			items = append(items, groupHeaderItem{label: p}, fallbackRow{provider: p, kind: rowLoading})
 		case statusKeyless:
-			items = append(items, fallbackRow{provider: p, kind: rowNoKey})
+			items = append(items, groupHeaderItem{label: p}, fallbackRow{provider: p, kind: rowNoKey})
 		case statusReady:
+			var rows []list.Item
 			for _, model := range st.models {
 				if !model.Free {
 					continue
@@ -403,25 +405,28 @@ func (m *fallbackManager) rebuildList() tea.Cmd {
 				if model.ID == m.primaryModel {
 					continue // already the primary; don't offer as fallback
 				}
-				items = append(items, fallbackRow{
+				rows = append(rows, fallbackRow{
 					provider: p,
 					modelID:  model.ID,
 					kind:     rowModel,
 					inPool:   m.selected[selKey(p, model.ID)],
+					free:     true,
+					ctx:      model.ContextLength,
 				})
+			}
+			if len(rows) > 0 {
+				items = append(items, groupHeaderItem{label: p, count: len(rows)})
+				items = append(items, rows...)
 			}
 		case statusHidden:
 			// skip
 		case statusError:
-			items = append(items, fallbackRow{provider: p, kind: rowError, detail: st.err})
+			items = append(items, groupHeaderItem{label: p}, fallbackRow{provider: p, kind: rowError, detail: st.err})
 		}
 	}
 	if !m.listReady {
-		l := list.New(items, list.NewDefaultDelegate(), 60, 20)
-		l.Title = "Free rotation pool"
-		l.SetShowStatusBar(false)
-		l.SetFilteringEnabled(true)
-		l.SetShowHelp(false)
+		l := list.New(items, columnDelegate{showMark: true}, 60, 20)
+		configureList(&l)
 		m.list = l
 		m.listReady = true
 		return nil
@@ -443,45 +448,47 @@ const (
 )
 
 // fallbackRow is one row in the fallback list: a loading placeholder, a
-// key-prompt row, or a toggleable model.
+// key-prompt row, or a toggleable model. free/ctx are display-only fields
+// feeding the tail column (membership state lives in inPool, rendered by
+// the delegate gutter).
 type fallbackRow struct {
 	provider string
 	modelID  string
 	kind     rowKind
 	inPool   bool
 	detail   string
+	free     bool
+	ctx      int
 }
 
 func (r fallbackRow) Title() string {
 	switch r.kind {
 	case rowLoading:
-		return "… loading " + r.provider + " models"
+		return "loading" + gEll
 	case rowNoKey:
-		return r.provider + " — no key, Enter to set"
+		return "no key — Enter to set"
 	case rowError:
-		return r.provider + " — unavailable, Enter to retry"
+		return "unavailable · Enter to retry"
 	default:
-		mark := "[ ]"
-		if r.inPool {
-			mark = "[✓]"
-		}
-		return mark + " " + r.modelID
+		// The in/out-of-pool mark lives in the delegate gutter, not the name.
+		return r.modelID
 	}
 }
-func (r fallbackRow) Description() string {
-	switch r.kind {
-	case rowLoading:
-		return "fetching free models"
-	case rowNoKey:
-		return "a credential is required to use " + r.provider + " as a fallback"
-	case rowError:
-		return r.detail
-	default:
-		if r.inPool {
-			return r.provider + " · in pool — Enter to remove"
-		}
-		return r.provider + " · free — Enter to add to pool"
+
+// tailParts mirrors modelItem for pool candidates: tier first, then ctx.
+// Status rows have no tail.
+func (r fallbackRow) tailParts() []string {
+	if r.kind != rowModel {
+		return nil
 	}
+	parts := []string{"paid"}
+	if r.free {
+		parts[0] = "free"
+	}
+	if r.ctx > 0 {
+		parts = append(parts, fmt.Sprintf("%dk", r.ctx/1024))
+	}
+	return parts
 }
 func (r fallbackRow) FilterValue() string {
 	return r.provider + " " + r.modelID
@@ -647,6 +654,14 @@ func (m *fallbackManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "x", "d":
 			return m, m.toggle()
 		case "enter":
+			// Section headers are not rows: nudge the cursor to the next
+			// provider block instead of swallowing Enter.
+			if _, isHeader := m.list.SelectedItem().(groupHeaderItem); isHeader {
+				if items := m.list.Items(); m.list.Index()+1 < len(items) {
+					m.list.Select(m.list.Index() + 1)
+				}
+				return m, nil
+			}
 			item, ok := m.list.SelectedItem().(fallbackRow)
 			if !ok {
 				return m, nil
@@ -672,15 +687,13 @@ func (m *fallbackManager) View() string {
 	if m.editor != nil {
 		return m.editor.View()
 	}
-	var b string
-	b += titleStyle.Render("◆ ultra-zen") + "\n"
-	b += subtitleStyle.Render("  Free rotation pool") + "\n\n"
-	b += m.list.View() + "\n"
+	var body string
+	body += m.list.View() + "\n"
 	if len(m.order) > 0 {
-		b += mutedStyle.Render("  pool: "+strings.Join(m.orderKeys(), " → ")) + "\n"
+		body += mutedStyle.Render("pool  " + strings.Join(m.orderKeys(), " "+gArrow+" ")) + "\n"
 	}
-	b += mutedStyle.Render("  Enter toggle · x remove · r reset · Esc save & back") + "\n"
-	return b
+	footer := mutedStyle.Render("enter toggle  r reset  esc save  ctrl+c quit")
+	return frame("pool", "", body, footer, "", m.list.Width()+4)
 }
 
 // orderKeys renders the current pool for the footer (provider/model pairs).

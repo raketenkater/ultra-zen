@@ -25,10 +25,42 @@ func feedProvider(m *fallbackManager, provider string, ids ...string) {
 	m.rebuildList()
 }
 
-// toggleRow presses Enter on the row at index i (which toggles a model).
+// toggleRow presses Enter on the i-th model row (headers are not rows).
 func toggleRow(t *testing.T, m *fallbackManager, i int) {
-	m.list.Select(i)
+	selectModelRow(m, i)
 	m.toggle()
+}
+
+// selectModelRow positions the cursor on the i-th rowModel item, skipping
+// section headers — the pool list interleaves providers with headers, so raw
+// item indices carry no meaning.
+func selectModelRow(m *fallbackManager, i int) {
+	n := 0
+	for idx, item := range m.list.Items() {
+		if row, ok := item.(fallbackRow); ok && row.kind == rowModel {
+			if n == i {
+				m.list.Select(idx)
+				return
+			}
+			n++
+		}
+	}
+	panic("selectModelRow: index out of range")
+}
+
+// selectKindRow positions the cursor on the i-th fallbackRow of a given kind.
+func selectKindRow(m *fallbackManager, kind rowKind, i int) {
+	n := 0
+	for idx, item := range m.list.Items() {
+		if row, ok := item.(fallbackRow); ok && row.kind == kind {
+			if n == i {
+				m.list.Select(idx)
+				return
+			}
+			n++
+		}
+	}
+	panic("selectKindRow: index out of range")
 }
 
 func TestRoutesEmptyByDefault(t *testing.T) {
@@ -42,8 +74,8 @@ func TestToggleAddsAndRemovesFromOrder(t *testing.T) {
 	m := newFallbackManager("")
 	feedProvider(&m, "modelscope", "deepseek-ai/DeepSeek-V4-Flash", "ZhipuAI/GLM-5.2")
 
-	// Toggle the first model (index 0).
-	m.list.Select(0)
+	// Toggle the first model.
+	selectModelRow(&m, 0)
 	m.toggle()
 	routes := m.routes()
 	if len(routes) != 1 {
@@ -54,7 +86,7 @@ func TestToggleAddsAndRemovesFromOrder(t *testing.T) {
 	}
 
 	// Toggle it off again — order should be empty.
-	m.list.Select(0)
+	selectModelRow(&m, 0)
 	m.toggle()
 	if got := m.routes(); len(got) != 0 {
 		t.Fatalf("routes() after untoggle = %v, want empty", got)
@@ -150,13 +182,13 @@ func TestApplyLoadShowsMissingKey(t *testing.T) {
 func TestToggleKeepsExactCursorAndFooterOrder(t *testing.T) {
 	m := newFallbackManager("")
 	feedProvider(&m, "openrouter", "a:free", "b:free", "c:free")
-	m.list.Select(2)
+	selectModelRow(&m, 2)
 	m.toggle()
 	row, ok := m.list.SelectedItem().(fallbackRow)
 	if !ok || row.modelID != "c:free" {
 		t.Fatalf("cursor moved to %#v after toggle, want c:free", m.list.SelectedItem())
 	}
-	m.list.Select(0)
+	selectModelRow(&m, 0)
 	m.toggle()
 	got := m.orderKeys()
 	if len(got) != 2 || got[0] != "c:free" || got[1] != "a:free" {
@@ -193,7 +225,9 @@ func TestFallbackKeyEntryIsInline(t *testing.T) {
 		}
 	}
 	m.rebuildList()
-	m.list.Select(0)
+	// The keyless provider renders as a status row under its section header;
+	// Enter on it must open the inline key editor.
+	selectKindRow(&m, rowNoKey, 0)
 	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.editor == nil {
 		t.Fatal("Enter did not open an inline editor")

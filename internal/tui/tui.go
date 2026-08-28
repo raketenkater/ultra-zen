@@ -8,6 +8,8 @@ package tui
 import (
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -17,99 +19,213 @@ import (
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
+// "The Column" design tokens: a gray ramp, one cyan accent (the cursor and
+// the selected line), one red reserved for errors. No background fills, and
+// never Faint — SGR 2 vanishes on some SSH terminals, so dimness is a color
+// token, not an attribute. AdaptiveColor pairs keep truecolor/256/16-color
+// degradation correct; the ANSI-16 slots (white/black, bright-black,
+// cyan/blue, bright-red/red) are position-stable across the ramp.
 var (
-	// Brand accent: violet, used for the wordmark, selection, and section rules.
-	accent = lipgloss.Color("#A78BFA")
-	// Palette: one accent, then a quiet gray ramp. Nothing else competes.
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(accent)
-	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
-	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
-	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#5EEAD4"))
-	// crumbStyle renders the already-chosen steps (orchestrator/worker) as
-	// breadcrumbs on later steps.
-	crumbStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#C4B5FD"))
-	// usageBannerStyle renders the launch-time per-provider usage summary as a
-	// status banner above the model list. It is informational, never selectable,
-	// so it can never be mistaken for a model.
-	usageBannerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B7BD8"))
-	// groupHeaderStyle renders a section rule above a provider's model rows:
-	// small caps-ish label, a count, and a thin rule — quieter than a filled
-	// banner, so sections read as structure rather than as selectable rows.
-	groupHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("#C4B5FD")).
-				Margin(1, 0, 0, 0)
-	groupRuleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B3245"))
-	// freeTagStyle / paidTagStyle add a subtle colored tier marker to a model
-	// row's description so free vs paid stays readable at a glance without
-	// being noisy. Free = green, paid = muted.
-	freeTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#4ADE80"))
-	paidTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+	colFG     = lipgloss.AdaptiveColor{Light: "#1A1A1A", Dark: "#D6D6D6"}
+	colMuted  = lipgloss.AdaptiveColor{Light: "#767676", Dark: "#6C6C6C"}
+	colAccent = lipgloss.AdaptiveColor{Light: "#005F87", Dark: "#5FD7FF"}
+	colAlert  = lipgloss.AdaptiveColor{Light: "#B00000", Dark: "#E05555"}
+
+	fgStyle         = lipgloss.NewStyle().Foreground(colFG)
+	mutedStyle      = lipgloss.NewStyle().Foreground(colMuted)
+	accentStyle     = lipgloss.NewStyle().Foreground(colAccent)
+	accentBoldStyle = lipgloss.NewStyle().Bold(true).Foreground(colAccent)
+	alertStyle      = lipgloss.NewStyle().Foreground(colAlert)
+	matchStyle      = lipgloss.NewStyle().Underline(true)
 )
 
-// selectedTitleStyle is the selected row's title: bold violet text instead of
-// the stock white-on-default block. Padding matches NormalTitle (2 cols) so
-// rows never shift horizontally when the cursor moves.
-var selectedTitleStyle = lipgloss.NewStyle().
-	Bold(true).
-	Foreground(accent).
-	PaddingLeft(2)
+// The glyph set: exactly one icon (the cursor) plus four data glyphs, each
+// with a defined meaning. TERM=linux/dumb swaps to ASCII — meaning also
+// lives in words and position, never in a glyph alone.
+var (
+	gCursor  = "❯"
+	gDot     = "·"
+	gMarkOn  = "×"
+	gMarkOff = "·"
+	gArrow   = "→"
+	gEll     = "…"
+)
 
-// rowIndentStyle indents descriptions to the titles' left edge (2 cols).
-var rowIndentStyle = lipgloss.NewStyle().PaddingLeft(2)
-
-// pickerDelegate renders the start-screen list like bubbles' DefaultDelegate,
-// but (a) emits descriptions verbatim so the colored free/paid tier tags keep
-// their ANSI, (b) renders groupHeaderItem rows as a single styled banner
-// with no selection chrome, and (c) restyles the selected/normal rows: the
-// selection is a violet bar + bold accent title instead of the stock white
-// block, and the description is indented to align with the title text.
-// It implements list.ItemDelegate.
-type pickerDelegate struct {
-	list.DefaultDelegate
+func init() {
+	switch os.Getenv("TERM") {
+	case "linux", "dumb":
+		gCursor, gDot, gMarkOn, gMarkOff, gArrow, gEll = ">", "-", "x", "-", "->", ".."
+	}
 }
 
-func (d pickerDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
-	if header, ok := listItem.(groupHeaderItem); ok {
-		fmt.Fprintf(w, "%s", header.Title())
+// tailer is the row contract behind the column layout: Title() is the bare
+// identity, tailParts() the facts shown right-aligned in the tail column.
+// Parts are ordered by drop priority: when the row runs out of width the
+// delegate sheds trailing parts (recent first, then ctx) — the first part,
+// the tier word, is never dropped.
+type tailer interface {
+	list.Item
+	Title() string
+	tailParts() []string
+}
+
+// columnDelegate renders every item as exactly one physical line:
+// [gutter][name left-aligned][tail right-aligned]. Height()==1 for all rows,
+// headers included, which is what keeps the list's pagination arithmetic
+// honest (two-line rows under a uniform-height paginator drift and
+// overflow). showMark adds the pool screen's membership glyph, placing names
+// at col 4 there and col 2 everywhere else.
+type columnDelegate struct {
+	showMark bool
+}
+
+func (columnDelegate) Height() int                         { return 1 }
+func (columnDelegate) Spacing() int                        { return 0 }
+func (columnDelegate) Update(tea.Msg, *list.Model) tea.Cmd { return nil }
+
+func (d columnDelegate) gutterWidth() int {
+	if d.showMark {
+		return 4
+	}
+	return 2
+}
+
+func (d columnDelegate) gutter(selected bool, item list.Item) string {
+	if d.showMark {
+		mark := gMarkOff
+		if row, ok := item.(fallbackRow); ok {
+			switch {
+			case row.kind != rowModel:
+				// Status rows keep the mark slot blank but still take the
+				// cursor — Enter on them does something (set a key, retry).
+				if selected {
+					return gCursor + "   "
+				}
+				return "    "
+			case row.inPool:
+				mark = gMarkOn
+			}
+		}
+		if selected {
+			return gCursor + " " + mark + " "
+		}
+		return "  " + mark + " "
+	}
+	if selected {
+		return gCursor + " "
+	}
+	return "  "
+}
+
+func (d columnDelegate) nameCap(listWidth int) int {
+	// Budget at 80 cols: gutter 2 + name 44 + gap 2 + tail 28 = listWidth 76.
+	// Wider terminals relax the name cap toward 96; nothing drops at 120.
+	c := 44 + (listWidth - 76)
+	if c > 96 {
+		c = 96
+	}
+	if c < 20 {
+		c = 20
+	}
+	return c
+}
+
+func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	lw := m.Width()
+	if lw <= 0 {
 		return
 	}
-	var (
-		title, desc string
-		s           = &d.Styles
-	)
-	if i, ok := listItem.(list.DefaultItem); ok {
-		title = i.Title()
-		desc = i.Description()
-	} else {
+	// Section headers: one muted line, flush col 0, no cursor. The indent
+	// delta (col 0 vs col 2) is the only separation they need — no rules,
+	// no pills, no blank line above.
+	if header, ok := item.(groupHeaderItem); ok {
+		fmt.Fprintf(w, "%s", mutedStyle.Render(header.line()))
 		return
 	}
-	if m.Width() <= 0 {
+	t, ok := item.(tailer)
+	if !ok {
 		return
 	}
-	textwidth := m.Width() - s.NormalTitle.GetPaddingLeft() - s.NormalTitle.GetPaddingRight()
 	isSelected := index == m.Index()
 	emptyFilter := m.FilterState() == list.Filtering && m.FilterValue() == ""
-	if emptyFilter {
-		title = s.DimmedTitle.Render(title)
-	} else if isSelected && m.FilterState() != list.Filtering {
-		title = selectedTitleStyle.Render(title)
+	_, isStatus := item.(providerStatusItem)
+	_, isFallbackStatus := item.(fallbackRow)
+	if fr, ok := item.(fallbackRow); ok && fr.kind != rowModel {
+		isFallbackStatus = true
 	} else {
-		title = s.NormalTitle.Render(title)
+		isFallbackStatus = false
 	}
-	title = ansiTruncate(title, textwidth)
-	// The description is emitted verbatim (NOT wrapped in a delegate style): its
-	// inner ANSI — the colored free/paid tier tag — must survive, and the muted
-	// styling is already baked into Description() itself. Indented to the same
-	// left edge as titles: the stock delegate leaves descriptions flush-left,
-	// which broke the column alignment.
-	desc = rowIndentStyle.Render(desc)
-	desc = ansiTruncate(desc, textwidth)
-	if d.ShowDescription {
-		fmt.Fprintf(w, "%s\n%s", title, desc)
-		return
+
+	gutter := d.gutter(isSelected && !emptyFilter, item)
+	name := ansiTruncate(t.Title(), d.nameCap(lw))
+	parts := t.tailParts()
+	tail := strings.Join(parts, "  ")
+
+	// Right-align the tail, shedding parts (then the name) until the row
+	// fits. The tier word — parts[0] — survives to the end.
+	gw := d.gutterWidth()
+	for len(parts) > 0 && gw+ansi.StringWidth(name)+2+ansi.StringWidth(tail) > lw && len(parts) > 1 {
+		parts = parts[:len(parts)-1]
+		tail = strings.Join(parts, "  ")
 	}
-	fmt.Fprintf(w, "%s", title)
+	if nameW := lw - gw - 2 - ansi.StringWidth(tail); ansi.StringWidth(name) > nameW {
+		name = ansiTruncate(name, max(nameW, 8))
+	}
+	pad := strings.Repeat(" ", max(lw-gw-ansi.StringWidth(name)-ansi.StringWidth(tail), 1))
+
+	// Error-state rows (provider unreachable) render the name in red; other
+	// non-selectable status rows sit one step dimmer than models.
+	nameStyle, tailStyle := fgStyle, mutedStyle
+	switch {
+	case isStatus:
+		nameStyle = mutedStyle
+		if st := item.(providerStatusItem); st.kind == "error" {
+			nameStyle = alertStyle
+		}
+	case isFallbackStatus:
+		nameStyle = mutedStyle
+		if fr := item.(fallbackRow); fr.kind == rowError {
+			nameStyle = alertStyle
+		}
+	}
+
+	var line string
+	switch {
+	case isSelected && !emptyFilter:
+		if m.FilterState() == list.Filtering {
+			// Mid-query: underline the matched runes of the name only
+			// (stock DefaultDelegate semantics), rest of the line bold-accent.
+			matched := m.MatchesForItem(index)
+			unmatched := accentBoldStyle.Inline(true)
+			matchedStyle := unmatched.Inherit(matchStyle)
+			line = accentBoldStyle.Render(gutter) +
+				lipgloss.StyleRunes(name, matched, matchedStyle, unmatched) +
+				accentBoldStyle.Render(pad+tail)
+		} else {
+			line = accentBoldStyle.Render(gutter + name + pad + tail)
+		}
+	case emptyFilter:
+		line = mutedStyle.Render(gutter+name) + mutedStyle.Render(pad+tail)
+	default:
+		line = nameStyle.Render(gutter+name) + tailStyle.Render(pad+tail)
+	}
+	// Exactly one write, no trailing newline: bubbles joins items itself.
+	fmt.Fprintf(w, "%s", line)
+}
+
+// configureList applies the shared list chrome: the frame owns all titles,
+// so the list renders no title bar (the filter prompt still swaps in while
+// filtering because showFilter keeps that section live). FilterInput is
+// configured after New because list.New bakes Styles.FilterPrompt into the
+// textinput at construction.
+func configureList(l *list.Model) {
+	l.Title = ""
+	l.SetShowTitle(false)
+	l.SetShowStatusBar(false)
+	l.SetShowHelp(false)
+	l.SetFilteringEnabled(true)
+	l.FilterInput.Prompt = "/ "
+	l.FilterInput.PromptStyle = accentStyle
 }
 
 // ansiTruncate truncates a (possibly ANSI-styled) string to textwidth display
@@ -128,20 +244,12 @@ type modelItem struct {
 }
 
 func (i modelItem) Title() string {
-	// Prefer the friendly Name when set; fall back to the id so the row is
-	// never blank. The paid/free tier is shown in Description(), not here —
-	// tagging the title would double-label rows and break the id-fallback test.
-	t := i.m.Name
-	if t == "" || t == i.m.ID {
-		t = i.m.ID
+	// Bare identity: the friendly Name when set, the id otherwise. Tier and
+	// recency live in the tail column, never in the title.
+	if i.m.Name != "" && i.m.Name != i.m.ID {
+		return i.m.Name
 	}
-	if i.m.Free {
-		t += "  (free)"
-	}
-	if i.recent {
-		t += "  " + recentStyle.Render("recent")
-	}
-	return t
+	return i.m.ID
 }
 
 var (
@@ -153,41 +261,20 @@ var (
 	baseCohere      = "https://api.cohere.ai/compatibility/v1"
 )
 
-func (i modelItem) Description() string {
-	var tier string
-	switch i.m.Base {
-	case baseOpenRouter:
-		tier = "OpenRouter"
-	case baseModelScope:
-		tier = "ModelScope"
-	case baseGroq:
-		tier = "Groq"
-	case baseCerebras:
-		tier = "Cerebras"
-	case baseHuggingFace:
-		tier = "HuggingFace"
-	case baseCohere:
-		tier = "Cohere"
-	case models.CodexSubBase:
-		tier = "ChatGPT subscription"
-	default:
-		if i.m.Free {
-			tier = "zen free"
-		} else {
-			tier = "opencode-go"
-		}
+// tailParts renders the tier word first (it is never dropped), then context,
+// then recency (shed first under width pressure).
+func (i modelItem) tailParts() []string {
+	parts := []string{"paid"}
+	if i.m.Free {
+		parts[0] = "free"
 	}
 	if i.m.ContextLength > 0 {
-		tier += fmt.Sprintf(" · %dk ctx", i.m.ContextLength/1024)
+		parts = append(parts, fmt.Sprintf("%dk", i.m.ContextLength/1024))
 	}
-	// A subtle colored tier tag (free = green, paid = muted) so the free/paid
-	// split stays visible at a glance. The delegate renders this description
-	// verbatim, preserving the inner ANSI.
-	tag := paidTagStyle.Render("paid")
-	if i.m.Free {
-		tag = freeTagStyle.Render("free")
+	if i.recent {
+		parts = append(parts, "recent")
 	}
-	return tag + mutedStyle.Render("  "+tier)
+	return parts
 }
 func (i modelItem) FilterValue() string { return i.m.ID }
 
@@ -208,23 +295,22 @@ type cycleItem struct {
 	loading   bool
 }
 
-func (i cycleItem) Title() string {
+func (i cycleItem) Title() string { return "free-cycle" }
+
+// tailParts: configured routes count, or the one-word ask ("setup · f") /
+// in-progress state. The first route never fits the tail honestly; it lives
+// in the pool footer chain instead.
+func (i cycleItem) tailParts() []string {
 	if i.selected > 0 {
-		return fmt.Sprintf("Free cycle ready — %d routes", i.selected)
-	}
-	return "Free cycle — configure provider rotation →"
-}
-func (i cycleItem) Description() string {
-	if i.selected > 0 {
-		return "Enter launch from " + i.first + " · f edits the pool"
+		return []string{fmt.Sprintf("%d routes", i.selected)}
 	}
 	if i.available == 0 {
 		if i.loading {
-			return "loading configured free providers · Enter to view live status"
+			return []string{"loading" + gEll}
 		}
-		return "no provider models available yet · Enter to add keys"
+		return []string{"setup " + gDot + " f"}
 	}
-	return fmt.Sprintf("%d free models discovered · OpenRouter, OpenCode Zen, and BYO free tiers", i.available)
+	return []string{fmt.Sprintf("%d models", i.available)}
 }
 func (i cycleItem) FilterValue() string { return "free cycle pool rotation providers" }
 
@@ -237,30 +323,24 @@ type providerModelItem struct {
 }
 
 func (i providerModelItem) Title() string {
-	title := i.model.Name
-	if title == "" || title == i.model.ID {
-		title = i.model.ID
+	if i.model.Name != "" && i.model.Name != i.model.ID {
+		return i.model.Name
 	}
-	if i.model.Free {
-		title += "  (free)"
-	}
-	// Paid cross-provider models are reachable via /model + the gateway cache,
-	// but not from the TUI picker (which only shows the primary provider's paid
-	// models under --all-models). Their tier shows in Description(), not here.
-	return title
+	return i.model.ID
 }
-func (i providerModelItem) Description() string {
-	// A subtle colored tier tag (free = green, paid = muted) so the free/paid
-	// split stays visible at a glance; the delegate renders verbatim, keeping
-	// the inner ANSI.
-	tag := paidTagStyle.Render("paid")
+
+// tailParts mirrors modelItem: tier first, then ctx. The provider never
+// appears in the tail on the start screen — the section header above already
+// names it (grafted rule: names are stated once).
+func (i providerModelItem) tailParts() []string {
+	parts := []string{"paid"}
 	if i.model.Free {
-		tag = freeTagStyle.Render("free")
+		parts[0] = "free"
 	}
-	if i.provider == "codex-sub" {
-		return tag + mutedStyle.Render("  ChatGPT subscription · auto-detected from the codex CLI login")
+	if i.model.ContextLength > 0 {
+		parts = append(parts, fmt.Sprintf("%dk", i.model.ContextLength/1024))
 	}
-	return tag + mutedStyle.Render("  "+i.provider+" · provider discovered automatically")
+	return parts
 }
 func (i providerModelItem) FilterValue() string {
 	return i.provider + " " + i.model.ID
@@ -277,90 +357,62 @@ type providerStatusItem struct {
 }
 
 func (i providerStatusItem) Title() string {
-	switch i.kind {
-	case "loading":
-		return i.provider + " — loading free models…"
-	case "keyless":
-		if i.provider == "codex-sub" {
-			return "Codex (ChatGPT sub) — not logged in (run `codex login`)"
-		}
-		return i.provider + " — no key (Enter to set)"
-	default:
-		return i.provider + " — unavailable (Enter to retry)"
+	if i.provider == "codex-sub" {
+		return "codex-sub"
 	}
+	return i.provider
 }
-func (i providerStatusItem) Description() string {
+
+// tailParts states the provider's state in one word; the footer/Enter
+// affordance is shared across all status rows so it does not repeat.
+func (i providerStatusItem) tailParts() []string {
 	switch i.kind {
 	case "loading":
-		return "fetching the free-model catalog"
+		return []string{"loading" + gEll}
 	case "keyless":
-		return "a credential is required to use " + i.provider + " free models"
+		return []string{"no key"}
 	default:
-		if i.detail != "" {
-			return i.detail
-		}
-		return "free models could not be fetched"
+		return []string{"unavailable"}
 	}
 }
 func (i providerStatusItem) FilterValue() string { return i.provider + " status" }
 
-// usageStatusItem is a non-selectable row on the start screen showing the
-// launch-time per-provider usage summary (OpenRouter credits, Zen 5h window,
-// etc.). It complements the in-session /v1/usage statusline: the picker runs
-// before the proxy exists, so it fetches the same upstream signals directly.
-type usageStatusItem struct {
-	rows map[string]usageSnapshot
-}
-
-func (i usageStatusItem) Title() string {
-	if len(i.rows) == 0 {
-		return "Usage — fetching…"
-	}
-	return "Usage — per provider"
-}
-func (i usageStatusItem) Description() string {
-	if len(i.rows) == 0 {
-		return "querying OpenRouter / Zen for remaining credits"
-	}
-	return usageSummaryText(i.rows)
-}
-func (i usageStatusItem) FilterValue() string { return "usage credits remaining providers" }
-
-// groupHeaderItem is a non-selectable category banner on the start screen that
-// labels a block of model rows belonging to one provider (e.g. "OpenRouter · 100").
-// It is rendered with groupHeaderStyle and is skipped on Enter (see Update):
-// landing the cursor on one moves to the next real row, so headers never get
-// mistaken for models and never block selection.
+// groupHeaderItem is a non-selectable one-line section label ("most used · 100")
+// rendered flush col 0, muted. It is skipped on Enter (see Update): landing the
+// cursor on one moves to the next real row, so headers never get mistaken for
+// models and never block selection.
 type groupHeaderItem struct {
-	label string // e.g. "OpenRouter" or "Most used"
+	label string // e.g. "OpenRouter" or "Most used" (rendered lowercased)
 	count int
 }
 
-func (i groupHeaderItem) Title() string {
-	label := groupHeaderStyle.Render(strings.ToUpper(i.label))
-	count := groupRuleStyle.Render(fmt.Sprintf(" %d ", i.count))
-	return label + count + " " + groupRuleStyle.Render("────────────")
+// line is the rendered header text. The label field keeps its original case
+// (startItemKey and the grouping tests read it); only the rendering lowercases.
+// A zero count (pool-screen provider sections without model rows) renders as
+// just the name — "groq · 0" states nothing.
+func (i groupHeaderItem) line() string {
+	if i.count == 0 {
+		return strings.ToLower(i.label)
+	}
+	return strings.ToLower(i.label) + " " + gDot + " " + strconv.Itoa(i.count)
 }
-func (i groupHeaderItem) Description() string { return "" }
+func (i groupHeaderItem) Title() string       { return i.line() }
 func (i groupHeaderItem) FilterValue() string { return "" }
 
 func (i comboItem) Title() string {
 	if i.manual {
-		return "Pick models manually →"
+		return "manual"
 	}
 	if i.combo.Worker == "" || i.combo.Worker == i.combo.Orchestrator {
 		return i.combo.Orchestrator
 	}
-	return i.combo.Orchestrator + "  +  " + i.combo.Worker
+	return i.combo.Orchestrator + " + " + i.combo.Worker
 }
-func (i comboItem) Description() string {
+func (i comboItem) tailParts() []string {
 	if i.manual {
-		return "choose orchestrator and worker yourself"
+		return nil
 	}
-	if i.combo.Worker == "" || i.combo.Worker == i.combo.Orchestrator {
-		return i.label + " · free"
-	}
-	return i.label + " · orchestrator + worker"
+	return []string{i.label} // "recent" / "recommended"
 }
 func (i comboItem) FilterValue() string {
 	return i.combo.Orchestrator + " " + i.combo.Worker
@@ -380,8 +432,16 @@ type ResumeOption struct {
 // instead, it does not reappear on later steps.
 type resumeItem struct{ opt ResumeOption }
 
-func (i resumeItem) Title() string       { return "↻ Resume: " + i.opt.Label }
-func (i resumeItem) Description() string { return i.opt.Description }
+func (i resumeItem) Title() string { return "resume " + gDot + " " + i.opt.Label }
+
+// tailParts passes the recorded time/agent summary through as-is: short
+// data, not prose.
+func (i resumeItem) tailParts() []string {
+	if i.opt.Description == "" {
+		return nil
+	}
+	return []string{i.opt.Description}
+}
 func (i resumeItem) FilterValue() string { return "resume " + i.opt.Label }
 
 type step int
@@ -462,16 +522,8 @@ func (m *model) startItems() []list.Item {
 	}
 	items := []list.Item{cycle}
 	// Launch-time per-provider usage summary (OpenRouter credits, Zen 5h window)
-	// is rendered as a status banner in View(), NOT as a list item — it is
+	// is rendered as a status line in the frame, NOT as a list item — it is
 	// informational, never selectable, so it can never be mistaken for a model.
-	// Providers that haven't produced a model list yet are still surfaced as
-	// status rows so the user sees free models exist but aren't ready — not a
-	// blank screen that implies no free provider is configured.
-	if m.catalog != nil {
-		for _, row := range m.catalog.statusRows() {
-			items = append(items, row)
-		}
-	}
 	if m.resume != nil {
 		items = append(items, resumeItem{opt: *m.resume})
 	}
@@ -521,6 +573,38 @@ func (m *model) startItems() []list.Item {
 		}
 		items = append(items, groupHeaderItem{label: groupLabel(p), count: len(rows)})
 		items = append(items, rows...)
+	}
+	// Providers without a usable model list are scattered nowhere: each kind
+	// collapses into one trailing section, provider per row, state in the
+	// tail. The user still sees free models exist (loading) or what to fix
+	// (keyless/error) without a blank screen implying no providers at all.
+	if m.catalog != nil {
+		var loadingRows, keylessRows, errorRows []list.Item
+		for _, row := range m.catalog.statusRows() {
+			if st, ok := row.(providerStatusItem); ok {
+				switch st.kind {
+				case "loading":
+					loadingRows = append(loadingRows, row)
+				case "keyless":
+					keylessRows = append(keylessRows, row)
+				default:
+					errorRows = append(errorRows, row)
+				}
+			}
+		}
+		for _, bucket := range []struct {
+			label string
+			rows  []list.Item
+		}{
+			{"loading providers", loadingRows},
+			{"keyless providers", keylessRows},
+			{"unavailable providers", errorRows},
+		} {
+			if len(bucket.rows) > 0 {
+				items = append(items, groupHeaderItem{label: bucket.label, count: len(bucket.rows)})
+				items = append(items, bucket.rows...)
+			}
+		}
 	}
 	return items
 }
@@ -679,18 +763,15 @@ func buildFastItems(ms []models.Model, orchestrator string) []list.Item {
 // fastItem is one of the two special rows at the top of the fast-step list.
 type fastItem struct{ mode string }
 
-func (i fastItem) Title() string {
-	if i.mode == "auto" {
-		return "auto — pick a flash-tier model at launch"
-	}
-	return "none — run the small-fast tier on the main model"
-}
+func (i fastItem) Title() string { return i.mode }
 
-func (i fastItem) Description() string {
+// tailParts replaces the deleted sentence descriptions with the plain-spoken
+// vocabulary: auto is the recommendation, none is what it does.
+func (i fastItem) tailParts() []string {
 	if i.mode == "auto" {
-		return "recommended: cheapest-looking model (flash/mini/lite) from the same provider, free variants first"
+		return []string{"recommended"}
 	}
-	return "legacy behavior: every tier on the orchestrator"
+	return []string{"all tiers"}
 }
 
 func (i fastItem) FilterValue() string { return "fast " + i.mode }
@@ -769,9 +850,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetHeight(msg.Height - 6)
 		return m, nil
 	case tea.KeyMsg:
+		// While the filter prompt is active, k/f/esc are TEXT the user is
+		// typing (filtering for "sk-..." or a model with a k in it) or the
+		// cancel-filter key — they must reach the list, not open screens.
+		// Outside filtering the bindings behave exactly as before.
+		filtering := m.list.FilterState() == list.Filtering
 		switch msg.String() {
 		case "k":
-			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast {
+			if !filtering && (m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast) {
 				km := newKeyManager()
 				m.keys = &km
 				m.prevStep = m.step
@@ -779,19 +865,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "f":
-			if m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast {
+			if !filtering && (m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast) {
 				return m, m.openFallbacks()
 			}
 		case "ctrl+c":
 			m.quit = true
 			return m, tea.Quit
 		case "esc":
-			if m.step == stepWorker {
+			if !filtering && m.step == stepWorker {
 				m.worker = ""
 				m.fast = ""
 				return m, tea.Quit
 			}
-			if m.step == stepFast {
+			if !filtering && m.step == stepFast {
 				// Esc on the fast step = auto-pick: keep whatever the launch
 				// resolves, do not pin "none".
 				m.fast = ""
@@ -902,88 +988,94 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// pickerChrome renders the shared frame: wordmark, then the step-specific
-// header block, then the caller's body. Keeping one renderer means every
-// screen inherits the same proportions instead of hand-tuned spacing.
-func pickerChrome(header string, body string, footer string) string {
-	var b string
-	b += titleStyle.Render("◆ ultra-zen") + "\n"
-	if header != "" {
-		b += header + "\n"
+// frame renders the one-line chrome every screen shares: a wordmark line
+// ("ultra-zen · <context>") with the usage summary right-aligned on it when
+// the terminal is wide enough, the body, an optional red error line, and the
+// key-hint footer. All explanatory sentences live in --help, not here.
+func frame(ctx, usage, body, footer, errLine string, termWidth int) string {
+	mark := fgStyle.Render("ultra-zen")
+	if ctx != "" {
+		mark += mutedStyle.Render(" " + gDot + " " + ctx)
 	}
-	b += "\n"
-	b += body
-	b += "\n"
+	folds := usage != "" && ansi.StringWidth(mark)+2+ansi.StringWidth(usage) <= termWidth
+	line1 := mark
+	if folds {
+		pad := max(termWidth-ansi.StringWidth(mark)-ansi.StringWidth(usage), 2)
+		line1 += strings.Repeat(" ", pad) + mutedStyle.Render(usage)
+	}
+	var b strings.Builder
+	b.WriteString(line1 + "\n")
+	if usage != "" && !folds {
+		// Too wide to share the wordmark line: give the usage summary its own.
+		b.WriteString(mutedStyle.Render(usage) + "\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
+		b.WriteString("\n")
+	}
+	if errLine != "" {
+		b.WriteString("\n" + alertStyle.Render("error: "+errLine) + "\n")
+	}
 	if footer != "" {
-		b += footer
+		b.WriteString("\n" + footer + "\n")
 	}
-	return b
+	return b.String()
 }
 
-// stepFooter renders the key hints, dimming the ones that don't apply to the
-// current step so the visible set stays short.
+// stepFooter joins the key hints in muted gray, two spaces apart — no dot
+// chain. The per-step Esc hint (skip/auto) is the only variation.
 func stepFooter(step step) string {
-	parts := []string{"/ filter", "Enter select"}
+	parts := []string{"/ filter", "enter select"}
 	switch step {
 	case stepWorker:
-		parts = append(parts, "Esc skip")
+		parts = append(parts, "esc skip")
 	case stepFast:
-		parts = append(parts, "Esc auto")
+		parts = append(parts, "esc auto")
 	}
-	parts = append(parts, "k keys", "f pool", "Ctrl+C quit")
-	joined := make([]string, 0, len(parts))
-	for _, p := range parts {
-		joined = append(joined, mutedStyle.Render(p))
+	parts = append(parts, "k keys", "f pool", "ctrl+c quit")
+	return mutedStyle.Render(strings.Join(parts, "  "))
+}
+
+// frameContext is the wordmark's suffix for the current step: where you are,
+// in the terms of what you already picked.
+func (m model) frameContext() string {
+	switch m.step {
+	case stepCombo:
+		return m.provider
+	case stepOrchestrator:
+		return "orchestrator"
+	case stepWorker:
+		return "worker " + gDot + " " + m.choice
+	case stepFast:
+		ctx := "fast " + gDot + " " + m.choice
+		if m.worker != "" {
+			ctx += " + " + m.worker
+		}
+		return ctx
 	}
-	return "  " + strings.Join(joined, mutedStyle.Render(" · ")) + "\n"
+	return m.subtitle
 }
 
 func (m model) View() string {
+	width := m.list.Width() + 4
+	usage := ""
+	if m.usage != nil && m.list.FilterState() != list.Filtering {
+		usage = usageSummaryText(m.usage)
+	}
 	switch m.step {
-	case stepCombo:
-		var header string
-		header += subtitleStyle.Render("  all configured providers — pick a model, combo, or free cycle") + "\n"
-		// Launch-time per-provider usage banner (OpenRouter credits, Zen 5h
-		// window). Informational only — never selectable, so it cannot be
-		// mistaken for a model row. Refreshed when usageLoaded arrives.
-		if m.usage != nil {
-			header += usageBannerStyle.Render("  "+usageSummaryText(m.usage)) + "\n"
-		}
-		var body string
-		body += m.list.View() + "\n"
-		if m.poolErr != "" {
-			body += mutedStyle.Render("  could not save free cycle: "+m.poolErr) + "\n"
-		}
-		return pickerChrome(header, body, stepFooter(stepCombo))
-	case stepOrchestrator:
-		header := subtitleStyle.Render("  "+m.subtitle) + "\n"
-		header += crumbStyle.Render("  main model") + mutedStyle.Render(" › worker › fast") + "\n"
-		return pickerChrome(header, m.list.View()+"\n", stepFooter(stepOrchestrator))
-	case stepWorker:
-		header := crumbStyle.Render("  "+m.choice) + mutedStyle.Render(" › ") + crumbStyle.Render("worker") + mutedStyle.Render(" › fast") + "\n"
-		header += subtitleStyle.Render("  worker runs sub-agents in the background") + "\n"
-		return pickerChrome(header, m.list.View()+"\n", stepFooter(stepWorker))
-	case stepFast:
-		header := crumbStyle.Render("  " + m.choice)
-		if m.worker != "" {
-			header += mutedStyle.Render(" › ") + crumbStyle.Render(m.worker)
-		}
-		header += mutedStyle.Render(" › ") + crumbStyle.Render("fast") + "\n"
-		header += subtitleStyle.Render("  cheap tier for the permission classifier and background calls") + "\n"
-		return pickerChrome(header, m.list.View()+"\n", stepFooter(stepFast))
+	case stepCombo, stepOrchestrator, stepWorker, stepFast:
+		return frame(m.frameContext(), usage, m.list.View(), stepFooter(m.step), m.poolErr, width)
 	case stepKeys:
 		if m.keys != nil {
 			return m.keys.View()
 		}
-		// Fall through to a safe default if the manager is closed but the
-		// step wasn't restored (shouldn't happen — see Update).
-		return pickerChrome(subtitleStyle.Render("  "+m.subtitle)+"\n", m.list.View()+"\n", "")
+		return frame(m.frameContext(), "", m.list.View(), stepFooter(m.step), "", width)
 	case stepFallbacks:
 		if m.fallbacks != nil {
 			return m.fallbacks.View()
 		}
-		// Fall through to a safe default (shouldn't happen — see Update).
-		return pickerChrome(subtitleStyle.Render("  "+m.subtitle)+"\n", m.list.View()+"\n", "")
+		return frame(m.frameContext(), "", m.list.View(), stepFooter(m.step), "", width)
 	}
 	return ""
 }
@@ -1110,11 +1202,8 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 	}
 	items := m.startItems()
 
-	l := list.New(items, pickerDelegate{DefaultDelegate: list.NewDefaultDelegate()}, 60, 20)
-	l.Title = ""
-	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(true)
-	l.SetShowHelp(false)
+	l := list.New(items, columnDelegate{}, 60, 20)
+	configureList(&l)
 
 	m.list = l
 	p := tea.NewProgram(m)

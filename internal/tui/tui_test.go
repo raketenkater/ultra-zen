@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -9,13 +10,67 @@ import (
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
+// TestFilterStateKeystrokesGoToFilter pins the Column's Phase-3 gate: while
+// the filter prompt is active, k/f/esc must reach the filter input (typing
+// "sk", or canceling the query) instead of opening screens. Outside
+// filtering the bindings behave exactly as before.
+func TestFilterStateKeystrokesGoToFilter(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := newTestModel()
+
+	// "/" enters filtering mode.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	mm := updated.(model)
+	if mm.list.FilterState() != list.Filtering {
+		t.Fatal("pressing / did not enter filtering mode")
+	}
+
+	// "k" while filtering is a typed rune, not the key-manager binding.
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	mm = updated.(model)
+	if mm.keys != nil || mm.step == stepKeys {
+		t.Fatal("k opened the key manager while filtering")
+	}
+	if got := mm.list.FilterValue(); !strings.HasSuffix(got, "k") {
+		t.Fatalf("filter value = %q, want it to contain the typed k", got)
+	}
+
+	// "f" while filtering is a typed rune, not the pool binding.
+	updated, _ = mm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	mm = updated.(model)
+	if mm.fallbacks != nil {
+		t.Fatal("f opened the pool editor while filtering")
+	}
+
+	// Esc while filtering cancels the query instead of quitting the picker.
+	updated, cmd := mm.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mm = updated.(model)
+	if cmd != nil && mm.quit {
+		t.Fatal("esc quit the picker while filtering")
+	}
+	if mm.list.FilterState() == list.Filtering {
+		t.Fatal("esc did not exit filtering mode")
+	}
+}
+
 // TestModelItemTitleUsesFriendlyName verifies the picker row renders the
-// friendly Name (falling back to the id), so users identify models at a glance.
+// friendly Name (falling back to the id), so users identify models at a
+// glance. Under the Column contract the title is the bare identity; tier and
+// recency are tail parts.
 func TestModelItemTitleUsesFriendlyName(t *testing.T) {
-	// Friendly name differs from the id -> show the name.
+	// Friendly name differs from the id -> show the name; free tier moves to
+	// the tail column.
 	item := modelItem{m: models.Model{ID: "zai-org/GLM-5.2", Name: "GLM 5.2", Free: true}}
-	if got := item.Title(); got != "GLM 5.2  (free)" {
+	if got := item.Title(); got != "GLM 5.2" {
 		t.Fatalf("Title = %q, want friendly name", got)
+	}
+	if got := strings.Join(item.tailParts(), "  "); got != "free" {
+		t.Fatalf("tailParts = %q, want free", got)
+	}
+	// ctx and recency append after the tier word, in drop-priority order.
+	rich := modelItem{m: models.Model{ID: "x", Name: "x", Free: true, ContextLength: 131072}, recent: true}
+	if got := strings.Join(rich.tailParts(), "  "); got != "free  128k  recent" {
+		t.Fatalf("tailParts = %q, want free 128k recent", got)
 	}
 	// No friendly name (Name == ID) -> fall back to the id.
 	plain := modelItem{m: models.Model{ID: "glm-5.1", Name: "glm-5.1"}}

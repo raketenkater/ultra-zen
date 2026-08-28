@@ -57,14 +57,14 @@ func (m *inlineKeyEditor) Update(msg tea.Msg) tea.Cmd {
 }
 
 func (m inlineKeyEditor) View() string {
-	b := titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  "+m.prompt) + "\n\n"
-	b += "  " + m.input.View() + "\n\n"
+	ctx := strings.TrimPrefix(m.prompt, "Set ")
+	ctx = strings.TrimSuffix(ctx, " API key")
+	body := "  " + m.input.View()
 	if m.help != "" {
-		b += mutedStyle.Render("  "+m.help) + "\n"
+		body += "\n" + mutedStyle.Render(m.help)
 	}
-	b += mutedStyle.Render("  Enter to confirm · Esc to cancel")
-	return b
+	footer := mutedStyle.Render("enter set  esc cancel")
+	return frame("key "+gDot+" "+ctx, "", body, footer, "", 0)
 }
 
 // keyModel is a single-line prompt for pasting an API key or base URL.

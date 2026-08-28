@@ -1307,17 +1307,24 @@ func main() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\n  ultra-zen ▸ %s  (%s)\n", selected.ID, selected.Base)
+	// Launch banner: plain stderr, NO ANSI (it interleaves with Claude Code's
+	// own colored banner). One fact per line, labels aligned — the summary of
+	// what is about to run.
+	fmt.Fprintf(os.Stderr, "ultra-zen · %s\n", selected.ID)
 	if *workerModel != "" {
-		fmt.Fprintf(os.Stderr, "  worker    ▸ %s\n", *workerModel)
+		fmt.Fprintf(os.Stderr, "  worker     %s\n", *workerModel)
 	}
 	if fast := resolveFastModel(*fastModel, *provider, selected, list); fast != "" && fast != selected.ID {
-		fmt.Fprintf(os.Stderr, "  fast      ▸ %s  (small-fast tier)\n", fast)
+		fmt.Fprintf(os.Stderr, "  fast       %s\n", fast)
 	}
-	for i, fallback := range fallbackRoutes {
-		fmt.Fprintf(os.Stderr, "  fallback %d ▸ %s  (%s)\n", i+1, fallback.Model, fallback.BaseURL)
+	switch {
+	case len(fallbackRoutes) == 0:
+	case routeChain(fallbackRoutes) != "":
+		fmt.Fprintf(os.Stderr, "  fallbacks  %s\n", routeChain(fallbackRoutes))
+	default:
+		fmt.Fprintf(os.Stderr, "  fallbacks  %d routes\n", len(fallbackRoutes))
 	}
-	fmt.Fprintf(os.Stderr, "  proxy on %s  →  claude\n\n", srv.BaseURL())
+	fmt.Fprintf(os.Stderr, "  proxy      %s\n\n", srv.BaseURL())
 
 	// Forward SIGINT/SIGTERM to claude and tear down the proxy.
 	sigCh := make(chan os.Signal, 1)
@@ -1489,6 +1496,21 @@ func waitForHealth(base string, timeout time.Duration) error {
 func die(err error) {
 	fmt.Fprintf(os.Stderr, "ultra-zen: %v\n", err)
 	os.Exit(1)
+}
+
+// routeChain renders the fallback pool as one arrow-joined line for the
+// launch banner. It returns "" when the chain would exceed 78 columns — the
+// banner then falls back to a route count instead of wrapping.
+func routeChain(routes []proxy.Upstream) string {
+	parts := make([]string, 0, len(routes))
+	for _, r := range routes {
+		parts = append(parts, r.Model)
+	}
+	chain := strings.Join(parts, " → ")
+	if len(chain) > 78 {
+		return ""
+	}
+	return chain
 }
 
 // warn reports a non-fatal problem to stderr (e.g. a stale free-pool route
