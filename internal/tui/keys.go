@@ -150,12 +150,13 @@ func (m keyManager) View() string {
 		return m.editor.View()
 	}
 	var b string
-	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  API keys — Enter set/change · x clear · Esc back") + "\n\n"
+	b += titleStyle.Render("◆ ultra-zen") + "\n"
+	b += subtitleStyle.Render("  API keys") + "\n\n"
 	b += m.list.View() + "\n"
 	if m.err != "" {
 		b += mutedStyle.Render("  error: "+m.err) + "\n"
 	}
+	b += mutedStyle.Render("  Enter set/change · x clear · Esc back") + "\n"
 	b += mutedStyle.Render("  Keys are stored at " + keys.Path())
 	return b
 }

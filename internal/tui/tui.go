@@ -8,6 +8,7 @@ package tui
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,33 +18,53 @@ import (
 )
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#7D56F4"))
-	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A0A0A0"))
-	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
-	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4EC9B0"))
+	// Brand accent: violet, used for the wordmark, selection, and section rules.
+	accent = lipgloss.Color("#A78BFA")
+	// Palette: one accent, then a quiet gray ramp. Nothing else competes.
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(accent)
+	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF"))
+	mutedStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+	recentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#5EEAD4"))
+	// crumbStyle renders the already-chosen steps (orchestrator/worker) as
+	// breadcrumbs on later steps.
+	crumbStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#C4B5FD"))
 	// usageBannerStyle renders the launch-time per-provider usage summary as a
 	// status banner above the model list. It is informational, never selectable,
 	// so it can never be mistaken for a model.
-	usageBannerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4")).Italic(true)
-	// groupHeaderStyle renders a collapsible-style category banner above a
-	// provider's model rows: bold accent label with a count badge, so the picker
-	// reads as grouped sections rather than one undifferentiated scroll.
+	usageBannerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#8B7BD8"))
+	// groupHeaderStyle renders a section rule above a provider's model rows:
+	// small caps-ish label, a count, and a thin rule — quieter than a filled
+	// banner, so sections read as structure rather than as selectable rows.
 	groupHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("#C8B5FF")).
-				Background(lipgloss.Color("#2A2140")).
-				Padding(0, 1)
+				Foreground(lipgloss.Color("#C4B5FD")).
+				Margin(1, 0, 0, 0)
+	groupRuleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B3245"))
 	// freeTagStyle / paidTagStyle add a subtle colored tier marker to a model
 	// row's description so free vs paid stays readable at a glance without
 	// being noisy. Free = green, paid = muted.
-	freeTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#3FB950"))
-	paidTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B6B6B"))
+	freeTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#4ADE80"))
+	paidTagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
 )
+
+// selectedTitleStyle is the selected row's title: bold violet text instead of
+// the stock white-on-default block. Padding matches NormalTitle (2 cols) so
+// rows never shift horizontally when the cursor moves.
+var selectedTitleStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(accent).
+	PaddingLeft(2)
+
+// rowIndentStyle indents descriptions to the titles' left edge (2 cols).
+var rowIndentStyle = lipgloss.NewStyle().PaddingLeft(2)
 
 // pickerDelegate renders the start-screen list like bubbles' DefaultDelegate,
 // but (a) emits descriptions verbatim so the colored free/paid tier tags keep
-// their ANSI, and (b) renders groupHeaderItem rows as a single styled banner
-// with no selection chrome. It implements list.ItemDelegate.
+// their ANSI, (b) renders groupHeaderItem rows as a single styled banner
+// with no selection chrome, and (c) restyles the selected/normal rows: the
+// selection is a violet bar + bold accent title instead of the stock white
+// block, and the description is indented to align with the title text.
+// It implements list.ItemDelegate.
 type pickerDelegate struct {
 	list.DefaultDelegate
 }
@@ -72,14 +93,17 @@ func (d pickerDelegate) Render(w io.Writer, m list.Model, index int, listItem li
 	if emptyFilter {
 		title = s.DimmedTitle.Render(title)
 	} else if isSelected && m.FilterState() != list.Filtering {
-		title = s.SelectedTitle.Render(title)
+		title = selectedTitleStyle.Render(title)
 	} else {
 		title = s.NormalTitle.Render(title)
 	}
 	title = ansiTruncate(title, textwidth)
 	// The description is emitted verbatim (NOT wrapped in a delegate style): its
 	// inner ANSI — the colored free/paid tier tag — must survive, and the muted
-	// styling is already baked into Description() itself.
+	// styling is already baked into Description() itself. Indented to the same
+	// left edge as titles: the stock delegate leaves descriptions flush-left,
+	// which broke the column alignment.
+	desc = rowIndentStyle.Render(desc)
 	desc = ansiTruncate(desc, textwidth)
 	if d.ShowDescription {
 		fmt.Fprintf(w, "%s\n%s", title, desc)
@@ -313,7 +337,9 @@ type groupHeaderItem struct {
 }
 
 func (i groupHeaderItem) Title() string {
-	return groupHeaderStyle.Render(fmt.Sprintf("%s · %d", i.label, i.count))
+	label := groupHeaderStyle.Render(strings.ToUpper(i.label))
+	count := groupRuleStyle.Render(fmt.Sprintf(" %d ", i.count))
+	return label + count + " " + groupRuleStyle.Render("────────────")
 }
 func (i groupHeaderItem) Description() string { return "" }
 func (i groupHeaderItem) FilterValue() string { return "" }
@@ -876,60 +902,90 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m model) View() string {
+// pickerChrome renders the shared frame: wordmark, then the step-specific
+// header block, then the caller's body. Keeping one renderer means every
+// screen inherits the same proportions instead of hand-tuned spacing.
+func pickerChrome(header string, body string, footer string) string {
 	var b string
-	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
+	b += titleStyle.Render("◆ ultra-zen") + "\n"
+	if header != "" {
+		b += header + "\n"
+	}
+	b += "\n"
+	b += body
+	b += "\n"
+	if footer != "" {
+		b += footer
+	}
+	return b
+}
+
+// stepFooter renders the key hints, dimming the ones that don't apply to the
+// current step so the visible set stays short.
+func stepFooter(step step) string {
+	parts := []string{"/ filter", "Enter select"}
+	switch step {
+	case stepWorker:
+		parts = append(parts, "Esc skip")
+	case stepFast:
+		parts = append(parts, "Esc auto")
+	}
+	parts = append(parts, "k keys", "f pool", "Ctrl+C quit")
+	joined := make([]string, 0, len(parts))
+	for _, p := range parts {
+		joined = append(joined, mutedStyle.Render(p))
+	}
+	return "  " + strings.Join(joined, mutedStyle.Render(" · ")) + "\n"
+}
+
+func (m model) View() string {
 	switch m.step {
 	case stepCombo:
-		b += subtitleStyle.Render("  all configured providers — select a model, combo, or free cycle") + "\n"
+		var header string
+		header += subtitleStyle.Render("  all configured providers — pick a model, combo, or free cycle") + "\n"
 		// Launch-time per-provider usage banner (OpenRouter credits, Zen 5h
 		// window). Informational only — never selectable, so it cannot be
 		// mistaken for a model row. Refreshed when usageLoaded arrives.
 		if m.usage != nil {
-			b += usageBannerStyle.Render("  💰 "+usageSummaryText(m.usage)) + "\n"
+			header += usageBannerStyle.Render("  "+usageSummaryText(m.usage)) + "\n"
 		}
-		b += "\n"
-		b += m.list.View() + "\n"
+		var body string
+		body += m.list.View() + "\n"
 		if m.poolErr != "" {
-			b += mutedStyle.Render("  could not save free cycle: "+m.poolErr) + "\n"
+			body += mutedStyle.Render("  could not save free cycle: "+m.poolErr) + "\n"
 		}
-		b += mutedStyle.Render("  / filter · Enter select · k keys · f pool · Ctrl+C quit")
+		return pickerChrome(header, body, stepFooter(stepCombo))
 	case stepOrchestrator:
-		b += subtitleStyle.Render("  "+m.subtitle+" — pick orchestrator (main model)") + "\n\n"
-		b += m.list.View() + "\n"
-		b += mutedStyle.Render("  / filter · Enter select · k keys · f pool · Ctrl+C quit")
+		header := subtitleStyle.Render("  "+m.subtitle) + "\n"
+		header += crumbStyle.Render("  main model") + mutedStyle.Render(" › worker › fast") + "\n"
+		return pickerChrome(header, m.list.View()+"\n", stepFooter(stepOrchestrator))
 	case stepWorker:
-		b += subtitleStyle.Render("  orchestrator: "+m.choice) + "\n"
-		b += subtitleStyle.Render("  pick worker for sub-agents (Esc to skip)") + "\n\n"
-		b += m.list.View() + "\n"
-		b += mutedStyle.Render("  / filter · Enter select · Esc skip · k keys · f pool · Ctrl+C quit")
+		header := crumbStyle.Render("  "+m.choice) + mutedStyle.Render(" › ") + crumbStyle.Render("worker") + mutedStyle.Render(" › fast") + "\n"
+		header += subtitleStyle.Render("  worker runs sub-agents in the background") + "\n"
+		return pickerChrome(header, m.list.View()+"\n", stepFooter(stepWorker))
 	case stepFast:
-		b += subtitleStyle.Render("  orchestrator: "+m.choice) + "\n"
+		header := crumbStyle.Render("  " + m.choice)
 		if m.worker != "" {
-			b += subtitleStyle.Render("  worker:       "+m.worker) + "\n"
+			header += mutedStyle.Render(" › ") + crumbStyle.Render(m.worker)
 		}
-		b += subtitleStyle.Render("  pick fast model for the small-fast tier — permission classifier and other cheap background calls (Esc = auto)") + "\n\n"
-		b += m.list.View() + "\n"
-		b += mutedStyle.Render("  / filter · Enter select · Esc auto · k keys · f pool · Ctrl+C quit")
+		header += mutedStyle.Render(" › ") + crumbStyle.Render("fast") + "\n"
+		header += subtitleStyle.Render("  cheap tier for the permission classifier and background calls") + "\n"
+		return pickerChrome(header, m.list.View()+"\n", stepFooter(stepFast))
 	case stepKeys:
 		if m.keys != nil {
 			return m.keys.View()
 		}
 		// Fall through to a safe default if the manager is closed but the
 		// step wasn't restored (shouldn't happen — see Update).
-		b += subtitleStyle.Render("  "+m.subtitle) + "\n\n"
-		b += m.list.View() + "\n"
-		return b
+		return pickerChrome(subtitleStyle.Render("  "+m.subtitle)+"\n", m.list.View()+"\n", "")
 	case stepFallbacks:
 		if m.fallbacks != nil {
 			return m.fallbacks.View()
 		}
 		// Fall through to a safe default (shouldn't happen — see Update).
-		b += subtitleStyle.Render("  "+m.subtitle) + "\n\n"
-		b += m.list.View() + "\n"
-		return b
+		return pickerChrome(subtitleStyle.Render("  "+m.subtitle)+"\n", m.list.View()+"\n", "")
 	}
-	return b
+	return ""
 }
 
 // buildModelItems returns model rows with recently used models first.

@@ -168,7 +168,14 @@ func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 		return
 	}
 	defer resp.Body.Close()
+	// The gateway wraps the windows in a "usage" envelope; older shapes put
+	// them at the top level. Accept both: prefer the envelope when present.
 	var payload struct {
+		Usage *struct {
+			Rolling *windowPayload `json:"rolling"`
+			Weekly  *windowPayload `json:"weekly"`
+			Monthly *windowPayload `json:"monthly"`
+		} `json:"usage"`
 		Rolling *windowPayload `json:"rolling"`
 		Weekly  *windowPayload `json:"weekly"`
 		Monthly *windowPayload `json:"monthly"`
@@ -187,15 +194,19 @@ func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 		}
 		return
 	}
+	rolling, weekly, monthly := payload.Rolling, payload.Weekly, payload.Monthly
+	if payload.Usage != nil {
+		rolling, weekly, monthly = payload.Usage.Rolling, payload.Usage.Weekly, payload.Usage.Monthly
+	}
 	row := &ProviderUsage{Name: "opencode-go", Kind: UsageCredits, Window: Window5h}
-	if payload.Rolling != nil {
-		row.Rolling = payload.Rolling.toStat("rolling")
+	if rolling != nil {
+		row.Rolling = rolling.toStat("rolling")
 	}
-	if payload.Weekly != nil {
-		row.Weekly = payload.Weekly.toStat("weekly")
+	if weekly != nil {
+		row.Weekly = weekly.toStat("weekly")
 	}
-	if payload.Monthly != nil {
-		row.Monthly = payload.Monthly.toStat("monthly")
+	if monthly != nil {
+		row.Monthly = monthly.toStat("monthly")
 	}
 	s.usage.setRow("opencode-go", row)
 }

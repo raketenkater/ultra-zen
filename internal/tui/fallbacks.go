@@ -673,12 +673,13 @@ func (m *fallbackManager) View() string {
 		return m.editor.View()
 	}
 	var b string
-	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  Free rotation pool — Enter toggle · x remove · r reset · Esc save & back") + "\n\n"
+	b += titleStyle.Render("◆ ultra-zen") + "\n"
+	b += subtitleStyle.Render("  Free rotation pool") + "\n\n"
 	b += m.list.View() + "\n"
 	if len(m.order) > 0 {
 		b += mutedStyle.Render("  pool: "+strings.Join(m.orderKeys(), " → ")) + "\n"
 	}
+	b += mutedStyle.Render("  Enter toggle · x remove · r reset · Esc save & back") + "\n"
 	return b
 }
 
