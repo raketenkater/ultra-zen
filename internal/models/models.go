@@ -526,9 +526,12 @@ func ListOpenRouterAll(httpClient *http.Client, apiKey string) ([]Model, error) 
 
 // ListOpenRouterRanked fetches every OpenRouter model and orders them by real
 // current usage (total tokens over the last 7 days) using the OpenRouter
-// rankings-daily dataset. Models absent from the rankings fall to the end,
-// sorted alphabetically. The returned slice is the full catalog in usage order;
-// callers cap it (e.g. TopN) for a default view. Requires an API key.
+// rankings-daily dataset. Free models form the first block (usage-descending
+// within the block), paid models follow (usage-descending), so the top of a
+// caller's TopN cap is always the free tier — raw token counts alone left free
+// models scattered mid-list or cut off entirely behind paid volume. Models
+// absent from the rankings fall to the end of their block, alphabetically.
+// The returned slice is the full catalog in that order. Requires an API key.
 func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
@@ -550,6 +553,15 @@ func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, erro
 		})
 	}
 	rank := fetchOpenRouterRanking(httpClient, apiKey)
+	orderOpenRouterRanked(out, rank)
+	return FilterUnavailable("openrouter", out), nil
+}
+
+// orderOpenRouterRanked sorts out in place: free block first, paid second,
+// usage-descending within each block, alphabetical for unranked or tied
+// models. Kept as a pure function so the grouping is unit-testable without a
+// live catalog or rankings endpoint.
+func orderOpenRouterRanked(out []Model, rank map[string]rankingEntry) {
 	// rankOf resolves a usage rank for a model. The rankings-daily dataset keys
 	// rows by model_permaslug, which for some models is the bare /models id and
 	// for others the dated canonical_slug (e.g. "...-20260731"). Normalize both
@@ -567,15 +579,20 @@ func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, erro
 		}
 		return rankingEntry{}
 	}
-	// Stable sort: ranked models first (by usage desc), then unranked (alpha).
+	// Stable sort: free first, then usage-desc within each block. Keeping free
+	// models in one top block means a TopN(100) cap can never truncate the free
+	// tier behind paid traffic (a :free model's tokens count separately from
+	// its paid twin).
 	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Free != out[j].Free {
+			return out[i].Free // free first
+		}
 		ri, rj := rankOf(out[i]), rankOf(out[j])
 		if ri.tokens != rj.tokens {
 			return ri.tokens > rj.tokens // higher usage first
 		}
 		return out[i].Name < out[j].Name
 	})
-	return FilterUnavailable("openrouter", out), nil
 }
 
 // rankingEntry holds an aggregated usage rank for one model.
