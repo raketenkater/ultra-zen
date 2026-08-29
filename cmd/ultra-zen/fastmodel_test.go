@@ -84,3 +84,60 @@ func TestResolveFastModelOpenRouterFreeCatalog(t *testing.T) {
 		t.Fatalf("auto-pick = %q, want vendor/model-x (name-based match)", got)
 	}
 }
+
+// TestFastTierCollapsed covers the tier-collapse guard's three cases: an
+// auto-pick that ends up sharing the primary (either nothing matched, or the
+// explicit id names the primary) must warn; --fast-model none keeps legacy
+// behavior without a warning; an explicit fast model different from the
+// primary never warns.
+func TestFastTierCollapsed(t *testing.T) {
+	const primary = "glm-5.2"
+	cases := []struct {
+		name      string
+		flagValue string
+		fast      string
+		want      bool
+	}{
+		// Collapse: auto-pick found no flash/mini/lite sibling → Env keeps
+		// every tier on the primary. This is the 3-of-9-sessions case.
+		{"auto no match warns", "", "", true},
+		// Collapse: explicit --fast-model names the primary itself.
+		{"explicit primary warns", "glm-5.2", primary, true},
+		// Legacy: "none" is the deliberate choice, never a silent collapse.
+		{"none no warning", "none", "", false},
+		{"off no warning", "off", "", false},
+		// Separated: explicit fast model different from primary.
+		{"explicit sibling no warning", "glm-5.3-flash", "glm-5.3-flash", false},
+		// Separated: auto-pick found a sibling.
+		{"auto sibling no warning", "", "glm-5.3-flash", false},
+	}
+	for _, tc := range cases {
+		if got := fastTierCollapsed(tc.flagValue, tc.fast, primary); got != tc.want {
+			t.Errorf("%s: fastTierCollapsed(%q, %q, %q) = %v, want %v",
+				tc.name, tc.flagValue, tc.fast, primary, got, tc.want)
+		}
+	}
+}
+
+// TestResolveFastModelCollapseFeedsGuard ties resolveFastModel to the guard:
+// the resolution paths that collapse the tier are exactly the ones the banner
+// then warns about.
+func TestResolveFastModelCollapseFeedsGuard(t *testing.T) {
+	list := []models.Model{
+		{ID: "deepseek-v4-flash-0731", Name: "DeepSeek V4 Flash 0731"},
+	}
+	primary := &models.Model{ID: "deepseek-v4-flash-0731", Name: "DeepSeek V4 Flash 0731"}
+	// Auto-pick with only the primary as a flash candidate returns ""...
+	fast := resolveFastModel("", "saia", primary, list)
+	if fast != "" {
+		t.Fatalf("auto-pick = %q, want empty", fast)
+	}
+	if !fastTierCollapsed("", fast, primary.ID) {
+		t.Error("auto-pick collapsed onto the primary but the guard stays silent")
+	}
+	// ...and an explicit none resolves to "" without tripping the guard.
+	fast = resolveFastModel("none", "saia", primary, list)
+	if fastTierCollapsed("none", fast, primary.ID) {
+		t.Error(`--fast-model none must not warn`)
+	}
+}

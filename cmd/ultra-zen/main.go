@@ -1321,12 +1321,19 @@ func main() {
 	// Launch banner: plain stderr, NO ANSI (it interleaves with Claude Code's
 	// own colored banner). One fact per line, labels aligned — the summary of
 	// what is about to run.
+	fast := resolveFastModel(*fastModel, *provider, selected, list)
 	fmt.Fprintf(os.Stderr, "ultra-zen · %s\n", selected.ID)
 	if *workerModel != "" {
 		fmt.Fprintf(os.Stderr, "  worker     %s\n", *workerModel)
 	}
-	if fast := resolveFastModel(*fastModel, *provider, selected, list); fast != "" && fast != selected.ID {
+	switch {
+	case fast != "" && fast != selected.ID:
 		fmt.Fprintf(os.Stderr, "  fast       %s\n", fast)
+	case fastTierCollapsed(*fastModel, fast, selected.ID):
+		// Tier-collapse guard: without a distinct fast model the permission
+		// classifier hammers the primary's rate limit right next to the main
+		// loop — say so instead of leaving it a silent mystery.
+		fmt.Fprintf(os.Stderr, "  fast       - same as primary: classifier shares the main rate limit\n")
 	}
 	switch {
 	case len(fallbackRoutes) == 0:
@@ -1345,7 +1352,6 @@ func main() {
 		cancel()
 	}()
 
-	fast := resolveFastModel(*fastModel, *provider, selected, list)
 	env := claude.Env(srv.BaseURL(), selected.ID, fast, selected.ContextLength)
 
 	// Resolve the ultra-zen binary path so the Workflow PreToolUse hook can
@@ -1423,6 +1429,20 @@ func main() {
 //     variants, and never the primary itself. If nothing matches — or the
 //     only candidate IS the primary — the main model is kept.
 //
+// When the resolved tier ends up equal to the primary (an explicit
+// --fast-model naming it, or an auto-pick that found no flash/mini/lite
+// sibling), fastTierCollapsed reports true so the launch banner warns that
+// every tier now shares one rate limit. "none" never warns: it is the
+// deliberate legacy choice, not a silent collapse.
+//
+// Deliberately NOT auto-substituting a cross-provider flash model here:
+// modelRoute (internal/proxy buildModelRoute) registers a route only for
+// models present in a loaded provider catalog, and none of those catalogs
+// contain a provably-routable cross-provider substitute that resolveFastModel
+// can see — an unroutable fast model would hard-fail every classifier call,
+// where the collapse merely shares the primary's quota. That trade is worse,
+// so the guard warns instead of substituting.
+//
 // The returned id is a plain gateway id; Env only emits env vars, and the proxy's
 // modelRoute resolves both plain and claude-prefixed spellings.
 func resolveFastModel(flagValue, provider string, primary *models.Model, list []models.Model) string {
@@ -1480,6 +1500,25 @@ func resolveFastModel(flagValue, provider string, primary *models.Model, list []
 		}
 	}
 	return best
+}
+
+// fastTierCollapsed reports whether the resolved fast model leaves Claude
+// Code's small-fast tier on the primary model: either the auto-pick found no
+// flash/mini/lite sibling ("" → Env keeps every tier on the main model) or an
+// explicit --fast-model named the primary itself. In both cases the permission
+// classifier silently shares the main rate limit — worth surfacing at launch
+// so a hammered model is explainable. flagValue "none"/"off" is the deliberate
+// legacy choice and never warns; an explicit fast model that is not the
+// primary never warns either.
+func fastTierCollapsed(flagValue, fast, primaryID string) bool {
+	switch strings.ToLower(strings.TrimSpace(flagValue)) {
+	case "none", "off":
+		return false
+	}
+	if primaryID == "" {
+		return false
+	}
+	return fast == "" || fast == primaryID
 }
 
 // waitForHealth polls the proxy health endpoint until it responds or the
