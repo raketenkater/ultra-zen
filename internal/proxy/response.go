@@ -17,8 +17,8 @@ type openAIResponse struct {
 
 // openAIChoice is one choice in a non-streaming Chat Completions response.
 type openAIChoice struct {
-	Index        int `json:"index"`
-	Message      struct {
+	Index   int `json:"index"`
+	Message struct {
 		Role      string       `json:"role"`
 		Content   string       `json:"content"`
 		ToolCalls []openAITool `json:"tool_calls"`
@@ -38,14 +38,14 @@ type anthropicContentBlock struct {
 
 // anthropicResponse is the Anthropic Messages response we return to Claude Code.
 type anthropicResponse struct {
-	ID           string                 `json:"id"`
-	Type         string                 `json:"type"` // "message"
-	Role         string                 `json:"role"` // "assistant"
-	Model        string                 `json:"model"`
+	ID           string                  `json:"id"`
+	Type         string                  `json:"type"` // "message"
+	Role         string                  `json:"role"` // "assistant"
+	Model        string                  `json:"model"`
 	Content      []anthropicContentBlock `json:"content"`
-	StopReason   string                 `json:"stop_reason"`
-	StopSequence *string                `json:"stop_sequence"`
-	Usage        anthropicUsage         `json:"usage"`
+	StopReason   string                  `json:"stop_reason"`
+	StopSequence *string                 `json:"stop_sequence"`
+	Usage        anthropicUsage          `json:"usage"`
 }
 
 type anthropicUsage struct {
@@ -75,8 +75,12 @@ func (r *openAIResponse) toAnthropic(model string) *anthropicResponse {
 	// Tool-block-aware stop_reason: when the gateway emitted tool_calls but the
 	// finish_reason is missing/"stop", Claude Code must still see stop_reason
 	// "tool_use" or it will never execute the pending tool call (breaking
-	// subagent spawn / MCP research). This mirrors the stream path.
-	if len(choice.Message.ToolCalls) > 0 && resp.StopReason != "tool_use" {
+	// subagent spawn / MCP research). This mirrors the stream path. A genuine
+	// length/max_tokens finish is the exception there and here: the arguments
+	// are truncated (toolInput degrades them to {}), so keep "max_tokens" and
+	// let Claude Code retry instead of executing a partial tool call.
+	truncated := choice.FinishReason == "length" || choice.FinishReason == "max_tokens"
+	if len(choice.Message.ToolCalls) > 0 && resp.StopReason != "tool_use" && !truncated {
 		resp.StopReason = "tool_use"
 	}
 
@@ -126,7 +130,11 @@ func mapStopReason(finish string) string {
 		return "end_turn"
 	case "tool_calls", "function_call":
 		return "tool_use"
-	case "length":
+	case "length", "max_tokens":
+		// Some gateways echo the Anthropic spelling "max_tokens" as the raw
+		// finish_reason instead of OpenAI's "length"; both mean the token
+		// budget cut the turn, and Claude Code must see max_tokens so it
+		// retries rather than treating the truncation as a finished turn.
 		return "max_tokens"
 	case "content_filter":
 		return "end_turn"

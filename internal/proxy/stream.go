@@ -8,7 +8,18 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// streamIdleTimeout caps how long the relay waits between lines from the
+// upstream SSE stream. There is deliberately no overall http.Client timeout
+// (streams can legitimately run for many minutes), so without an inter-chunk
+// deadline a gateway that accepts the request and then goes silent hangs the
+// turn until Claude Code's own cancel lands — and the resulting
+// canceled-context error is misattributed to rate limiting, reordering the
+// pool with a bogus "every available route is throttled". Declared as a var so
+// tests can shrink it.
+var streamIdleTimeout = 120 * time.Second
 
 // streamChunk is one OpenAI streaming chunk.
 type streamChunk struct {
@@ -39,6 +50,14 @@ type streamTool struct {
 	} `json:"function"`
 }
 
+// streamLine is one scanner result relayed from the reader goroutine to the
+// main translate loop, so the loop can select the line stream against the
+// idle watchdog instead of blocking inside scanner.Scan().
+type streamLine struct {
+	text string
+	err  error
+}
+
 // streamState tracks the Anthropic event sequence we are emitting.
 type streamState struct {
 	w          http.ResponseWriter
@@ -47,6 +66,9 @@ type streamState struct {
 	started    bool
 	blockIndex int
 	textOpen   bool
+	// textBlocks counts opened text blocks so completion logging can report
+	// what the relay actually handed the client.
+	textBlocks int
 	// toolBlocks/toolStarted are keyed by tool id (not openai index): some
 	// providers reuse index 0 for each new tool call, so keying by index would
 	// collapse a second subagent spawn into the first block and the agent
@@ -79,8 +101,17 @@ type streamState struct {
 	emittedText bool
 }
 
+// hasContent reports whether the upstream delivered anything worth handing to
+// the client: real text, an opened tool block, or buffered reasoning.
+func (s *streamState) hasContent() bool {
+	return s.emittedText || len(s.toolStarted) > 0 || s.reasoning.Len() > 0
+}
+
 // streamTranslate reads OpenAI SSE from upstream and writes Anthropic SSE to
-// the client. It owns the ResponseWriter for the lifetime of the stream.
+// the client. It owns the ResponseWriter for the lifetime of the stream. A
+// non-nil error means the turn did not complete — the client has already been
+// sent an SSE error event, so it can surface and retry the turn instead of
+// silently stopping.
 func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error {
 	flusher, _ := w.(http.Flusher)
 	st := &streamState{
@@ -91,18 +122,91 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		toolStarted: make(map[string]bool),
 		idForIndex:  make(map[int]string),
 	}
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
+
+	// The watchdog cannot select on a blocking scanner.Scan(), so the byte
+	// reader lives in a goroutine that hands up whole lines. done closes when
+	// this function returns; the select in the sender lets the goroutine exit
+	// on abandonment (a stalled Close below additionally unblocks a reader
+	// parked in Read).
+	lines := make(chan streamLine)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for scanner.Scan() {
+			select {
+			case lines <- streamLine{text: scanner.Text()}:
+			case <-done:
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			select {
+			case lines <- streamLine{err: err}:
+			case <-done:
+			}
+		}
+	}()
+
+	idle := time.NewTimer(streamIdleTimeout)
+	defer idle.Stop()
+
+	for {
+		var (
+			sline streamLine
+			ok    bool
+		)
+		select {
+		case sline, ok = <-lines:
+			if !ok {
+				// A clean EOF that carries neither the [DONE] sentinel nor any
+				// finish_reason chunk means the upstream vanished mid-generation
+				// (gateway cut, LB idle timeout) rather than completing. Emit an
+				// Anthropic error event so Claude Code treats the turn as failed
+				// and retries, instead of accepting a half-written answer as a
+				// finished "end_turn".
+				if !st.sawDone && st.finish == "" {
+					st.abortStream("upstream stream ended prematurely (no finish_reason, no [DONE])")
+					return io.ErrUnexpectedEOF
+				}
+				return st.finishStream()
+			}
+		case <-idle.C:
+			// Silence longer than the cap: the gateway is holding the
+			// connection open without generating. Aborting here beats waiting
+			// for Claude Code's cancel, whose canceled-context error would run
+			// the transport-error path and fake a throttle. Close the body so
+			// the reader goroutine's parked Read unblocks.
+			st.abortStream(fmt.Sprintf("upstream stream stalled: no data from %s for %v", model, streamIdleTimeout))
+			if closer, isCloser := body.(io.Closer); isCloser {
+				closer.Close()
+			}
+			return fmt.Errorf("upstream stream stalled: no data from %s for %v", model, streamIdleTimeout)
+		}
+		// Any line from upstream — data chunk, SSE keepalive comment, blank
+		// event separator — proves the connection is alive; reset the watchdog.
+		if !idle.Stop() {
+			select {
+			case <-idle.C:
+			default:
+			}
+		}
+		idle.Reset(streamIdleTimeout)
+
+		if sline.err != nil {
+			st.abortStream(fmt.Sprintf("upstream connection failed mid-stream: %v", sline.err))
+			return sline.err
+		}
+		line := sline.text
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
 			st.sawDone = true
-			st.finishStream()
-			return nil
+			return st.finishStream()
 		}
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
@@ -136,21 +240,6 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 			st.finish = choice.FinishReason
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		st.abortStream(fmt.Sprintf("upstream connection failed mid-stream: %v", err))
-		return err
-	}
-	// A clean EOF that carries neither the [DONE] sentinel nor any finish_reason
-	// chunk means the upstream vanished mid-generation (gateway cut, LB idle
-	// timeout) rather than completing. Emit an Anthropic error event so Claude
-	// Code treats the turn as failed and retries, instead of accepting a
-	// half-written answer as a finished "end_turn".
-	if !st.sawDone && st.finish == "" {
-		st.abortStream("upstream stream ended prematurely (no finish_reason, no [DONE])")
-		return io.ErrUnexpectedEOF
-	}
-	st.finishStream()
-	return nil
 }
 
 // abortStream terminates a broken relay with an Anthropic SSE error event.
@@ -192,6 +281,7 @@ func (s *streamState) ensureStarted(chunk *streamChunk) {
 
 func (s *streamState) emitText(text string) {
 	if !s.textOpen {
+		s.textBlocks++
 		s.writeEvent("content_block_start", map[string]any{
 			"type":          "content_block_start",
 			"index":         s.blockIndex,
@@ -266,11 +356,21 @@ func (s *streamState) emitToolDelta(tc streamTool) {
 	}
 }
 
-func (s *streamState) finishStream() {
-	if !s.started {
-		// Upstream produced nothing usable; emit a minimal valid stream.
-		s.ensureStarted(&streamChunk{})
-		s.emitText("")
+// finishStream closes a protocol-complete stream. It returns an error when the
+// stream carried nothing at all; the relay then surfaces the failure instead of
+// fabricating a successful turn.
+func (s *streamState) finishStream() error {
+	if !s.hasContent() {
+		// A protocol end ([DONE] or a finish_reason chunk) that carries zero
+		// content used to be completed as a fabricated empty end_turn — a
+		// perfectly-formed, perfectly silent assistant message. Claude Code
+		// rendered it as "the model stopped mid-task", the classifier could
+		// not see it (any data:-framed prefix is bodyOK upstream), and no
+		// retry ever happened. Abort instead: the SSE error event plus the
+		// returned error make this a visible, retryable failure, matching how
+		// the non-stream path already rotates past an empty completion.
+		s.abortStream(fmt.Sprintf("upstream_no_content: %s ended the stream without any text, tool call, or reasoning", s.model))
+		return fmt.Errorf("upstream_no_content from %s (protocol-complete stream with zero content)", s.model)
 	}
 	// Reasoning-only stream: no real content and no tool calls arrived, but the
 	// model answered in reasoning_content. Surface it as text so Claude Code
@@ -299,15 +399,27 @@ func (s *streamState) finishStream() {
 	// pending tool call — breaking subagent spawn (agent overview) and MCP
 	// research calls. The same guard applies when a gateway sends
 	// finish_reason="stop" despite emitting tool_calls.
-	if len(s.toolStarted) > 0 && stop != "tool_use" {
+	// The guard must NOT fire on a genuine length/max_tokens finish: there the
+	// tool's input_json_delta is truncated mid-JSON, and relabeling the turn
+	// "tool_use" makes Claude Code execute that partial input. Keeping
+	// "max_tokens" instead routes the turn through the client's
+	// retry/continuation logic, which is the honest answer for a truncated
+	// generation.
+	truncated := s.finish == "length" || s.finish == "max_tokens"
+	if len(s.toolStarted) > 0 && stop != "tool_use" && !truncated {
 		stop = "tool_use"
 	}
+	// One line per completed stream: enough to reconstruct what the client saw
+	// (and to spot the empty-ish turns) without dumping content on every turn.
+	log.Printf("ultra-zen proxy stream: completed model=%s finish_reason=%q stop_reason=%s text_blocks=%d tool_blocks=%d output_tokens=%d",
+		s.model, s.finish, stop, s.textBlocks, len(s.toolStarted), s.output)
 	s.writeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
 		"usage": map[string]any{"output_tokens": s.output},
 	})
 	s.writeEvent("message_stop", map[string]any{"type": "message_stop"})
+	return nil
 }
 
 // writeEvent writes one Anthropic SSE event and flushes.
