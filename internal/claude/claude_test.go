@@ -22,6 +22,11 @@ func TestWriteGatewayCache(t *testing.T) {
 	err := WriteGatewayCache("http://127.0.0.1:1234", []GatewayCacheModel{
 		{ID: "claude-opencode-go-deepseek-v4-flash", DisplayName: "deepseek-v4-flash"},
 		{ID: "claude-codex-gpt-5.6-sol", DisplayName: "GPT-5.6-Sol"},
+		// OpenRouter free tier, as main.go builds it: the marker rides on the
+		// display name, the claude-prefixed id stays byte-identical (Claude-
+		// ModelID sanitizes '/' ':' ' ' to '-' but keeps dots, so
+		// "poolside/laguna-s-2.1:free" becomes "poolside-laguna-s-2.1-free").
+		{ID: "claude-openrouter-poolside-laguna-s-2.1-free", DisplayName: WithFreeMarker("Laguna S 2.1 — OpenRouter")},
 	})
 	if err != nil {
 		t.Fatalf("WriteGatewayCache: %v", err)
@@ -40,17 +45,62 @@ func TestWriteGatewayCache(t *testing.T) {
 		t.Fatalf("baseUrl = %v", cache["baseUrl"])
 	}
 	models, _ := cache["models"].([]any)
-	if len(models) != 2 {
-		t.Fatalf("models = %d entries, want 2", len(models))
+	if len(models) != 3 {
+		t.Fatalf("models = %d entries, want 3", len(models))
 	}
 	first := models[0].(map[string]any)
 	if first["id"] != "claude-opencode-go-deepseek-v4-flash" || first["display_name"] != "deepseek-v4-flash" {
 		t.Fatalf("first model = %v", first)
 	}
+	// The free marker survives the JSON round-trip and never touches the id.
+	free := models[2].(map[string]any)
+	if free["id"] != "claude-openrouter-poolside-laguna-s-2.1-free" || free["display_name"] != "Laguna S 2.1 — OpenRouter (free)" {
+		t.Fatalf("free-tier model = %v", free)
+	}
 	// Legacy XDG path: also written as a belt-and-suspenders fallback.
 	legacyPath := filepath.Join(xdgHome, "claude", "cache", "gateway-models.json")
 	if _, err := os.Stat(legacyPath); err != nil {
 		t.Fatalf("legacy cache not written at %s: %v", legacyPath, err)
+	}
+}
+
+// TestWithFreeMarker covers the OpenRouter :free display-name marker used by
+// the gateway cache (feedback: highlight free models in /model). Free rows get
+// " (free)"; already-marked names never double-mark, in any casing; the
+// openrouter/free router's FriendlyName ("OpenRouter Free") already reads free
+// and stays untouched; paid names are never modified.
+func TestWithFreeMarker(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"free model gets marker", "Laguna S 2.1 — OpenRouter", "Laguna S 2.1 — OpenRouter (free)"},
+		{"already suffixed lowercase", "Laguna S 2.1 — OpenRouter (free)", "Laguna S 2.1 — OpenRouter (free)"},
+		{"already suffixed title case", "Laguna S 2.1 — OpenRouter (Free)", "Laguna S 2.1 — OpenRouter (Free)"},
+		{"already suffixed upper case", "DeepSeek V4 Flash (FREE)", "DeepSeek V4 Flash (FREE)"},
+		// Only a trailing marker suppresses: the openrouter/free router's name
+		// ("OpenRouter Free", word not suffix) is still free-tier and gets the
+		// marker so it stands out in the picker like every other :free row.
+		{"openrouter free router marked", "OpenRouter Free — OpenRouter", "OpenRouter Free — OpenRouter (free)"},
+		// A plain name gets exactly one marker — free/paid gating lives in the
+		// caller (main.go only calls this for provider=="openrouter" &&
+		// m.Free), so this function's contract is purely "mark if unmarked".
+		{"plain free-tier name", "DeepSeek V4 Flash — OpenRouter", "DeepSeek V4 Flash — OpenRouter (free)"},
+		{"blank passes through", "", ""},
+		{"idempotent when applied twice", WithFreeMarker("Laguna S 2.1 — OpenRouter"), "Laguna S 2.1 — OpenRouter (free)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WithFreeMarker(tc.in)
+			if got != tc.want {
+				t.Fatalf("WithFreeMarker(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			// Re-marking must never append a second marker.
+			if again := WithFreeMarker(got); again != got {
+				t.Fatalf("WithFreeMarker not idempotent: %q -> %q", got, again)
+			}
+		})
 	}
 }
 

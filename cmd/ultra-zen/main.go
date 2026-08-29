@@ -1286,6 +1286,17 @@ func main() {
 				display = display + " (paid)"
 			}
 		}
+		// Free-tier OpenRouter models get a " (free)" marker in every view —
+		// the quota is account-wide and :free requests are capped per day, so
+		// the picker should make that tier obvious. Free-ness is authoritative
+		// from the catalog (m.Free, derived from the ":free" id suffix or the
+		// openrouter/free router by models.ListOpenRouter*), never from the
+		// display name. WithFreeMarker keeps this idempotent, so an entry the
+		// --all-models branch above already suffixed never double-marks. The ID
+		// is untouched: Claude Code and the proxy route by it, byte-identical.
+		if m.Provider == "openrouter" && m.Free {
+			display = claude.WithFreeMarker(display)
+		}
 		gatewayModels = append(gatewayModels, claude.GatewayCacheModel{
 			ID:          proxy.ClaudeModelID(m.Provider, m.ID),
 			DisplayName: display,

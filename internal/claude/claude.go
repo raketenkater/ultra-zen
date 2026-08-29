@@ -164,6 +164,26 @@ type GatewayCacheModel struct {
 	DisplayName string `json:"display_name"`
 }
 
+// freeMarker is the trailing display-name suffix that flags an OpenRouter
+// free-tier model in Claude Code's /model picker. The gateway-cache schema is
+// only {id, display_name}, so the hint has to ride on the name; the id stays
+// byte-identical because Claude Code and the proxy route by it.
+const freeMarker = " (free)"
+
+// WithFreeMarker appends freeMarker to a display name unless it already ends in
+// a free marker, so applying it twice never produces "(free) (free)". The
+// already-marked check is case-insensitive and covers the exact suffix the
+// --all-models view adds (" (free)") in any casing. Blank names pass through.
+func WithFreeMarker(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return name
+	}
+	if strings.HasSuffix(strings.ToLower(name), "(free)") {
+		return name
+	}
+	return name + freeMarker
+}
+
 // WriteGatewayCache pre-writes Claude Code's /model gateway-models cache so the
 // picker shows the full catalog immediately on launch — without depending on
 // Claude Code's own (fragile) gateway discovery fetch (bpu) to populate it.
