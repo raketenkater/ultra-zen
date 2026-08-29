@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -108,6 +109,20 @@ type Server struct {
 	poolMu         sync.Mutex
 	activeRoute    int
 	exhaustedRoute []bool
+	// nextEligible is the per-route cooldown park (pool-indexed, zero = never
+	// parked). A temporary 429 / 5xx / transient availability 400 parks the
+	// route until the stored time so the next turn does not re-probe a
+	// freshly-failed route head-of-line forever; the park expires on its own
+	// and a success clears it. Transport errors only rotate the cursor (an
+	// unreachable endpoint may be our own egress failing, not the route's).
+	// Guarded by poolMu.
+	nextEligible []time.Time
+	// strikes counts consecutive temporary failures per route (pool-indexed)
+	// and drives the exponential cooldown ladder (5m -> 15m -> 60m, capped).
+	// Reset on a good 200. Guarded by poolMu.
+	strikes []int
+	// now is the clock seam for cooldown tests (nil in production = time.Now).
+	now func() time.Time
 	// deadSelectable remembers /model-selectable routes that are NOT in the
 	// rotation pool (full-catalog models) but were hard-denied (403/permanent)
 	// this session. They have no pool index, so exhaustedRoute can't mark them;
@@ -138,6 +153,8 @@ func New(cfg Config) *Server {
 	s := &Server{
 		cfg:            cfg,
 		exhaustedRoute: make([]bool, 1+len(cfg.Fallbacks)),
+		nextEligible:   make([]time.Time, 1+len(cfg.Fallbacks)),
+		strikes:        make([]int, 1+len(cfg.Fallbacks)),
 		deadSelectable: make(map[string]bool),
 		modelRoute:     buildModelRoute(cfg),
 		usage:          newUsageTracker(),
@@ -523,12 +540,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, 400, "invalid_request_error", "could not read request body: "+err.Error())
+		s.reject(w, 400, "invalid_request_error", "could not read request body: "+err.Error())
 		return
 	}
 	var areq anthropicRequest
 	if err := json.Unmarshal(body, &areq); err != nil {
-		writeError(w, 400, "invalid_request_error", "invalid Anthropic request: "+err.Error())
+		s.reject(w, 400, "invalid_request_error", "invalid Anthropic request: "+err.Error())
 		return
 	}
 	// Model routing. When Claude Code's /model command selects a model, the
@@ -553,7 +570,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		// picked a section should never silently get a model. Any other
 		// unrecognized model id keeps the primary fallback (harmless for
 		// arbitrary/other-client requests).
-		writeError(w, 400, "invalid_request_error", fmt.Sprintf("model group %q is a section header, not a selectable model; run /model to pick one", areq.Model))
+		s.reject(w, 400, "invalid_request_error", fmt.Sprintf("model group %q is a section header, not a selectable model; run /model to pick one", areq.Model))
 		return
 	} else if (areq.Model == "" || areq.Model == primary.Model) && len(s.cfg.Fallbacks) == 0 && s.cfg.WorkerModel != "" && !hasInteractiveTools(areq.Tools) {
 		// Background sub-agent with no explicit /model pick: run on the worker.
@@ -564,7 +581,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	oreq, err := areq.toOpenAI(primary.Model)
 	if err != nil {
-		writeError(w, 400, "invalid_request_error", err.Error())
+		s.reject(w, 400, "invalid_request_error", err.Error())
 		return
 	}
 	// Clamp max_tokens to a safe ceiling. Claude Code frequently requests very
@@ -574,11 +591,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, resp, used, err := s.forwardWithRateLimit(r.Context(), primary, oreq)
 	if err != nil {
-		writeError(w, 502, "api_error", "gateway request failed: "+err.Error())
+		s.reject(w, 502, "api_error", "gateway request failed: "+err.Error())
 		return
 	}
 	if resp == nil {
-		writeError(w, 429, "rate_limit_error", "every configured free model is exhausted for this session")
+		s.reject(w, 429, "rate_limit_error", "every configured free model is exhausted for this session")
 		return
 	}
 	defer resp.Body.Close()
@@ -589,13 +606,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode == http.StatusBadRequest {
 		ub, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		s.dumpFailingRequest(ub, payload)
+		s.dumpFailingRequest(used, ub, payload)
 		log.Printf("ultra-zen proxy: upstream 400 (max_tokens=%d): %s | request: %s", oreq.MaxTokens, truncate(string(ub), 200), truncate(string(payload), 500))
 
 		// First retry: same params (handles transient backend failures).
 		_, resp2, err := s.forwardTo(r.Context(), used, oreq)
 		if err != nil {
-			writeError(w, 502, "api_error", "gateway retry failed: "+err.Error())
+			s.reject(w, 502, "api_error", "gateway retry failed: "+err.Error())
 			return
 		}
 		if resp2.StatusCode == http.StatusOK {
@@ -613,7 +630,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 				oreq.MaxTokens /= 2
 				payload3, resp3, err := s.forwardTo(r.Context(), used, oreq)
 				if err != nil {
-					writeError(w, 502, "api_error", "gateway retry failed: "+err.Error())
+					s.reject(w, 502, "api_error", "gateway retry failed: "+err.Error())
 					return
 				}
 				if resp3.StatusCode == http.StatusOK {
@@ -700,7 +717,20 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			break
 		}
 		temporary := false
+		// sawThrottle tracks whether at least one route answered with a
+		// throttle-class HTTP response this round. Transport errors and a dead
+		// context set `temporary` (the pool must be retried) but are NOT
+		// throttles; without this the "every available route is throttled" line
+		// lied after a Claude Code cancel, which is how #3 echoed a fake 429
+		// back at the user.
+		sawThrottle := false
 		for _, choice := range routes {
+			// A dead context is not a route condition: return it before
+			// touching the pool so a cancel can never reorder routes, park
+			// anyone, or emit a throttle log.
+			if err := ctx.Err(); err != nil {
+				return nil, nil, Upstream{}, err
+			}
 			if !choice.explicit && s.routeExhausted(choice.index) {
 				continue
 			}
@@ -718,6 +748,19 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			}
 			p, candidate, callErr := s.forwardTo(ctx, choice.Upstream, routeReq)
 			if callErr != nil {
+				// A canceled request (Claude Code interrupted the turn, or the
+				// proxy's context is otherwise done) surfaces as a transport
+				// error on whatever route was in flight. That is not the
+				// route's fault: reordering or parking it on every cancel was
+				// mechanism #3's echo, and the resulting backoff log told the
+				// user "every available route is throttled" about a request
+				// nobody was making any more. Return the error untouched.
+				if errors.Is(callErr, context.Canceled) {
+					if candidate != nil {
+						candidate.Body.Close()
+					}
+					return nil, nil, Upstream{}, callErr
+				}
 				// A transport failure (dial timeout, connection refused, TLS error)
 				// is a temporary endpoint outage, not a permanent request error.
 				// Soft-skip to the next pool route instead of surfacing a 502
@@ -730,6 +773,13 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 				log.Printf("ultra-zen proxy: transport error on %s: %v; rotating", choice.Model, callErr)
 				continue
 			}
+			// servedOK marks a 200 whose body classified as a real completion.
+			// Only such responses get the pool-promotion and usage bookkeeping
+			// in the return branch below: the 2xx-with-error-body and
+			// degenerate cases rotate with `continue` before reaching it (they
+			// never promoteRoute), and any remaining non-200 pass-through is a
+			// genuine client error that must not reorder the pool either.
+			servedOK := false
 			if candidate.StatusCode == http.StatusOK {
 				// Peek the body so a gateway error or empty completion served
 				// with HTTP 200 rotates to the next route instead of producing
@@ -767,6 +817,7 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 					candidate.Body.Close()
 					continue
 				}
+				servedOK = true
 			}
 			if candidate.StatusCode == http.StatusForbidden {
 				body, _ := io.ReadAll(candidate.Body)
@@ -796,21 +847,55 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 				candidate.Body.Close()
 				candidate.Body = io.NopCloser(bytes.NewReader(body))
 				s.limitRoute(choice.index, false)
+				s.parkRoute(choice.index)
 				temporary = true
 				lastPayload, lastBody, lastResp, lastUsed = p, body, candidate, choice.Upstream
 				log.Printf("ultra-zen proxy: upstream %d (endpoint unavailable) on %s: %s; rotating", candidate.StatusCode, choice.Model, truncate(string(body), 200))
 				continue
 			}
+			// A 400 can be a transient availability failure in disguise: the
+			// opencode Zen gateway answers "Upstream request failed: Model is
+			// unavailable." with HTTP 400 inside a server_error envelope. That
+			// is the same class as a 5xx outage — soft-rotate to the next pool
+			// route (limitRoute + park, explicitly WITHOUT promoteRoute, which
+			// pinned the dead route head-of-line) instead of ending the turn.
+			// Request-shaped 400s (invalid_request_error with a param, context
+			// length, data_inspection_failed) do not match the predicate and
+			// fall through to the return branch below so handleMessages'
+			// halving retry keeps fixing them — rotating those would hide a
+			// request bug.
+			if candidate.StatusCode == http.StatusBadRequest {
+				body, _ := io.ReadAll(candidate.Body)
+				candidate.Body.Close()
+				candidate.Body = io.NopCloser(bytes.NewReader(body))
+				if isTransientUpstreamFailure(body) {
+					s.limitRoute(choice.index, false)
+					s.parkRoute(choice.index)
+					temporary = true
+					lastPayload, lastBody, lastResp, lastUsed = p, body, candidate, choice.Upstream
+					log.Printf("ultra-zen proxy: transient availability 400 on %s: %s; rotating", choice.Model, truncate(string(body), 200))
+					continue
+				}
+			}
 			if candidate.StatusCode != http.StatusTooManyRequests {
-				s.promoteRoute(choice.index)
-				// Success-ish: clear any prior exhaustion so a provider that came
-				// back online stops showing as "hit". The served-request counter
-				// and the :free quota tally below only track real 200s — a 400
-				// (bad params) still gets handed through to the caller's retry
-				// path, but it is not a served request and OpenRouter does not
-				// meter it against the free cap.
-				s.usage.setExhausted(choice.Upstream.Provider, false)
-				if candidate.StatusCode == http.StatusOK {
+				// Only a 200 whose body classified as a real completion counts
+				// as success: promote the route and book the usage. Anything
+				// else reaching this branch is a pass-through client error the
+				// caller must still see (e.g. a request-shaped 400 for the
+				// halving retry) — promoting it would pin a failing route at
+				// the head of every later rotation. The 2xx-with-error-body
+				// and degenerate cases already `continue`d above, so servedOK
+				// is exactly StatusCode==200 && bodyOK.
+				if servedOK {
+					s.promoteRoute(choice.index)
+					s.clearRouteCooldown(choice.index)
+					// Success: clear any prior exhaustion so a provider that came
+					// back online stops showing as "hit". The served-request counter
+					// and the :free quota tally below only track real completions — a
+					// 400 (bad params) still gets handed through to the caller's
+					// retry path, but it is not a served request and OpenRouter does
+					// not meter it against the free cap.
+					s.usage.setExhausted(choice.Upstream.Provider, false)
 					s.usage.recordRequest(choice.Upstream.Provider)
 					// OpenRouter meters :free models (and the openrouter/free
 					// router) against a per-UTC-day request cap with no readable
@@ -828,14 +913,19 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			candidate.Body = io.NopCloser(bytes.NewReader(body))
 			accountExhausted := isOpenRouterDailyLimit(body)
 			providerExhausted := accountExhausted || isFreeUsageLimit(body)
+			sawThrottle = true
 			if providerExhausted {
 				s.exhaustProviderRoutes(choice.Upstream)
 				// Mark the provider exhausted for the statusline. SAIA and other
 				// free tiers that should NOT permanently retire still get cleared
-				// on the next 200 above (setExhausted(...,false)).
+				// on the next good 200 (setExhausted(...,false)).
 				s.usage.setExhausted(choice.Upstream.Provider, true)
 			} else {
 				s.limitRoute(choice.index, false)
+				// A temporary 429 parks the route for a cooldown window so the
+				// next turn starts elsewhere instead of re-probing the throttled
+				// route first every few seconds (the glm-5.2:free 131-hits bug).
+				s.parkRoute(choice.index)
 			}
 			// Capture any rate-limit response headers for the provider so the
 			// statusline can show remaining-request counts even for providers
@@ -863,9 +953,18 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			delay = backoff * time.Duration(1<<round)
 		}
 		if delay > maxRateLimitWait {
+			log.Printf("ultra-zen proxy: backoff %s exceeds the %s ceiling; giving up on this round's retry loop", delay, maxRateLimitWait)
 			break
 		}
-		log.Printf("ultra-zen proxy: every available route is throttled; retrying in %s", delay)
+		// Only say "throttled" when a route actually answered with a throttle
+		// class this round; a round that failed purely on transport errors is an
+		// outage, and calling it a throttle sent users chasing rate limits that
+		// never existed.
+		if sawThrottle {
+			log.Printf("ultra-zen proxy: every available route is throttled; retrying in %s", delay)
+		} else {
+			log.Printf("ultra-zen proxy: every available route failed transiently; retrying in %s", delay)
+		}
 		if err := sleepContext(ctx, delay); err != nil {
 			return nil, nil, Upstream{}, err
 		}
@@ -906,11 +1005,34 @@ func (s *Server) recordRetryServed(u Upstream, resp *http.Response) {
 	if classifyUpstreamBody(prefix) != bodyOK {
 		return
 	}
+	// Aligned with the main loop's success branch: a proven-good 200 promotes
+	// the route, clears any cooldown, and books the usage.
+	idx := s.poolIndexOf(u)
+	s.promoteRoute(idx)
+	s.clearRouteCooldown(idx)
 	s.usage.recordRequest(u.Provider)
 	s.usage.setExhausted(u.Provider, false)
 	if u.Provider == "openrouter" && models.OpenRouterFreeModel(u.Model) {
 		models.RecordORFreeRequest()
 	}
+}
+
+// poolIndexOf resolves an upstream back to its rotation-pool index, or -1 for
+// a route outside the pool (the legacy no-fallback primary, a worker model, an
+// index -1 selectable). promoteRoute/clearRouteCooldown no-op on -1.
+func (s *Server) poolIndexOf(u Upstream) int {
+	if !sameUpstream(u, s.cfg.primaryUpstream()) && len(s.cfg.Fallbacks) > 0 {
+		for i, f := range s.cfg.Fallbacks {
+			if sameUpstream(u, f) {
+				return 1 + i
+			}
+		}
+		return -1
+	}
+	if sameUpstream(u, s.cfg.primaryUpstream()) {
+		return 0
+	}
+	return -1
 }
 
 // routeOrder returns every non-exhausted pool route, starting at the most
@@ -970,7 +1092,7 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 			out = append(out, routeChoice{Upstream: primary, index: -1, explicit: true})
 		}
 	} else {
-		if primIdx >= 0 && !s.exhaustedRoute[primIdx] {
+		if primIdx >= 0 && s.routeEligibleLocked(primIdx) {
 			out = append(out, routeChoice{Upstream: primary, index: primIdx})
 			seen[primIdx] = true
 		} else if primIdx < 0 {
@@ -991,11 +1113,21 @@ func (s *Server) routeOrder(primary Upstream) []routeChoice {
 		if seen[idx] {
 			continue
 		}
-		if !s.exhaustedRoute[idx] {
+		if s.routeEligibleLocked(idx) {
 			out = append(out, routeChoice{Upstream: pool[idx].u, index: idx})
 		}
 	}
 	return out
+}
+
+// routeEligibleLocked reports whether a pool route may be attempted now: not
+// permanently exhausted and not inside a temporary-failure cooldown park.
+// Callers must hold poolMu.
+func (s *Server) routeEligibleLocked(index int) bool {
+	if s.exhaustedRoute[index] {
+		return false
+	}
+	return !s.clockNow().Before(s.nextEligible[index])
 }
 
 // sameUpstream reports whether two upstreams point at the same model on the
@@ -1022,13 +1154,74 @@ func (s *Server) limitRoute(index int, permanent bool) {
 	}
 }
 
+// parkRoute puts a route on a temporary-failure cooldown: one more strike
+// extends the park, following the repeat-offense ladder below. This is what
+// stops a 429/5xx/transient-400 route from being re-probed head-of-line on
+// every turn forever (the glm-5.2:free 131-hits bug).
+func (s *Server) parkRoute(index int) {
+	if index < 0 || index >= len(s.nextEligible) {
+		return
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	s.strikes[index]++
+	s.nextEligible[index] = s.clockNow().Add(routeCooldownTTL(s.strikes[index]))
+}
+
+// routeCooldownTTL is the repeat-offense ladder: the 1st temporary failure
+// parks the route for 5 minutes, the 2nd for 15, the 3rd and every one after
+// for 60 (capped). Counting only offenses keeps the ladder deterministic; a
+// good 200 clears the count so the next incident starts at 5 minutes.
+func routeCooldownTTL(offenses int) time.Duration {
+	switch {
+	case offenses <= 1:
+		return 5 * time.Minute
+	case offenses == 2:
+		return 15 * time.Minute
+	default:
+		return 60 * time.Minute
+	}
+}
+
+// clearRouteCooldown forgets a route's temporary-failure history (strikes and
+// park). Called from promoteRoute on a good 200: the route proved healthy, so
+// a future failure must start a fresh 5-minute park, not an escalated one.
+func (s *Server) clearRouteCooldown(index int) {
+	if index < 0 || index >= len(s.strikes) {
+		return
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	s.strikes[index] = 0
+	s.nextEligible[index] = time.Time{}
+}
+
+// clockNow is the cooldown clock seam: s.now when set (tests), time.Now
+// otherwise.
+func (s *Server) clockNow() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
 func (s *Server) routeExhausted(index int) bool {
-	if index < 0 {
+	if index < 0 || index >= len(s.exhaustedRoute) {
 		return false
 	}
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
-	return s.exhaustedRoute[index]
+	if s.exhaustedRoute[index] {
+		return true
+	}
+	// Permanent retirement (403 denial / FreeUsageLimitError) stays as before.
+	// Additionally a route parked in a temporary-failure cooldown reads as not
+	// eligible until the park expires on its own — routeExhausted is now
+	// time-aware (fix #4/#7).
+	if index < len(s.nextEligible) && s.clockNow().Before(s.nextEligible[index]) {
+		return true
+	}
+	return false
 }
 
 // retireRoute permanently retires a failed route. Pool routes (index >= 0) are
@@ -1160,6 +1353,24 @@ func isFreeUsageLimit(body []byte) bool {
 		strings.Contains(msg, "gousagelimiterror") ||
 		strings.Contains(msg, "insufficient_quota") ||
 		strings.Contains(msg, "exceeded your current quota")
+}
+
+// isTransientUpstreamFailure reports a 400 body that is really an availability
+// failure wearing a client-error status code — today's instance is zen-go's
+// {"type":"server_error","message":"Error from provider (Console): Upstream
+// request failed: Model is unavailable."}. Only this class rotates to another
+// pool route: a 400 that names a bad param (invalid_request_error), a context
+// length, or moderation stays on the same upstream so handleMessages' halving
+// retry can fix it. The substring match is intentionally narrow — "upstream
+// request failed" is a generic gateway wrapper, so it must co-occur with a
+// server_error type to count.
+func isTransientUpstreamFailure(body []byte) bool {
+	msg := strings.ToLower(string(body))
+	if strings.Contains(msg, "model is unavailable") {
+		return true
+	}
+	return strings.Contains(msg, "upstream request failed") &&
+		strings.Contains(msg, `"type":"server_error"`)
 }
 
 // classifyUpstreamBody peeks at a 200 response body prefix and decides whether
@@ -1322,10 +1533,22 @@ func truncate(s string, n int) string {
 	return s
 }
 
+// reject logs and emits an Anthropic-shaped error response. It exists so
+// every writeError exit in handleMessages is observable: previously a session
+// could end on an error the proxy logged nowhere, leaving only the client's
+// redacted UI as evidence.
+func (s *Server) reject(w http.ResponseWriter, status int, typ, message string) {
+	log.Printf("ultra-zen proxy: request error %d %s: %s", status, typ, message)
+	writeError(w, status, typ, message)
+}
+
 // dumpFailingRequest writes the full request payload + upstream error to
 // ~/.cache/ultra-zen/last-400.json so the exact failing request can be
-// inspected without truncation. Overwrites on each 400.
-func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
+// inspected without truncation. Overwrites on each 400. The route fields are
+// stamped from the upstream that ACTUALLY served the failing request, not the
+// launch config: with a fallback pool the dump used to name the primary model
+// even when a completely different gateway 400'd, which misdirected triage.
+func (s *Server) dumpFailingRequest(used Upstream, upstreamErr []byte, payload []byte) {
 	dir := os.Getenv("HOME") + "/.cache/ultra-zen"
 	// 0700/0600: the dump holds the full request payload — the entire
 	// conversation, including any file contents Claude Code read into context.
@@ -1339,8 +1562,8 @@ func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
 		Request     json.RawMessage `json:"request"`
 		UpstreamErr json.RawMessage `json:"upstream_error"`
 	}{
-		Model:       s.cfg.Model,
-		Upstream:    s.cfg.BaseURL,
+		Model:       used.Model,
+		Upstream:    used.BaseURL,
 		Request:     json.RawMessage(payload),
 		UpstreamErr: json.RawMessage(upstreamErr),
 	}
@@ -1361,7 +1584,7 @@ func (s *Server) dumpFailingRequest(upstreamErr []byte, payload []byte) {
 func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, model, kind string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		writeError(w, 502, "api_error", "read gateway response: "+err.Error())
+		s.reject(w, 502, "api_error", "read gateway response: "+err.Error())
 		return
 	}
 	if kind == UpstreamResponses {
@@ -1369,14 +1592,14 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, m
 		// into an openAIResponse.
 		chunks := collectChatChunks(body)
 		if len(chunks) == 0 {
-			writeError(w, 502, "api_error", "empty responses stream from codex backend")
+			s.reject(w, 502, "api_error", "empty responses stream from codex backend")
 			return
 		}
 		oresp := chunksToOpenAIResponse(chunks)
 		anthropic := oresp.toAnthropic(model)
 		out, err := json.Marshal(anthropic)
 		if err != nil {
-			writeError(w, 502, "api_error", "encode translated response: "+err.Error())
+			s.reject(w, 502, "api_error", "encode translated response: "+err.Error())
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1386,7 +1609,7 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, m
 	}
 	var oresp openAIResponse
 	if err := json.Unmarshal(body, &oresp); err != nil {
-		writeError(w, 502, "api_error", "parse gateway response: "+err.Error())
+		s.reject(w, 502, "api_error", "parse gateway response: "+err.Error())
 		return
 	}
 	anthropic := oresp.toAnthropic(model)
@@ -1394,7 +1617,7 @@ func (s *Server) nonStreamResponse(w http.ResponseWriter, resp *http.Response, m
 	if err != nil {
 		// Never hand Claude Code a 200 with an empty body — it surfaces as an
 		// unexplained API error with no way to tell what went wrong.
-		writeError(w, 502, "api_error", "encode translated response: "+err.Error())
+		s.reject(w, 502, "api_error", "encode translated response: "+err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
