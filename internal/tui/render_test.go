@@ -32,7 +32,7 @@ func renderFixtureList(t *testing.T, delegate columnDelegate, width int) []strin
 	items := []list.Item{
 		groupHeaderItem{label: "Most used", count: 4},
 		modelItem{m: models.Model{ID: "a", Name: "Alpha Model", Free: true, ContextLength: 204800}, recent: true},
-		modelItem{m: models.Model{ID: "b", Name: "B", Free: false}, primary: true},
+		modelItem{m: models.Model{ID: "b", Name: "B", Free: false}},
 		cycleItem{selected: 3},
 		providerStatusItem{provider: "cerebras", kind: "keyless"},
 	}
@@ -181,48 +181,6 @@ func TestRenderFreeTailPops(t *testing.T) {
 		if !strings.Contains(free, mutedStyle.Render("200k")) {
 			t.Fatalf("width %d: free row ctx should stay muted: %q", width, free)
 		}
-	}
-}
-
-// TestRenderPrimaryGutterDot pins the current-model marker: an unselected
-// primary row carries the muted dot in the gutter, the gutter stays exactly
-// two columns (name alignment invariant), and selecting the row swaps the
-// cursor back in — the dot never competes with the cursor.
-func TestRenderPrimaryGutterDot(t *testing.T) {
-	delegate := columnDelegate{}
-	primary := modelItem{m: models.Model{ID: "cur", Name: "Current", Free: false}, primary: true}
-	other := modelItem{m: models.Model{ID: "o", Name: "Other", Free: true}}
-	lm := list.New([]list.Item{primary, other}, delegate, 80, 10)
-	configureList(&lm)
-	lm.Select(1) // cursor on "Other": the primary row must show the dot
-
-	var buf bytes.Buffer
-	delegate.Render(&buf, lm, 0, primary)
-	plain := ansi.Strip(buf.String())
-	if !strings.HasPrefix(plain, gDot+" ") {
-		t.Fatalf("unselected primary gutter = %q, want %q + space", plain, gDot)
-	}
-	if !strings.HasPrefix(strings.TrimPrefix(plain, gDot+" "), "Current") {
-		t.Fatalf("primary name not at col 2: %q", plain)
-	}
-	// The marker dot is one step dimmer than the model name beside it.
-	if !strings.Contains(buf.String(), mutedStyle.Render(gDot+" ")) {
-		t.Fatalf("primary dot not muted: %q", buf.String())
-	}
-
-	buf.Reset()
-	// index 0 != cursor (1) so this row renders unselected.
-	delegate.Render(&buf, lm, 0, other)
-	if plain := ansi.Strip(buf.String()); !strings.HasPrefix(plain, "  ") || strings.HasPrefix(plain, gDot) {
-		t.Fatalf("non-primary unselected row must keep the blank gutter: %q", plain)
-	}
-
-	// Selected: cursor wins, the dot yields (still two columns).
-	lm.Select(0)
-	buf.Reset()
-	delegate.Render(&buf, lm, 0, primary)
-	if plain := ansi.Strip(buf.String()); !strings.HasPrefix(plain, gCursor+" ") || strings.HasPrefix(plain, gCursor+gDot) {
-		t.Fatalf("selected primary row gutter = %q, want cursor only", plain)
 	}
 }
 

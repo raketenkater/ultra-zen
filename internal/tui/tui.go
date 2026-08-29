@@ -69,13 +69,6 @@ type tailer interface {
 	tailParts() []string
 }
 
-// primaryer marks the row of the picker's current model (m.choice). The
-// non-mark gutter draws a muted dot there: the cursor shows where you are,
-// the dot shows what you already picked, and the two never compete.
-type primaryer interface {
-	isPrimary() bool
-}
-
 // columnDelegate renders every item as exactly one physical line:
 // [gutter][name left-aligned][tail right-aligned]. Height()==1 for all rows,
 // headers included, which is what keeps the list's pagination arithmetic
@@ -125,12 +118,6 @@ func (d columnDelegate) gutter(selected bool, item list.Item) string {
 	}
 	if selected {
 		return gCursor + " "
-	}
-	// The cursor shows where you are; the dot shows what you already
-	// picked (the picker's current model). The gutter stays exactly two
-	// columns either way, so names keep their alignment.
-	if p, ok := item.(primaryer); ok && p.isPrimary() {
-		return gDot + " "
 	}
 	return "  "
 }
@@ -251,14 +238,7 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	case emptyFilter:
 		line = mutedStyle.Render(gutter+name) + mutedStyle.Render(pad+tail)
 	default:
-		// The primary marker gutter is one shade dimmer than any name it
-		// sits beside, so it needs its own segment; plain-space gutters
-		// inherit the name style unchanged.
-		gutterStyle := nameStyle
-		if strings.HasPrefix(gutter, gDot) {
-			gutterStyle = mutedStyle
-		}
-		line = gutterStyle.Render(gutter) + nameStyle.Render(name) + renderTail(pad, parts)
+		line = nameStyle.Render(gutter+name) + renderTail(pad, parts)
 	}
 	// Exactly one write, no trailing newline: bubbles joins items itself.
 	fmt.Fprintf(w, "%s", line)
@@ -290,12 +270,9 @@ func ansiTruncate(s string, width int) string {
 
 // modelItem is a single model row in the orchestrator/worker lists.
 type modelItem struct {
-	m       models.Model
-	recent  bool
-	primary bool // the picker's current model (m.choice) — gutter dot
+	m      models.Model
+	recent bool
 }
-
-func (i modelItem) isPrimary() bool { return i.primary }
 
 func (i modelItem) Title() string {
 	// Bare identity: the friendly Name when set, the id otherwise. Tier and
@@ -374,10 +351,7 @@ func (i cycleItem) FilterValue() string { return "free cycle pool rotation provi
 type providerModelItem struct {
 	provider string
 	model    models.Model
-	primary  bool // the picker's current model (m.choice) — gutter dot
 }
-
-func (i providerModelItem) isPrimary() bool { return i.primary }
 
 func (i providerModelItem) Title() string {
 	if i.model.Name != "" && i.model.Name != i.model.ID {
@@ -605,7 +579,7 @@ func (m *model) startItems() []list.Item {
 	for _, model := range m.all {
 		local[model.ID] = true
 	}
-	primaryModels := buildModelItems(m.all, m.choice)
+	primaryModels := buildModelItems(m.all)
 	if len(primaryModels) > 0 {
 		items = append(items, groupHeaderItem{label: groupLabel(m.provider), count: len(primaryModels)})
 		items = append(items, primaryModels...)
@@ -621,8 +595,7 @@ func (m *model) startItems() []list.Item {
 			continue
 		}
 		secondary[option.Provider] = append(secondary[option.Provider],
-			providerModelItem{provider: option.Provider, model: option.Model,
-				primary: option.Model.ID == m.choice})
+			providerModelItem{provider: option.Provider, model: option.Model})
 	}
 	for _, p := range poolProviders {
 		rows, ok := secondary[p]
@@ -766,7 +739,7 @@ func startItemKey(item list.Item) string {
 
 func (m *model) enterOrchestratorStep() {
 	m.step = stepOrchestrator
-	m.list.SetItems(buildModelItems(m.all, m.choice))
+	m.list.SetItems(buildModelItems(m.all))
 	m.list.ResetSelected()
 	m.list.ResetFilter()
 }
@@ -1138,10 +1111,8 @@ func (m model) View() string {
 	return ""
 }
 
-// buildModelItems returns model rows with recently used models first. The
-// current model (choice, "" until one is picked) is marked primary so its
-// gutter carries the dot.
-func buildModelItems(ms []models.Model, choice string) []list.Item {
+// buildModelItems returns model rows with recently used models first.
+func buildModelItems(ms []models.Model) []list.Item {
 	recent := models.LoadRecent()
 	ordered := models.SortByRecent(ms, recent)
 	isRecent := make(map[string]bool, len(recent))
@@ -1150,7 +1121,7 @@ func buildModelItems(ms []models.Model, choice string) []list.Item {
 	}
 	items := make([]list.Item, 0, len(ordered))
 	for _, mdl := range ordered {
-		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID], primary: mdl.ID == choice})
+		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID]})
 	}
 	return items
 }

@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
@@ -93,7 +95,7 @@ func newTestModel() model {
 	ms := []models.Model{
 		{ID: "test-model", Name: "test-model", Base: "https://example.com", Free: true},
 	}
-	items := buildModelItems(ms, "")
+	items := buildModelItems(ms)
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)
@@ -104,6 +106,85 @@ func newTestModel() model {
 		subtitle: "opencode Zen",
 		step:     stepCombo,
 	}
+}
+
+// assertPickerRows renders every row of lm through the real columnDelegate
+// and pins the two tier-hierarchy cues that the picker flow actually
+// produces: an unselected model row keeps the blank two-column gutter (no
+// "already picked" dot — nothing is picked yet, and Run never seeds a
+// choice), names stay at col 2, and the free tier pops with the accent tail
+// word while paid tails stay unaccented.
+func assertPickerRows(t *testing.T, screen string, lm list.Model) {
+	t.Helper()
+	delegate := columnDelegate{}
+	lm.Select(0) // cursor on row 0; every later row renders unselected
+	rows := 0
+	for idx, item := range lm.Items() {
+		mi, ok := item.(modelItem)
+		if !ok {
+			continue
+		}
+		rows++
+		// The cursor row renders as one all-bold-accent line (a different,
+		// separately pinned branch); check the unselected rows only.
+		if idx == lm.Index() {
+			continue
+		}
+		var buf bytes.Buffer
+		delegate.Render(&buf, lm, idx, item)
+		plain := ansi.Strip(buf.String())
+		if !strings.HasPrefix(plain, "  ") {
+			t.Fatalf("%s: unselected row %d carries a gutter marker: %q", screen, idx, plain)
+		}
+		if !strings.HasPrefix(strings.TrimPrefix(plain, "  "), mi.Title()) {
+			t.Fatalf("%s: row %d name not at col 2: %q", screen, idx, plain)
+		}
+		if mi.m.Free && !strings.Contains(buf.String(), accentStyle.Render("free")) {
+			t.Fatalf("%s: free row %d lost the accent tail: %q", screen, idx, buf.String())
+		}
+		if !mi.m.Free && strings.Contains(buf.String(), accentStyle.Render("free")) {
+			t.Fatalf("%s: paid row %d wrongly accented: %q", screen, idx, buf.String())
+		}
+	}
+	if rows < 2 {
+		t.Fatalf("%s: expected model rows from the real build, got %d", screen, rows)
+	}
+}
+
+// TestPickerFlowHierarchyCues pins what the start screen and the manual
+// orchestrator step actually render: Run only opens the picker when nothing
+// is chosen, so no row may claim to be "the current pick" — the free accent
+// and the name column are the surviving cues. Drives Update()/startItems/
+// buildModelItems end to end; no hand-built row state.
+func TestPickerFlowHierarchyCues(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ms := []models.Model{
+		{ID: "free-model", Name: "free-model", Base: "https://example.com", Free: true},
+		{ID: "paid-model", Name: "paid-model", Base: "https://example.com"},
+	}
+	m := model{all: ms, provider: "opencode-go", subtitle: "opencode Zen", step: stepCombo, hasCombos: true}
+	l := list.New(m.startItems(), columnDelegate{}, 80, 30)
+	configureList(&l)
+	m.list = l
+	assertPickerRows(t, "start", m.list)
+
+	// Walk the real flow: Enter on the manual row advances to the
+	// orchestrator step, which rebuilds items with m.choice still "".
+	for i, item := range m.list.Items() {
+		if ci, ok := item.(comboItem); ok && ci.manual {
+			m.list.Select(i)
+			break
+		}
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+	if mm.step != stepOrchestrator {
+		t.Fatalf("step = %v, want stepOrchestrator", mm.step)
+	}
+	if mm.choice != "" {
+		t.Fatalf("choice = %q before any pick, want empty", mm.choice)
+	}
+	assertPickerRows(t, "orchestrator", mm.list)
 }
 
 // Opening the key manager with 'k' and closing it with Esc must not panic
