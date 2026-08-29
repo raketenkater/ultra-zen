@@ -87,10 +87,19 @@ func (s *Server) fetchProviderUsage(httpClient *http.Client, provider, key strin
 	}
 }
 
-// fetchOpenRouterUsage GETs {OpenRouterBase}/key. It reads limit_remaining and
-// usage_daily; we deliberately avoid /credits (403s on normal keys).
+// fetchOpenRouterUsage GETs {OpenRouterBase}/key for the per-key cap and the
+// free-tier window, then {OpenRouterBase}/credits for the account balance and
+// the lifetime-purchased amount that sets the :free daily request cap.
+// (/activity would report daily free_used but needs a management key.)
 func (s *Server) fetchOpenRouterUsage(httpClient *http.Client, key string) {
-	url := models.OpenRouterBase + "/key"
+	s.fetchOpenRouterUsageAt(models.OpenRouterBase, httpClient, key)
+}
+
+// fetchOpenRouterUsageAt is fetchOpenRouterUsage with an injectable base URL
+// for tests — mirroring fetchOpenRouterUsageAt in internal/tui, which lets the
+// parity test point both usage paths at the same fake server.
+func (s *Server) fetchOpenRouterUsageAt(base string, httpClient *http.Client, key string) {
+	url := base + "/key"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return
@@ -150,7 +159,40 @@ func (s *Server) fetchOpenRouterUsage(httpClient *http.Client, key string) {
 			row.Daily = &WindowStat{Status: "daily", ResetsAt: *payload.Data.LimitReset}
 		}
 	}
+	// Account credits come from /credits: `limit_remaining` on /key is the
+	// per-key cap, not the balance. Purchased lifetime also sets the free-tier
+	// daily request cap (50 → 1000 at $10+). Same shared fetch and fold as the
+	// launch banner (internal/tui) so the two views can never disagree.
+	if total, used, ok := models.FetchOpenRouterCredits(httpClient, base, key); ok {
+		applyOpenRouterCredits(row, total, used)
+	}
 	s.usage.setRow("openrouter", row)
+}
+
+// applyOpenRouterCredits folds /credits totals plus the local :free request
+// tally into a fresh openrouter row. Shared by the poller and the launch-time
+// banner fetch (internal/tui calls through the same logic via the exported
+// proxy helper below) so both paths render identical numbers from identical
+// upstream data.
+func applyOpenRouterCredits(row *ProviderUsage, total, used float64) {
+	balance := total - used
+	row.Limit = &total
+	row.Remaining = &balance
+	row.Credits = &balance
+	capN := models.OpenRouterFreeDailyCap(total)
+	usedN := models.ORFreeRequests()
+	row.FreeReqsUsed = &usedN
+	row.FreeReqsLimit = &capN
+	if usedN >= capN {
+		row.Exhausted = true
+	}
+}
+
+// ApplyOpenRouterCredits is the exported form of applyOpenRouterCredits for
+// the launch-time banner in internal/tui, which builds the same canonical
+// ProviderUsage row before any proxy exists.
+func ApplyOpenRouterCredits(row *ProviderUsage, total, used float64) {
+	applyOpenRouterCredits(row, total, used)
 }
 
 // fetchZenUsage GETs {base}/usage (opencode.ai zen gateway). It parses the

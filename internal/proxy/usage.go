@@ -59,6 +59,16 @@ type ProviderUsage struct {
 	// Daily is a daily reset window (e.g. OpenRouter free-tier limit_reset),
 	// carrying the ISO timestamp of the next reset in ResetsAt.
 	Daily      *WindowStat `json:"daily,omitempty"`
+	// Credits is the account balance (total purchased minus total spent),
+	// from /credits — distinct from Remaining, which /key reports as the
+	// per-key cap when the account has no credit data.
+	Credits *float64 `json:"credits,omitempty"`
+	// FreeReqsUsed/FreeReqsLimit are OpenRouter's :free request tally against
+	// the daily cap. No public API exposes this, so the tally is ultra-zen's
+	// own persisted per-UTC-day counter (a floor: requests made outside
+	// ultra-zen are invisible).
+	FreeReqsUsed  *int64 `json:"freeReqsUsed,omitempty"`
+	FreeReqsLimit *int64 `json:"freeReqsLimit,omitempty"`
 	Exhausted  bool        `json:"exhausted"`
 	LastUpdated string     `json:"lastUpdated"` // ISO timestamp of the last good fetch
 	Detail     string      `json:"detail,omitempty"`

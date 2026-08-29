@@ -81,6 +81,32 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 	case proxy.UsageCredits:
 		switch title {
 		case "openrouter":
+			// Account credits (from /credits) are the headline number: the
+			// balance, plus the :free request tally against today's cap. The
+			// tally is "~"-marked because it counts only requests routed
+			// through ultra-zen — a floor for "left", never more than what
+			// OpenRouter itself meters.
+			if u.Credits != nil {
+				tok := fmt.Sprintf("[OR $%.2f credits", *u.Credits)
+				if u.FreeReqsLimit != nil {
+					left := *u.FreeReqsLimit
+					if u.FreeReqsUsed != nil {
+						left -= *u.FreeReqsUsed
+						if left < 0 {
+							left = 0
+						}
+					}
+					tok += fmt.Sprintf(" · ~%d free req left", left)
+				}
+				return tok + "]"
+			}
+			if u.Remaining == nil && u.FreeLimit == nil {
+				// /key reported a null limit_remaining (and no /credits
+				// data): the key is unmetered. Render the fact instead of
+				// falling through to the ambiguous "[openrouter —]" dash,
+				// so the statusline and launch banner show the same token.
+				return "[OR unlimited]"
+			}
 			reset := humanizeReset(resetOf(u.Daily))
 			if u.FreeLimit != nil && *u.FreeLimit > 0 {
 				// Free tier: daily cap + remaining balance + daily reset.

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
 // Config holds the gateway target and credentials for the proxy.
@@ -597,6 +599,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if resp2.StatusCode == http.StatusOK {
+			s.recordRetryServed(used)
 			resp.Body.Close()
 			resp.Body = resp2.Body
 			resp.StatusCode = resp2.StatusCode
@@ -614,6 +617,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if resp3.StatusCode == http.StatusOK {
+					s.recordRetryServed(used)
 					resp.Body.Close()
 					resp.Body = resp3.Body
 					resp.StatusCode = resp3.StatusCode
@@ -799,10 +803,22 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 			}
 			if candidate.StatusCode != http.StatusTooManyRequests {
 				s.promoteRoute(choice.index)
-				// Success: count the served request and clear any prior exhaustion
-				// so a provider that came back online stops showing as "hit".
-				s.usage.recordRequest(choice.Upstream.Provider)
+				// Success-ish: clear any prior exhaustion so a provider that came
+				// back online stops showing as "hit". The served-request counter
+				// and the :free quota tally below only track real 200s — a 400
+				// (bad params) still gets handed through to the caller's retry
+				// path, but it is not a served request and OpenRouter does not
+				// meter it against the free cap.
 				s.usage.setExhausted(choice.Upstream.Provider, false)
+				if candidate.StatusCode == http.StatusOK {
+					s.usage.recordRequest(choice.Upstream.Provider)
+					// OpenRouter meters :free models (and the openrouter/free
+					// router) against a per-UTC-day request cap with no readable
+					// API for ordinary keys, so count locally for the statusline.
+					if choice.Upstream.Provider == "openrouter" && models.OpenRouterFreeModel(choice.Upstream.Model) {
+						models.RecordORFreeRequest()
+					}
+				}
 				*oreq = *routeReq
 				return p, candidate, choice.Upstream, nil
 			}
@@ -869,6 +885,19 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 		return nil, nil, Upstream{}, lastCallErr
 	}
 	return lastPayload, lastResp, lastUsed, nil
+}
+
+// recordRetryServed performs the success accounting for the 400-retry path in
+// handleMessages, mirroring the in-loop bookkeeping in forwardWithRateLimit.
+// The failed 400 attempt itself was never metered by OpenRouter (a rejected
+// request does not spend a :free slot), so the retry's 200 counts exactly
+// once — no double-counting across the original round and the retry.
+func (s *Server) recordRetryServed(u Upstream) {
+	s.usage.recordRequest(u.Provider)
+	s.usage.setExhausted(u.Provider, false)
+	if u.Provider == "openrouter" && models.OpenRouterFreeModel(u.Model) {
+		models.RecordORFreeRequest()
+	}
 }
 
 // routeOrder returns every non-exhausted pool route, starting at the most

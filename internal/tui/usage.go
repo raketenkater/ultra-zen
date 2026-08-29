@@ -77,12 +77,18 @@ func fetchUsageSync(providers map[string]string) map[string]usageSnapshot {
 	return rows
 }
 
-// fetchOpenRouterUsage queries GET /api/v1/key with the normal API key (NOT
-// /credits, which 403s on non-management keys). Parses the remaining credit
-// balance, the free-tier daily cap + reset, and today's usage into a canonical
-// ProviderUsage row rendered by the shared usagefmt formatter.
+// fetchOpenRouterUsage queries GET /api/v1/key with the normal API key, then
+// GET /api/v1/credits for the account balance. /key's limit_remaining is only
+// the per-key cap, so the balance and the :free request tally come from
+// /credits plus the local counter — the exact same shared fetch/fold the
+// in-session poller performs (models.FetchOpenRouterCredits +
+// proxy.ApplyOpenRouterCredits), so both views render identical numbers.
 func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
-	req, err := http.NewRequest(http.MethodGet, models.OpenRouterBase+"/key", nil)
+	return fetchOpenRouterUsageAt(models.OpenRouterBase, client, key)
+}
+
+func fetchOpenRouterUsageAt(base string, client *http.Client, key string) usageSnapshot {
+	req, err := http.NewRequest(http.MethodGet, base+"/key", nil)
 	if err != nil {
 		return usageSnapshot{Provider: "openrouter", Line: "OpenRouter: " + err.Error()}
 	}
@@ -92,6 +98,10 @@ func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
 		return usageSnapshot{Provider: "openrouter", Line: "OpenRouter: " + err.Error()}
 	}
 	defer resp.Body.Close()
+	// A rejected key must not render as an empty (⇒ "unlimited") row.
+	if resp.StatusCode != http.StatusOK {
+		return usageSnapshot{Provider: "openrouter", Line: "OpenRouter: /key " + resp.Status}
+	}
 	body, _ := io.ReadAll(resp.Body)
 	var payload struct {
 		Data struct {
@@ -105,12 +115,11 @@ func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return usageSnapshot{Provider: "openrouter", Line: "OpenRouter: parse error"}
 	}
-	if payload.Data.LimitRemaining == nil {
-		return usageSnapshot{Provider: "openrouter", Line: "OpenRouter: unlimited credits", Ready: true}
-	}
 	row := &proxy.ProviderUsage{Name: "openrouter", Kind: proxy.UsageCredits, Window: proxy.WindowDaily}
-	rem := *payload.Data.LimitRemaining
-	row.Remaining = &rem
+	if payload.Data.LimitRemaining != nil {
+		rem := *payload.Data.LimitRemaining
+		row.Remaining = &rem
+	}
 	if payload.Data.UsageDaily != nil {
 		used := *payload.Data.UsageDaily
 		row.Used = &used
@@ -124,6 +133,16 @@ func fetchOpenRouterUsage(client *http.Client, key string) usageSnapshot {
 			row.Daily = &proxy.WindowStat{Status: "daily", ResetsAt: *payload.Data.LimitReset}
 		}
 	}
+	// Account credits come from /credits (/key's limit_remaining is the per-key
+	// cap, not the balance); the :free request tally is the local persisted
+	// counter. Identical fetch and fold as the in-session poller.
+	if total, used, ok := models.FetchOpenRouterCredits(client, base, key); ok {
+		proxy.ApplyOpenRouterCredits(row, total, used)
+		return usageSnapshot{Provider: "openrouter", Usage: row, Ready: true}
+	}
+	// No /credits data: /key's fields alone. A null limit_remaining means the
+	// key is unmetered; usagefmt renders that as "[OR unlimited]" so the
+	// banner and the statusline show the identical token.
 	return usageSnapshot{Provider: "openrouter", Usage: row, Ready: true}
 }
 
