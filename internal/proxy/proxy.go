@@ -25,23 +25,23 @@ type Config struct {
 	Provider         string // provider name for the primary route
 	BaseURL          string // e.g. https://opencode.ai/zen/go/v1
 	APIKey           string
-	Model            string         // the Zen model id to forward orchestrator requests to
-	Kind             string         // primary route wire protocol ("" chat, "responses" for codex-sub)
-	AccountID        string         // ChatGPT-Account-ID header for the codex-sub backend
-	WorkerModel      string         // if set, background sub-agents use this cheaper model
-	Fallbacks        []Upstream     // ordered free-model fallbacks; replaces worker routing when set
-	OpenRouterRPM    int            // session-wide request pace for OpenRouter free models
-	RateLimitRetries int            // full-pool retries after temporary 429s; zero uses the default
-	RateLimitBackoff time.Duration  // initial temporary-429 backoff; zero uses the default
-	Port             int            // local listen port
-	Models           []ModelInfo    // full model list advertised at /v1/models
-	Upstreams        []Upstream     // every known upstream route (primary + fallbacks); maps /model ids to gateways
+	Model            string        // the Zen model id to forward orchestrator requests to
+	Kind             string        // primary route wire protocol ("" chat, "responses" for codex-sub)
+	AccountID        string        // ChatGPT-Account-ID header for the codex-sub backend
+	WorkerModel      string        // if set, background sub-agents use this cheaper model
+	Fallbacks        []Upstream    // ordered free-model fallbacks; replaces worker routing when set
+	OpenRouterRPM    int           // session-wide request pace for OpenRouter free models
+	RateLimitRetries int           // full-pool retries after temporary 429s; zero uses the default
+	RateLimitBackoff time.Duration // initial temporary-429 backoff; zero uses the default
+	Port             int           // local listen port
+	Models           []ModelInfo   // full model list advertised at /v1/models
+	Upstreams        []Upstream    // every known upstream route (primary + fallbacks); maps /model ids to gateways
 	// AllModels reorganizes /v1/models into per-provider free/paid sub-sections
 	// (the --all-models flag). When false, the advertised list is byte-identical
 	// to the legacy single-header-per-provider layout.
-	AllModels bool
-	ContextLength    int            // primary model's context window in tokens (0 = unknown); used to truncate over-limit requests
-	OnUnavailable    func(Upstream) // called after an explicit per-model access denial
+	AllModels     bool
+	ContextLength int            // primary model's context window in tokens (0 = unknown); used to truncate over-limit requests
+	OnUnavailable func(Upstream) // called after an explicit per-model access denial
 }
 
 // primaryUpstream returns the canonical Upstream for the primary route,
@@ -238,8 +238,8 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, _ := json.Marshal(map[string]any{
-		"schema":   "ultra-zen/usage/v1",
-		"server":   map[string]any{"url": s.baseURL},
+		"schema":    "ultra-zen/usage/v1",
+		"server":    map[string]any{"url": s.baseURL},
 		"providers": s.usage.getRows(),
 	})
 	w.Header().Set("Content-Type", "application/json")
@@ -599,7 +599,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if resp2.StatusCode == http.StatusOK {
-			s.recordRetryServed(used)
+			s.recordRetryServed(used, resp2)
 			resp.Body.Close()
 			resp.Body = resp2.Body
 			resp.StatusCode = resp2.StatusCode
@@ -617,7 +617,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if resp3.StatusCode == http.StatusOK {
-					s.recordRetryServed(used)
+					s.recordRetryServed(used, resp3)
 					resp.Body.Close()
 					resp.Body = resp3.Body
 					resp.StatusCode = resp3.StatusCode
@@ -889,10 +889,23 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 
 // recordRetryServed performs the success accounting for the 400-retry path in
 // handleMessages, mirroring the in-loop bookkeeping in forwardWithRateLimit.
-// The failed 400 attempt itself was never metered by OpenRouter (a rejected
-// request does not spend a :free slot), so the retry's 200 counts exactly
-// once — no double-counting across the original round and the retry.
-func (s *Server) recordRetryServed(u Upstream) {
+// Like the main loop, the accounting only runs when the 200's body
+// classifies as a real completion: several gateways serve error objects or
+// empty choices with HTTP 200, and the main path rotates past those without
+// counting them — a retry round must not bump the :free tally for a body the
+// main path would reject. The peeked prefix is rewound, so the caller still
+// receives the full response. The failed 400 attempt itself was never
+// metered by OpenRouter (a rejected request does not spend a :free slot), so
+// a gated-in retry 200 counts exactly once — no double-counting across the
+// original round and the retry.
+func (s *Server) recordRetryServed(u Upstream, resp *http.Response) {
+	prefix := make([]byte, 64*1024)
+	n, _ := io.ReadFull(resp.Body, prefix)
+	prefix = prefix[:n]
+	resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), resp.Body))
+	if classifyUpstreamBody(prefix) != bodyOK {
+		return
+	}
 	s.usage.recordRequest(u.Provider)
 	s.usage.setExhausted(u.Provider, false)
 	if u.Provider == "openrouter" && models.OpenRouterFreeModel(u.Model) {

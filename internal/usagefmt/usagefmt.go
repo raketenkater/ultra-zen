@@ -83,20 +83,19 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 		case "openrouter":
 			// Account credits (from /credits) are the headline number: the
 			// balance, plus the :free request tally against today's cap. The
-			// tally is "~"-marked because it counts only requests routed
-			// through ultra-zen — a floor for "left", never more than what
-			// OpenRouter itself meters.
+			// tally counts only requests routed through ultra-zen, so it is a
+			// floor for "used" — which is why the token states the counted
+			// usage ("~N/cap used") and never derives "left" from it: cap minus
+			// a floored usage is an upper bound of the true remaining and would
+			// overstate what the user has left to spend.
 			if u.Credits != nil {
 				tok := fmt.Sprintf("[OR $%.2f credits", *u.Credits)
 				if u.FreeReqsLimit != nil {
-					left := *u.FreeReqsLimit
+					var used int64
 					if u.FreeReqsUsed != nil {
-						left -= *u.FreeReqsUsed
-						if left < 0 {
-							left = 0
-						}
+						used = *u.FreeReqsUsed
 					}
-					tok += fmt.Sprintf(" · ~%d free req left", left)
+					tok += fmt.Sprintf(" · ~%d/%d free req used", used, *u.FreeReqsLimit)
 				}
 				return tok + "]"
 			}

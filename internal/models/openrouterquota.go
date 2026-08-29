@@ -5,12 +5,16 @@
 // management key and 403s otherwise), so ultra-zen keeps its own counter:
 // every proxied :free request to openrouter increments a persisted daily
 // tally (UTC day, matching OpenRouter's reset). The count is a floor —
-// requests made through other apps or outside ultra-zen are invisible — but
-// between ultra-zen sessions it tracks the real quota. Concurrent ultra-zen
-// sessions share this one file, so the read-modify-write runs under an
-// in-process mutex plus flock (see internal/flock): the tally is then exact
-// across sessions, though still a floor overall. Cache-file style follows
-// recent.go: best-effort, corrupt file means zero, never a launch blocker.
+// requests made through other apps or outside ultra-zen are invisible — so
+// the counted usage is exact only for ultra-zen-routed traffic, "requests
+// left" derived from it is an upper bound, and ultra-zen's status token
+// renders the counted usage itself ("N/cap free req used", see
+// internal/usagefmt) rather than overstating what remains. Concurrent
+// ultra-zen sessions share this one file, so the read-modify-write runs under
+// an in-process mutex plus flock (see internal/flock): the tally is then
+// exact across sessions, though still a floor overall. Cache-file style
+// follows recent.go: best-effort, corrupt file means zero, never a launch
+// blocker.
 package models
 
 import (
@@ -40,7 +44,12 @@ type orQuotaRecord struct {
 	Count int64  `json:"count"`
 }
 
-func todayUTC() string { return time.Now().UTC().Format("2006-01-02") }
+// orFreeClock is the seam RecordORFreeRequest reads the UTC day from. It is a
+// package-level var only so tests can flip days to cover the midnight-
+// straddle path; production code never replaces it.
+var orFreeClock = func() string { return time.Now().UTC().Format("2006-01-02") }
+
+func todayUTC() string { return orFreeClock() }
 
 // OpenRouterFreeModel reports whether an openrouter model id is metered
 // against the :free daily request cap: the ":free" suffix variant or the
@@ -70,16 +79,19 @@ var orQuotaMu sync.Mutex
 func ORFreeRequests() int64 {
 	orQuotaMu.Lock()
 	defer orQuotaMu.Unlock()
-	return readORFreeCountLocked()
+	return readORFreeCountLocked(todayUTC())
 }
 
-func readORFreeCountLocked() int64 {
+// readORFreeCountLocked returns the persisted count when it belongs to day.
+// Callers hold orQuotaMu and pass the day they already resolved, so a record
+// read and a record write can never disagree about which UTC day "today" is.
+func readORFreeCountLocked(day string) int64 {
 	b, err := os.ReadFile(orQuotaPath())
 	if err != nil {
 		return 0
 	}
 	var rec orQuotaRecord
-	if err := json.Unmarshal(b, &rec); err != nil || rec.Day != todayUTC() {
+	if err := json.Unmarshal(b, &rec); err != nil || rec.Day != day {
 		return 0
 	}
 	return rec.Count
@@ -93,14 +105,19 @@ func readORFreeCountLocked() int64 {
 func RecordORFreeRequest() {
 	orQuotaMu.Lock()
 	defer orQuotaMu.Unlock()
+	// Resolve the UTC day ONCE under the lock and use it for both the read and
+	// the write. Calling todayUTC() on each side would let a request straddling
+	// midnight read yesterday's tally and persist it under today's day — a
+	// phantom count on the new day.
+	day := todayUTC()
 	p := orQuotaPath()
 	guard := flock.Lock(p)
 	defer guard.Close()
-	writeORFreeCountLocked(readORFreeCountLocked() + 1)
+	writeORFreeCountLocked(day, readORFreeCountLocked(day)+1)
 }
 
-func writeORFreeCountLocked(n int64) {
-	rec := orQuotaRecord{Day: todayUTC(), Count: n}
+func writeORFreeCountLocked(day string, n int64) {
+	rec := orQuotaRecord{Day: day, Count: n}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return

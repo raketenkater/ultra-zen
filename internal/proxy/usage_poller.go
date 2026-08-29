@@ -76,10 +76,10 @@ func (s *Server) fetchProviderUsage(httpClient *http.Client, provider, key strin
 		}
 	case "cerebras", "cohere", "modelscope", "huggingface", "codex":
 		s.usage.setRow(provider, &ProviderUsage{
-			Name:    provider,
-			Kind:    UsageUnknown,
-			Window:  WindowNone,
-			Detail:  "no live usage endpoint; counting requests",
+			Name:   provider,
+			Kind:   UsageUnknown,
+			Window: WindowNone,
+			Detail: "no live usage endpoint; counting requests",
 		})
 	default:
 		// Unknown BYO provider: count requests only.
@@ -131,12 +131,17 @@ func (s *Server) fetchOpenRouterUsageAt(base string, httpClient *http.Client, ke
 		}
 		return
 	}
-	if resp.StatusCode != http.StatusOK && payload.Error != nil {
-		row := s.usage.getRowSnapshot("openrouter")
-		if row != nil {
-			row.Detail = payload.Error.Message
-			s.usage.setRow("openrouter", row)
+	// Any non-200 /key is a rejected (or otherwise unusable) key: never build
+	// a row from the empty payload — an all-nil row renders "[OR unlimited]"
+	// while the launch banner (internal/tui) renders the rejection line. The
+	// body's error.message, when present, is the better detail; otherwise
+	// record the status. Keep the last good row with that detail.
+	if resp.StatusCode != http.StatusOK {
+		detail := "OpenRouter: /key " + resp.Status
+		if payload.Error != nil && payload.Error.Message != "" {
+			detail = payload.Error.Message
 		}
+		s.usage.setRow("openrouter", providerOrKeep(s, "openrouter", detail))
 		return
 	}
 	row := &ProviderUsage{Name: "openrouter", Kind: UsageCredits, Window: WindowDaily}

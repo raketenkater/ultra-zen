@@ -81,6 +81,56 @@ func TestORFreeRequestCounterCorruptFile(t *testing.T) {
 	}
 }
 
+// TestRecordORFreeRequestMidnightStraddle pins the once-per-call day
+// resolution: a request that straddles UTC midnight must read and write the
+// SAME day. The old code called todayUTC() on both sides of the read-modify-
+// write, so a flip in between persisted yesterday's tally under today's day —
+// a phantom "N+1 used today". The clock seam (orFreeClock) flips days
+// mid-call exactly like the real midnight would.
+func TestRecordORFreeRequestMidnightStraddle(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", dir)
+	const dayA, dayB = "2026-08-28", "2026-08-29"
+	p := filepath.Join(dir, "ultra-zen", "openrouter-free-requests.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(orQuotaRecord{Day: dayA, Count: 49})
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := orFreeClock
+	defer func() { orFreeClock = orig }()
+	// First clock read (any pre-lock or the Record's single resolution) sees
+	// dayA; every read after it sees dayB — the worst-case straddle. If the
+	// record path resolved the day twice, the read would use dayA (finding 49)
+	// and the write would stamp dayB.
+	calls := 0
+	orFreeClock = func() string {
+		calls++
+		if calls == 1 {
+			return dayA
+		}
+		return dayB
+	}
+	RecordORFreeRequest()
+	var rec orQuotaRecord
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Day != dayA || rec.Count != 50 {
+		t.Fatalf("straddled record = {Day:%q Count:%d}, want {Day:%q Count:50} — old count leaked into the new day", rec.Day, rec.Count, dayA)
+	}
+	// From the new day's perspective the tally restarts at zero.
+	if got := ORFreeRequests(); got != 0 {
+		t.Fatalf("dayB read = %d, want 0", got)
+	}
+}
+
 // TestORFreeRequestConcurrentNoLostUpdates hammers the read-modify-write from
 // many goroutines: without the mutex+flock the rename-on-rename race would
 // intermittently under-report.

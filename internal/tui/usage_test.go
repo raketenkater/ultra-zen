@@ -154,7 +154,9 @@ func fakeOpenRouter(keyLimit *float64, credits bool, total, used float64) *httpt
 
 // TestFetchOpenRouterUsageCreditsParity pins the launch banner against the
 // same golden values the poller test asserts: $20.00 lifetime → balance
-// 19.99, 1000/day cap, tally 7 → "~993 free req left".
+// 19.99, 1000/day cap, tally 7 → "~7/1000 free req used" (the token states
+// counted usage; it never subtracts from the cap, which would overstate
+// what remains).
 func TestFetchOpenRouterUsageCreditsParity(t *testing.T) {
 	seedORFreeCount(t, 7)
 	lim := 1.0
@@ -164,7 +166,7 @@ func TestFetchOpenRouterUsageCreditsParity(t *testing.T) {
 	if snap.Usage == nil {
 		t.Fatalf("no row: %+v", snap)
 	}
-	want := "[OR $19.99 credits · ~993 free req left]"
+	want := "[OR $19.99 credits · ~7/1000 free req used]"
 	if got := usagefmt.FormatProviderUsage(*snap.Usage); got != want {
 		t.Fatalf("banner = %q, want %q", got, want)
 	}
@@ -221,6 +223,31 @@ func TestFetchOpenRouterUsageKeyRejected(t *testing.T) {
 	}
 	if !strings.Contains(snap.Line, "401") {
 		t.Fatalf("line = %q, want it to mention the status", snap.Line)
+	}
+}
+
+// TestFetchOpenRouterUsageKeyRejectedNoErrorField: the guard covers non-200
+// bodies WITHOUT an error field too (a proxy/CDN 403 HTML-JSON hybrid, for
+// instance) — they must still surface as the rejection Line, never as the
+// empty row that renders "[OR unlimited]". The poller pins the same body
+// shape on its side (internal/proxy/usage_poller_test.go).
+func TestFetchOpenRouterUsageKeyRejectedNoErrorField(t *testing.T) {
+	seedORFreeCount(t, 0)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"label": nil}})
+	}))
+	defer srv.Close()
+	snap := fetchOpenRouterUsageAt(srv.URL, srv.Client(), "bad-key")
+	if snap.Usage != nil || snap.Ready {
+		t.Fatalf("row = %+v ready=%v, want unusable snapshot", snap.Usage, snap.Ready)
+	}
+	if !strings.Contains(snap.Line, "403") {
+		t.Fatalf("line = %q, want it to mention the status", snap.Line)
+	}
+	if strings.Contains(usageSummaryText(map[string]usageSnapshot{"openrouter": snap}), "unlimited") {
+		t.Fatalf("rejected key rendered unlimited: %q", usageSummaryText(map[string]usageSnapshot{"openrouter": snap}))
 	}
 }
 

@@ -140,6 +140,75 @@ func TestFetchOpenRouterUsageCreditsSkip(t *testing.T) {
 	}
 }
 
+// TestFetchOpenRouterUsageKeyRejected pins the poller's rejected-key guard on
+// BOTH body shapes: a non-200 with an error object and a non-200 whose body
+// carries no error field. Neither may build the all-nil UsageCredits row —
+// Remaining/Limit/Credits all nil is exactly the state usagefmt renders as
+// "[OR unlimited]" (the launch banner renders the rejection line instead;
+// internal/tui/usage_test.go pins its side of the parity).
+func TestFetchOpenRouterUsageKeyRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"error-body", `{"error":{"code":401,"message":"No auth methods configured"}}`},
+		{"no-error-field", `{"data":{"label":null}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			seedORFreeCount(t, 0)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			s := New(Config{})
+			s.fetchOpenRouterUsageAt(srv.URL, srv.Client(), "bad-key")
+			row := s.usage.getRowSnapshot("openrouter")
+			if row == nil {
+				t.Fatal("no row stored")
+			}
+			if row.Kind == UsageCredits && row.Remaining == nil && row.Limit == nil && row.Credits == nil {
+				t.Fatalf("rejected /key built the all-nil credits row (renders [OR unlimited]): %+v", row)
+			}
+			if row.Credits != nil || row.FreeReqsLimit != nil || row.FreeReqsUsed != nil {
+				t.Fatalf("rejected /key leaked credit fields: %+v", row)
+			}
+			if !strings.Contains(row.Detail, "401") && !strings.Contains(strings.ToLower(row.Detail), "auth") {
+				t.Fatalf("Detail = %q, want it to record the rejection", row.Detail)
+			}
+		})
+	}
+}
+
+// TestFetchOpenRouterUsageKeyRejectedKeepsLastGood: a rejection on refresh
+// must not wipe the previous good row — only Detail changes.
+func TestFetchOpenRouterUsageKeyRejectedKeepsLastGood(t *testing.T) {
+	seedORFreeCount(t, 4)
+	good := fakeOpenRouter(t, nil, true, 20.0, 0.01)
+	defer good.Close()
+	s := New(Config{})
+	s.fetchOpenRouterUsageAt(good.URL, good.Client(), "sk-or-test")
+	before := s.usage.getRowSnapshot("openrouter")
+	if before == nil || before.Credits == nil {
+		t.Fatal("seed fetch did not store a good row")
+	}
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"detail":"key revoked"}`)) // non-200, no error field
+	}))
+	defer bad.Close()
+	s.fetchOpenRouterUsageAt(bad.URL, bad.Client(), "sk-or-test")
+	row := s.usage.getRowSnapshot("openrouter")
+	if row.Credits == nil || row.FreeReqsLimit == nil {
+		t.Fatalf("rejection wiped the last good row: %+v", row)
+	}
+	if row.Detail == "" {
+		t.Fatal("rejection left no Detail")
+	}
+}
+
 // TestHandleMessagesCountsOnly200Free pins the counter gating: an openrouter
 // :free 401 is not a served request (OpenRouter meters nothing), a :free 200
 // is counted once, a paid openrouter 200 is not counted, and a second :free
@@ -192,5 +261,59 @@ func TestHandleMessagesCountsOnly200Free(t *testing.T) {
 	post("openrouter/free")
 	if got := models.ORFreeRequests(); got != 2 {
 		t.Fatalf("router-variant tally = %d, want 2 (openrouter/free is metered too)", got)
+	}
+}
+
+// TestRetryServedAppliesBodyGate pins the 400-retry counter gate: a gateway
+// can serve an error object (or an empty completion) with HTTP 200 on the
+// retry, and the main loop rotates past exactly such bodies without counting
+// them. The retry path must apply the same classifyUpstreamBody gate, so a
+// :free round only bumps the daily tally when the retry's body is a real
+// completion.
+func TestRetryServedAppliesBodyGate(t *testing.T) {
+	ok := `{"id":"r","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
+	cases := []struct {
+		name     string
+		response string
+		want     int64
+	}{
+		// Gateway error object served with HTTP 200: must NOT count.
+		{"error-body", `{"error":{"message":"upstream failed"}}`, 0},
+		// Empty choices with HTTP 200: must NOT count.
+		{"degenerate", `{"id":"r","choices":[]}`, 0},
+		// A genuine completion: counts exactly once.
+		{"real-completion", ok, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			seedORFreeCount(t, 0)
+			var calls int
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if calls == 1 {
+					w.WriteHeader(http.StatusBadRequest)
+					w.Write([]byte(`{"error":{"message":"Upstream request failed"}}`))
+					return
+				}
+				w.Write([]byte(tc.response))
+			}))
+			defer up.Close()
+			s := New(Config{Provider: "openrouter", BaseURL: up.URL, APIKey: "sk-or-test", Model: "vendor/a:free", Port: 0})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := s.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			body := `{"model":"vendor/a:free","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			s.handleMessages(rec, req)
+			if calls != 2 {
+				t.Fatalf("upstream calls = %d, want 2 (400 then retry)", calls)
+			}
+			if got := models.ORFreeRequests(); got != tc.want {
+				t.Fatalf("tally after %s retry = %d, want %d", tc.name, got, tc.want)
+			}
+		})
 	}
 }
