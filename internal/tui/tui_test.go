@@ -93,7 +93,7 @@ func newTestModel() model {
 	ms := []models.Model{
 		{ID: "test-model", Name: "test-model", Base: "https://example.com", Free: true},
 	}
-	items := buildModelItems(ms)
+	items := buildModelItems(ms, "")
 	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(true)

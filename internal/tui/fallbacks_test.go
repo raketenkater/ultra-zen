@@ -1,9 +1,13 @@
 package tui
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
@@ -211,6 +215,78 @@ func TestExistingPoolRestoredWhenReopened(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("routes[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// markSlot renders the i-th model row and returns the gutter's mark column
+// (plain text, col 2 of the 4-col pool gutter).
+func markSlot(t *testing.T, m *fallbackManager, i int) string {
+	t.Helper()
+	var rows []int
+	for idx, item := range m.list.Items() {
+		if row, ok := item.(fallbackRow); ok && row.kind == rowModel {
+			rows = append(rows, idx)
+		}
+	}
+	item := m.list.Items()[rows[i]]
+	lm := list.New(m.list.Items(), columnDelegate{showMark: true}, 80, 20)
+	configureList(&lm)
+	var buf bytes.Buffer
+	// index -1 never matches the model's cursor, so the row renders unselected.
+	columnDelegate{showMark: true}.Render(&buf, lm, -1, item)
+	runes := []rune(ansi.Strip(buf.String()))
+	return string(runes[2])
+}
+
+func TestPoolRankDigitsInGutter(t *testing.T) {
+	m := newFallbackManager("")
+	feedProvider(&m, "openrouter", "a:free", "b:free", "c:free")
+	toggleRow(t, &m, 0) // order: a
+	toggleRow(t, &m, 1) // order: a, b
+
+	// In-pool rows carry their 1-based rotation rank; out-of-pool the off mark.
+	if got := markSlot(t, &m, 0); got != "1" {
+		t.Fatalf("rank of a:free = %q, want 1", got)
+	}
+	if got := markSlot(t, &m, 1); got != "2" {
+		t.Fatalf("rank of b:free = %q, want 2", got)
+	}
+	if got := markSlot(t, &m, 2); got != gMarkOff {
+		t.Fatalf("mark of c:free = %q, want %q", got, gMarkOff)
+	}
+
+	// Untoggle then retoggle a: it rejoins at the END of the order, so b
+	// becomes rank 1, a rank 2 — the off-mark swaps back to a digit.
+	toggleRow(t, &m, 0)
+	if got := markSlot(t, &m, 0); got != gMarkOff {
+		t.Fatalf("untoggled a:free = %q, want %q", got, gMarkOff)
+	}
+	toggleRow(t, &m, 0)
+	if got := markSlot(t, &m, 0); got != "2" {
+		t.Fatalf("retoggled a:free rank = %q, want 2 (rejoins order last)", got)
+	}
+	if got := markSlot(t, &m, 1); got != "1" {
+		t.Fatalf("b:free rank after a rejoined last = %q, want 1", got)
+	}
+}
+
+func TestPoolRankBeyondNineUsesGlyph(t *testing.T) {
+	m := newFallbackManager("")
+	ids := make([]string, 12)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("m%02d:free", i)
+	}
+	feedProvider(&m, "openrouter", ids...)
+	for i := range ids {
+		toggleRow(t, &m, i)
+	}
+	// Rank 10 cannot fit one gutter column: membership falls back to the on
+	// glyph, and the 4-col gutter (name at col 4) holds.
+	if got := markSlot(t, &m, 9); got != gMarkOn {
+		t.Fatalf("rank-10 row mark = %q, want %q", got, gMarkOn)
+	}
+	if got := markSlot(t, &m, 0); got != "1" {
+		t.Fatalf("rank-1 row mark = %q, want 1", got)
 	}
 }
 

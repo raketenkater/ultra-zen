@@ -69,6 +69,13 @@ type tailer interface {
 	tailParts() []string
 }
 
+// primaryer marks the row of the picker's current model (m.choice). The
+// non-mark gutter draws a muted dot there: the cursor shows where you are,
+// the dot shows what you already picked, and the two never compete.
+type primaryer interface {
+	isPrimary() bool
+}
+
 // columnDelegate renders every item as exactly one physical line:
 // [gutter][name left-aligned][tail right-aligned]. Height()==1 for all rows,
 // headers included, which is what keeps the list's pagination arithmetic
@@ -102,6 +109,11 @@ func (d columnDelegate) gutter(selected bool, item list.Item) string {
 					return gCursor + "   "
 				}
 				return "    "
+			case row.inPool && row.pos >= 1 && row.pos <= 9:
+				// Pool members carry their 1-based rotation rank as a digit
+				// (the order routes() returns); beyond 9 the membership glyph
+				// stands in — two digits would break the 4-col gutter.
+				mark = strconv.Itoa(row.pos)
 			case row.inPool:
 				mark = gMarkOn
 			}
@@ -114,7 +126,35 @@ func (d columnDelegate) gutter(selected bool, item list.Item) string {
 	if selected {
 		return gCursor + " "
 	}
+	// The cursor shows where you are; the dot shows what you already
+	// picked (the picker's current model). The gutter stays exactly two
+	// columns either way, so names keep their alignment.
+	if p, ok := item.(primaryer); ok && p.isPrimary() {
+		return gDot + " "
+	}
 	return "  "
+}
+
+// renderTail assembles the styled tail segment: pad, then the shed parts
+// joined by two spaces. The first part is the tier word — "free" renders in
+// accent cyan so the free tier pops at a glance, every other part (and the
+// pad and joiners) stays muted. It runs after the shed arithmetic on the
+// plain strings; ANSI carries zero display width, so per-part styling cannot
+// shift a column.
+func renderTail(pad string, parts []string) string {
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render(pad))
+	for i, part := range parts {
+		if i > 0 {
+			b.WriteString(mutedStyle.Render("  "))
+		}
+		if i == 0 && part == "free" {
+			b.WriteString(accentStyle.Render(part))
+			continue
+		}
+		b.WriteString(mutedStyle.Render(part))
+	}
+	return b.String()
 }
 
 func (d columnDelegate) nameCap(listWidth int) int {
@@ -162,7 +202,9 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	tail := strings.Join(parts, "  ")
 
 	// Right-align the tail, shedding parts (then the name) until the row
-	// fits. The tier word — parts[0] — survives to the end.
+	// fits. The shedding arithmetic works on the plain join above: ANSI
+	// sequences carry zero display width, so renderTail()'s per-part styling
+	// (below) cannot shift a column.
 	gw := d.gutterWidth()
 	for len(parts) > 0 && gw+ansi.StringWidth(name)+2+ansi.StringWidth(tail) > lw && len(parts) > 1 {
 		parts = parts[:len(parts)-1]
@@ -174,8 +216,10 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	pad := strings.Repeat(" ", max(lw-gw-ansi.StringWidth(name)-ansi.StringWidth(tail), 1))
 
 	// Error-state rows (provider unreachable) render the name in red; other
-	// non-selectable status rows sit one step dimmer than models.
-	nameStyle, tailStyle := fgStyle, mutedStyle
+	// non-selectable status rows sit one step dimmer than models. The tail
+	// style no longer applies to the whole segment — renderTail colours the
+	// tier word individually (free = accent cyan, everything else muted).
+	nameStyle := fgStyle
 	switch {
 	case isStatus:
 		nameStyle = mutedStyle
@@ -207,7 +251,14 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	case emptyFilter:
 		line = mutedStyle.Render(gutter+name) + mutedStyle.Render(pad+tail)
 	default:
-		line = nameStyle.Render(gutter+name) + tailStyle.Render(pad+tail)
+		// The primary marker gutter is one shade dimmer than any name it
+		// sits beside, so it needs its own segment; plain-space gutters
+		// inherit the name style unchanged.
+		gutterStyle := nameStyle
+		if strings.HasPrefix(gutter, gDot) {
+			gutterStyle = mutedStyle
+		}
+		line = gutterStyle.Render(gutter) + nameStyle.Render(name) + renderTail(pad, parts)
 	}
 	// Exactly one write, no trailing newline: bubbles joins items itself.
 	fmt.Fprintf(w, "%s", line)
@@ -239,9 +290,12 @@ func ansiTruncate(s string, width int) string {
 
 // modelItem is a single model row in the orchestrator/worker lists.
 type modelItem struct {
-	m      models.Model
-	recent bool
+	m       models.Model
+	recent  bool
+	primary bool // the picker's current model (m.choice) — gutter dot
 }
+
+func (i modelItem) isPrimary() bool { return i.primary }
 
 func (i modelItem) Title() string {
 	// Bare identity: the friendly Name when set, the id otherwise. Tier and
@@ -320,7 +374,10 @@ func (i cycleItem) FilterValue() string { return "free cycle pool rotation provi
 type providerModelItem struct {
 	provider string
 	model    models.Model
+	primary  bool // the picker's current model (m.choice) — gutter dot
 }
+
+func (i providerModelItem) isPrimary() bool { return i.primary }
 
 func (i providerModelItem) Title() string {
 	if i.model.Name != "" && i.model.Name != i.model.ID {
@@ -548,7 +605,7 @@ func (m *model) startItems() []list.Item {
 	for _, model := range m.all {
 		local[model.ID] = true
 	}
-	primaryModels := buildModelItems(m.all)
+	primaryModels := buildModelItems(m.all, m.choice)
 	if len(primaryModels) > 0 {
 		items = append(items, groupHeaderItem{label: groupLabel(m.provider), count: len(primaryModels)})
 		items = append(items, primaryModels...)
@@ -564,7 +621,8 @@ func (m *model) startItems() []list.Item {
 			continue
 		}
 		secondary[option.Provider] = append(secondary[option.Provider],
-			providerModelItem{provider: option.Provider, model: option.Model})
+			providerModelItem{provider: option.Provider, model: option.Model,
+				primary: option.Model.ID == m.choice})
 	}
 	for _, p := range poolProviders {
 		rows, ok := secondary[p]
@@ -708,7 +766,7 @@ func startItemKey(item list.Item) string {
 
 func (m *model) enterOrchestratorStep() {
 	m.step = stepOrchestrator
-	m.list.SetItems(buildModelItems(m.all))
+	m.list.SetItems(buildModelItems(m.all, m.choice))
 	m.list.ResetSelected()
 	m.list.ResetFilter()
 }
@@ -1080,8 +1138,10 @@ func (m model) View() string {
 	return ""
 }
 
-// buildModelItems returns model rows with recently used models first.
-func buildModelItems(ms []models.Model) []list.Item {
+// buildModelItems returns model rows with recently used models first. The
+// current model (choice, "" until one is picked) is marked primary so its
+// gutter carries the dot.
+func buildModelItems(ms []models.Model, choice string) []list.Item {
 	recent := models.LoadRecent()
 	ordered := models.SortByRecent(ms, recent)
 	isRecent := make(map[string]bool, len(recent))
@@ -1090,7 +1150,7 @@ func buildModelItems(ms []models.Model) []list.Item {
 	}
 	items := make([]list.Item, 0, len(ordered))
 	for _, mdl := range ordered {
-		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID]})
+		items = append(items, modelItem{m: mdl, recent: isRecent[mdl.ID], primary: mdl.ID == choice})
 	}
 	return items
 }

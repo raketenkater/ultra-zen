@@ -382,8 +382,14 @@ func (e *unknownProviderError) Error() string { return "unknown free-tier provid
 // key returns the selection key for a provider/model pair.
 func selKey(provider, model string) string { return provider + "\x00" + model }
 
-// rebuildList renders the current state as list rows.
+// rebuildList renders the current state as list rows. Pool members carry
+// their rotation rank (pos) from m.order, so the gutter digit matches the
+// footer's a → b → c chain.
 func (m *fallbackManager) rebuildList() tea.Cmd {
+	rank := make(map[string]int, len(m.order))
+	for i, k := range m.order {
+		rank[k] = i + 1
+	}
 	selected, hadSelection := fallbackRow{}, false
 	if m.listReady {
 		selected, hadSelection = m.list.SelectedItem().(fallbackRow)
@@ -412,6 +418,7 @@ func (m *fallbackManager) rebuildList() tea.Cmd {
 					inPool:   m.selected[selKey(p, model.ID)],
 					free:     true,
 					ctx:      model.ContextLength,
+					pos:      rank[selKey(p, model.ID)],
 				})
 			}
 			if len(rows) > 0 {
@@ -450,7 +457,9 @@ const (
 // fallbackRow is one row in the fallback list: a loading placeholder, a
 // key-prompt row, or a toggleable model. free/ctx are display-only fields
 // feeding the tail column (membership state lives in inPool, rendered by
-// the delegate gutter).
+// the delegate gutter). pos is the row's 1-based rotation rank within
+// m.order (0 = not in pool); the gutter shows the digit for ranks 1..9 and
+// falls back to the membership glyph beyond that.
 type fallbackRow struct {
 	provider string
 	modelID  string
@@ -459,6 +468,7 @@ type fallbackRow struct {
 	detail   string
 	free     bool
 	ctx      int
+	pos      int
 }
 
 func (r fallbackRow) Title() string {

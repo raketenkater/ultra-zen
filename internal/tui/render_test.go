@@ -2,23 +2,37 @@ package tui
 
 import (
 	"bytes"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
 
-// goldens are the fixtures the whole Column contract hangs off: every item
-// renders to exactly ONE physical line, tails right-align across rows, and
-// the tier word survives width pressure when recent/ctx cannot.
+// TestMain pins the renderer to the ANSI-16 profile. lipgloss strips every
+// style to plain text when stdout is not a TTY (the test runner), but the
+// Column design carries real information in color — the free tier's accent
+// tail word versus muted paid — so the goldens below assert the actual SGR
+// sequences. The profile is set on the global renderer before any style
+// renders, and t.Setenv cannot do this job: termenv reads the environment
+// once at package init. Assertions compare against style.Render values
+// rather than hardcoded sequences, so the dark/light AdaptiveColor branch the
+// renderer happens to pick stays irrelevant.
+func TestMain(m *testing.M) {
+	lipgloss.SetColorProfile(termenv.ANSI)
+	os.Exit(m.Run())
+}
 func renderFixtureList(t *testing.T, delegate columnDelegate, width int) []string {
 	t.Helper()
 	items := []list.Item{
 		groupHeaderItem{label: "Most used", count: 4},
 		modelItem{m: models.Model{ID: "a", Name: "Alpha Model", Free: true, ContextLength: 204800}, recent: true},
-		modelItem{m: models.Model{ID: "b", Name: "B", Free: false}},
+		modelItem{m: models.Model{ID: "b", Name: "B", Free: false}, primary: true},
 		cycleItem{selected: 3},
 		providerStatusItem{provider: "cerebras", kind: "keyless"},
 	}
@@ -105,15 +119,18 @@ func TestRenderTierWordSurvivesWidthPressure(t *testing.T) {
 }
 
 // TestRenderPoolGutter keeps names at col 4 on the pool screen and marks
-// membership in the gutter, never in the name.
+// membership in the gutter, never in the name. Pool members show their
+// rotation rank (1-based pos) for ranks 1..9; beyond that the membership
+// glyph stands in, since two digits would break the 4-column gutter.
 func TestRenderPoolGutter(t *testing.T) {
 	delegate := columnDelegate{showMark: true}
 	rows := []fallbackRow{
-		{provider: "groq", modelID: "llama", kind: rowModel, inPool: true, free: true},
-		{provider: "groq", modelID: "qwen", kind: rowModel, inPool: false, free: true},
+		{provider: "groq", modelID: "llama", kind: rowModel, inPool: true, pos: 1, free: true},
+		{provider: "groq", modelID: "qwen", kind: rowModel, inPool: true, pos: 12, free: true},
+		{provider: "groq", modelID: "gemma", kind: rowModel, inPool: false, free: true},
 		{provider: "cerebras", kind: rowNoKey},
 	}
-	lm := list.New([]list.Item{rows[0], rows[1], rows[2]}, delegate, 80, 10)
+	lm := list.New([]list.Item{rows[0], rows[1], rows[2], rows[3]}, delegate, 80, 10)
 	configureList(&lm)
 	for i, row := range rows {
 		var buf bytes.Buffer
@@ -122,10 +139,13 @@ func TestRenderPoolGutter(t *testing.T) {
 		if len(plain) < 4 {
 			t.Fatalf("row %d too short: %q", i, plain)
 		}
-		if i < 2 {
-			wantMark := gMarkOn
-			if !row.inPool {
-				wantMark = gMarkOff
+		if i < 3 {
+			wantMark := gMarkOff
+			switch {
+			case row.inPool && row.pos >= 1 && row.pos <= 9:
+				wantMark = strconv.Itoa(row.pos)
+			case row.inPool:
+				wantMark = gMarkOn
 			}
 			runes := []rune(plain)
 			if string(runes[2]) != wantMark {
@@ -134,6 +154,99 @@ func TestRenderPoolGutter(t *testing.T) {
 			if !strings.HasPrefix(string(runes[4:]), row.modelID) {
 				t.Fatalf("row %d name not at col 4: %q", i, plain)
 			}
+		}
+	}
+}
+
+// TestRenderFreeTailPops pins the free-tier highlight: on every width the
+// tier word of a free row carries the accent style (the one color besides the
+// cursor), while a paid row's whole tail — and a free row's ctx/recency
+// parts — stay muted. This is what makes free vs paid scannable at a glance.
+func TestRenderFreeTailPops(t *testing.T) {
+	wantFree := accentStyle.Render("free")
+	wantPaid := mutedStyle.Render("paid")
+	if wantFree == wantPaid {
+		t.Fatal("fixture degraded: accent and muted render identically (color profile not forced?)")
+	}
+	for _, width := range []int{40, 80, 116} {
+		lines := renderFixtureList(t, columnDelegate{}, width)
+		free, paid := lines[1], lines[2]
+		if !strings.Contains(free, wantFree) {
+			t.Fatalf("width %d: free row tail not accent-styled: %q", width, free)
+		}
+		if !strings.Contains(paid, wantPaid) || strings.Contains(paid, wantFree) {
+			t.Fatalf("width %d: paid row tail wrongly highlighted: %q", width, paid)
+		}
+		// Only the tier word pops — the ctx word beside it stays muted.
+		if !strings.Contains(free, mutedStyle.Render("200k")) {
+			t.Fatalf("width %d: free row ctx should stay muted: %q", width, free)
+		}
+	}
+}
+
+// TestRenderPrimaryGutterDot pins the current-model marker: an unselected
+// primary row carries the muted dot in the gutter, the gutter stays exactly
+// two columns (name alignment invariant), and selecting the row swaps the
+// cursor back in — the dot never competes with the cursor.
+func TestRenderPrimaryGutterDot(t *testing.T) {
+	delegate := columnDelegate{}
+	primary := modelItem{m: models.Model{ID: "cur", Name: "Current", Free: false}, primary: true}
+	other := modelItem{m: models.Model{ID: "o", Name: "Other", Free: true}}
+	lm := list.New([]list.Item{primary, other}, delegate, 80, 10)
+	configureList(&lm)
+	lm.Select(1) // cursor on "Other": the primary row must show the dot
+
+	var buf bytes.Buffer
+	delegate.Render(&buf, lm, 0, primary)
+	plain := ansi.Strip(buf.String())
+	if !strings.HasPrefix(plain, gDot+" ") {
+		t.Fatalf("unselected primary gutter = %q, want %q + space", plain, gDot)
+	}
+	if !strings.HasPrefix(strings.TrimPrefix(plain, gDot+" "), "Current") {
+		t.Fatalf("primary name not at col 2: %q", plain)
+	}
+	// The marker dot is one step dimmer than the model name beside it.
+	if !strings.Contains(buf.String(), mutedStyle.Render(gDot+" ")) {
+		t.Fatalf("primary dot not muted: %q", buf.String())
+	}
+
+	buf.Reset()
+	// index 0 != cursor (1) so this row renders unselected.
+	delegate.Render(&buf, lm, 0, other)
+	if plain := ansi.Strip(buf.String()); !strings.HasPrefix(plain, "  ") || strings.HasPrefix(plain, gDot) {
+		t.Fatalf("non-primary unselected row must keep the blank gutter: %q", plain)
+	}
+
+	// Selected: cursor wins, the dot yields (still two columns).
+	lm.Select(0)
+	buf.Reset()
+	delegate.Render(&buf, lm, 0, primary)
+	if plain := ansi.Strip(buf.String()); !strings.HasPrefix(plain, gCursor+" ") || strings.HasPrefix(plain, gCursor+gDot) {
+		t.Fatalf("selected primary row gutter = %q, want cursor only", plain)
+	}
+}
+
+// TestRenderTierWordSurvivesInFreeTail pins the documented drop order on the
+// free-highlighted tail: at width 40 the styled "free" survives while recent
+// and ctx are shed, and the row still fits the column budget.
+func TestRenderTierWordSurvivesInFreeTail(t *testing.T) {
+	delegate := columnDelegate{}
+	long := modelItem{
+		m:      models.Model{ID: "x", Name: "An Extremely Long Model Display Name That Cannot Fit", Free: true, ContextLength: 131072},
+		recent: true,
+	}
+	for _, width := range []int{40, 60} {
+		lm := list.New([]list.Item{long}, delegate, width, 10)
+		configureList(&lm)
+		var buf bytes.Buffer
+		// index -1 keeps the row unselected: only the unselected branch
+		// styles the tier word individually (the cursor line is all bold).
+		delegate.Render(&buf, lm, -1, long)
+		if !strings.Contains(buf.String(), accentStyle.Render("free")) {
+			t.Fatalf("width %d: styled tier word dropped: %q", width, buf.String())
+		}
+		if w := ansi.StringWidth(buf.String()); w > width {
+			t.Fatalf("width %d: row is %d wide: %q", width, w, ansi.Strip(buf.String()))
 		}
 	}
 }
