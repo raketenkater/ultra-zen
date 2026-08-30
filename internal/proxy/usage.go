@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -238,6 +239,106 @@ func (t *usageTracker) getRows() []ProviderUsage {
 		out = append(out, *row)
 	}
 	return out
+}
+
+// IsCreditsExhausted reports whether an upstream error body is a credits/balance
+// exhausted response — the live "drained" signal from opencode Zen (GoUsageLimitError
+// at the request path) and the OpenAI/OpenRouter-style 401 with a CreditsError
+// envelope. It is the single predicate the live usage poller and the launch
+// fetch use to flip ProviderUsage.Exhausted, so the statusline and launch
+// banner render the same drained token for the same data.
+//
+// We do NOT invent a dollar figure here: balance is console-only on the opencode
+// side, and the upstream error string is the only ground truth we have. The
+// returned reason is the first matching substring (lowercased) and is what the
+// formatter surfaces as the "drained" message — a stable, user-readable
+// excerpt, not a parse.
+func IsCreditsExhausted(body []byte) (bool, string) {
+	msg := strings.ToLower(string(body))
+	// Order matters: more-specific phrases first so the surfaced reason is the
+	// most informative. The exact tokens seen in the live incident
+	// (2026-08-30) and in the documented upstream payloads:
+	//   - {"error":{"type":"credits_error","message":"Insufficient balance.
+	//     Manage your billing here..."}}
+	//   - opencode zen: {"error":{"type":"error","message":"GoUsageLimitError:
+	//     Credit balance too low..."}}
+	//   - openai: {"error":{"type":"insufficient_quota","message":"..."}}
+	candidates := []string{
+		"insufficient balance",
+		"manage your billing",
+		"credit balance too low",
+		"credits_error",
+		"insufficient_quota",
+		"gousagelimiterror",
+	}
+	for _, c := range candidates {
+		if strings.Contains(msg, c) {
+			return true, c
+		}
+	}
+	return false, ""
+}
+
+// MarkExhaustedFromBody flips a provider's Exhausted flag and stores a
+// balance-aware Detail when the body is a credits-exhausted response. It is
+// the single point where the "drained" signal is set, so the statusline and
+// the launch banner cannot drift apart on the same upstream evidence. The
+// returned bool is true when the body was classified as a credits-exhausted
+// response, so callers can decide whether to keep rotating (false) or stop
+// retrying the provider (true) on this turn.
+func (t *usageTracker) MarkExhaustedFromBody(provider string, body []byte) bool {
+	if provider == "" {
+		return false
+	}
+	exhausted, reason := IsCreditsExhausted(body)
+	if !exhausted {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	row := t.rows[provider]
+	if row == nil {
+		row = &ProviderUsage{Name: provider}
+		t.rows[provider] = row
+	}
+	row.Exhausted = true
+	// Balance is console-only — we cannot invent a number. The Detail carries
+	// the upstream phrase (e.g. "Insufficient balance. Manage your billing")
+	// so the statusline and the launch banner surface the same words the user
+	// will see in the provider's own dashboard. Truncated to keep the line
+	// short beside the [Zen …] / [OR …] token.
+	detail := reason
+	if len(body) > 0 {
+		// Prefer a slightly longer human-readable excerpt over the bare
+		// marker so the statusline explains WHY, not just THAT. Strip
+		// everything but the message field when it is a JSON envelope.
+		detail = extractDrainedDetail(body, reason)
+	}
+	row.Detail = detail
+	return true
+}
+
+// extractDrainedDetail pulls the message field out of a {error:{message:..}}
+// envelope (or returns a trimmed plain-text body) so the statusline shows
+// the upstream's own explanation, not a guess. Falls back to the lowercased
+// marker if the body is not a JSON envelope.
+func extractDrainedDetail(body []byte, fallback string) string {
+	var env struct {
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && env.Error != nil && env.Error.Message != "" {
+		msg := strings.TrimSpace(env.Error.Message)
+		// Cap to 80 chars so the statusline stays one line beside the [..]
+		// token; the full message is in the provider dashboard if needed.
+		if len(msg) > 80 {
+			msg = msg[:80] + "…"
+		}
+		return msg
+	}
+	return fallback
 }
 
 // lowerKey lowercases a header name for case-insensitive lookup.

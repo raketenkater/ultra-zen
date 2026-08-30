@@ -112,6 +112,7 @@ func (s *Server) fetchOpenRouterUsageAt(base string, httpClient *http.Client, ke
 		return
 	}
 	defer resp.Body.Close()
+	rawBody, readErr := io.ReadAll(resp.Body)
 	var payload struct {
 		Data struct {
 			LimitRemaining *float64 `json:"limit_remaining"`
@@ -124,10 +125,13 @@ func (s *Server) fetchOpenRouterUsageAt(base string, httpClient *http.Client, ke
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if readErr == nil && len(rawBody) > 0 {
+		_ = json.Unmarshal(rawBody, &payload)
+	}
+	if readErr != nil {
 		row := s.usage.getRowSnapshot("openrouter")
 		if row != nil {
-			row.Detail = "parse error: " + err.Error()
+			row.Detail = "parse error: " + readErr.Error()
 			s.usage.setRow("openrouter", row)
 		}
 		return
@@ -138,6 +142,22 @@ func (s *Server) fetchOpenRouterUsageAt(base string, httpClient *http.Client, ke
 	// body's error.message, when present, is the better detail; otherwise
 	// record the status. Keep the last good row with that detail.
 	if resp.StatusCode != http.StatusOK {
+		// A 401 with a CreditsError / "Insufficient balance" body is the live
+		// "drained" signal — the OpenRouter account credit wallet is empty
+		// (balance is console-only, no money API). MarkExhaustedFromBody flips
+		// the row's Exhausted flag and stores the upstream message so the
+		// statusline reads "drained" instead of the HTTP status the user
+		// already knows about.
+		if resp.StatusCode == http.StatusUnauthorized && len(rawBody) > 0 {
+			if s.usage.MarkExhaustedFromBody("openrouter", rawBody) {
+				detail := "drained"
+				if payload.Error != nil && payload.Error.Message != "" {
+					detail = "drained: " + payload.Error.Message
+				}
+				s.usage.setRow("openrouter", providerOrKeep(s, "openrouter", detail))
+				return
+			}
+		}
 		detail := "OpenRouter: /key " + resp.Status
 		if payload.Error != nil && payload.Error.Message != "" {
 			detail = payload.Error.Message
@@ -227,6 +247,16 @@ func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
+		// A 401 with a CreditsError/insufficient-balance body is the live
+		// "drained" signal (anomalyco/opencode#44189 — the /usage endpoint
+		// returns the same envelope when the console credit wallet is empty).
+		// MarkExhaustedFromBody flips the row's Exhausted flag and stores the
+		// upstream's own message in Detail so the statusline reads "drained"
+		// instead of the HTTP status the user already knows about.
+		if s.usage.MarkExhaustedFromBody("opencode-go", body) {
+			s.usage.setRow("opencode-go", providerOrKeep(s, "opencode-go", "drained: "+strings.ToLower(string(body))))
+			return
+		}
 		s.usage.setRow("opencode-go", providerOrKeep(s, "opencode-go", "Zen: /usage "+resp.Status))
 		return
 	}

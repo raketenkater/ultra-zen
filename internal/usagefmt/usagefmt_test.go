@@ -75,15 +75,15 @@ func TestFormatOpenRouterFreeTierLegacy(t *testing.T) {
 	}
 }
 
-// TestFormatExhausted: the hit marker wins over everything, including the
-// credits headline (the counter flip at cap must show "hit", not a stale
+// TestFormatExhausted: the drained marker wins over everything, including the
+// credits headline (the counter flip at cap must show "drained", not a stale
 // "~N/cap used" tally).
 func TestFormatExhausted(t *testing.T) {
 	u := proxy.ProviderUsage{
 		Name: "openrouter", Kind: proxy.UsageCredits, Exhausted: true,
 		Credits: f(20), FreeReqsUsed: i(1000), FreeReqsLimit: i(1000),
 	}
-	if got := FormatProviderUsage(u); got != "[openrouter hit]" {
+	if got := FormatProviderUsage(u); got != "[OR drained]" {
 		t.Fatalf("got %q", got)
 	}
 }

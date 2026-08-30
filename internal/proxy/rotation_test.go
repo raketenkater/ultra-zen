@@ -56,6 +56,16 @@ func TestIsTransientUpstreamFailure(t *testing.T) {
 		{"param error", `{"error":{"message":"Error from provider: Upstream request failed","type":"invalid_request_error","param":"max_tokens"}}`, false},
 		{"context length", `{"error":{"message":"This model's maximum context length is 8192 tokens","type":"invalid_request_error"}}`, false},
 		{"data inspection", `{"error":{"message":"data_inspection_failed","type":"invalid_request_error"}}`, false},
+		// Pretty-printed server_error bodies (spaces around the colon) were the
+		// live miss: the old substring `"type":"server_error"` scan rotated past
+		// them to the halving retry on a dead route. Structural parsing must
+		// still catch them.
+		{"pretty-printed server_error", "{\n\t\"type\": \"server_error\",\n\t\"message\": \"Error from provider (Console): Upstream request failed: Model is unavailable.\"\n}", true},
+		{"nested server_error pretty", "{\n\t\"error\": { \"type\": \"server_error\", \"message\": \"Upstream request failed: Model is unavailable.\" }\n}", true},
+		// A request-shaped 400 whose message wraps an upstream/provider note must
+		// still NOT rotate (halving owns it) once the type is recognized.
+		{"invalid_request wraps upstream note", `{"error":{"message":"Error from backend: Upstream request failed: invalid value","type":"invalid_request_error"}}`, false},
+		{"context length nested", `{"error":{"message":"maximum context length is 8192 tokens","type":"invalid_request_error"}}`, false},
 		{"empty", ``, false},
 	}
 	for _, tc := range cases {
@@ -174,6 +184,196 @@ func TestRequestShaped400StillReachesHalving(t *testing.T) {
 	}
 	if gotMax != maxOutputTokens/2 {
 		t.Fatalf("third call max_tokens = %d, want halved %d", gotMax, maxOutputTokens/2)
+	}
+}
+
+// prettyServerErr is a pretty-printed server_error body (spaces around the
+// colon) — the exact shape the live gateway emitted that the old substring scan
+// missed and wrongly sent to the halving retry.
+const prettyServerErr = "{\n\t\"type\": \"server_error\",\n\t\"message\": \"Error from provider (Console): Upstream request failed: Model is unavailable.\"\n}"
+
+// TestPrettyServerError400Rotates pins the structural fix for transient-400
+// detection: a pretty-printed server_error body (which the old
+// `"type":"server_error"` substring scan MISSED) must rotate to the next pool
+// route and park the dead route, never fall through to the halving retry.
+func TestPrettyServerError400Rotates(t *testing.T) {
+	var deadCalls, fbCalls int
+	clock := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deadCalls++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(prettyServerErr))
+	}))
+	defer dead.Close()
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fbCalls++
+		w.Write([]byte(goodBody))
+	}))
+	defer fb.Close()
+
+	s := New(Config{
+		Provider:  "opencode-go",
+		BaseURL:   dead.URL,
+		APIKey:    "k",
+		Model:     "glm-5.2",
+		Fallbacks: []Upstream{{Provider: "opencode-go", BaseURL: fb.URL, APIKey: "k", Model: "zen-free"}},
+		Port:      0,
+	})
+	s.now = func() time.Time { return clock }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	send := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(
+			`{"model":"glm-5.2","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		rec := httptest.NewRecorder()
+		s.handleMessages(rec, req)
+		return rec.Code
+	}
+
+	if code := send(); code != 200 {
+		t.Fatalf("turn 1 status = %d, want 200 from the fallback (pretty server_error must rotate), body=%s", code, "")
+	}
+	if deadCalls != 1 || fbCalls != 1 {
+		t.Fatalf("turn 1 calls dead=%d fb=%d, want 1/1 (rotate, NOT the 3-call halving path)", deadCalls, fbCalls)
+	}
+	if ar := activeRouteOf(s); ar == 0 {
+		t.Fatalf("pool cursor = 0: the transient 400 promoted the dead route head-of-line")
+	}
+	// The parked dead route must not be re-probed on the next turn.
+	if code := send(); code != 200 {
+		t.Fatalf("turn 2 status = %d, want 200", code)
+	}
+	if deadCalls != 1 {
+		t.Fatalf("pretty server_error route probed again while parked (calls=%d), want still 1", deadCalls)
+	}
+	if fbCalls != 2 {
+		t.Fatalf("fallback calls = %d, want 2 (fallback serves both turns)", fbCalls)
+	}
+}
+
+// TestDataInspectionFailed400ReachesHalving pins the other half: a
+// data_inspection_failed (moderation) invalid_request_error 400 must NOT rotate
+// — it stays on the same upstream and flows to handleMessages' same-params +
+// halved-max_tokens retry, which is what fixes the genuine request bug.
+func TestDataInspectionFailed400ReachesHalving(t *testing.T) {
+	var calls int
+	var gotMax int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		gotMax = req.MaxTokens
+		calls++
+		if calls <= 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":{"message":"data_inspection_failed","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Write([]byte(goodBody))
+	}))
+	defer up.Close()
+
+	s := New(Config{Provider: "p", BaseURL: up.URL, APIKey: "k", Model: "m", Port: 0})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(s.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+		`{"model":"m","max_tokens":100000,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after halved retry", resp.StatusCode)
+	}
+	// The moderation 400 must reach the halving path on the SAME upstream: 3
+	// calls (initial + same params + halved), never a rotation to another route.
+	if calls != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (initial + same params + halved) — a rotation means the transient-400 gate wrongly fired", calls)
+	}
+	if gotMax != maxOutputTokens/2 {
+		t.Fatalf("third call max_tokens = %d, want halved %d", gotMax, maxOutputTokens/2)
+	}
+}
+
+// TestAllParkedCoolingDown429 pins the honest all-parked message: after every
+// route has been parked by a temporary 429, the next turn finds the whole pool
+// cooling down and must answer 429 (NOT 502) with "retry in ~Nm" naming the
+// soonest route's park expiry — never the misleading "every free model is
+// exhausted" wording.
+func TestAllParkedCoolingDown429(t *testing.T) {
+	throttler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":{"type":"rate_limit_error","message":"slow down"}}`))
+	}
+	a := httptest.NewServer(http.HandlerFunc(throttler))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(throttler))
+	defer b.Close()
+
+	clock := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	s := New(Config{
+		Provider:         "p",
+		BaseURL:          a.URL,
+		APIKey:           "k",
+		Model:            "m",
+		Fallbacks:        []Upstream{{Provider: "p", BaseURL: b.URL, APIKey: "k", Model: "m2"}},
+		Port:             0,
+		RateLimitRetries: 1,
+		RateLimitBackoff: time.Millisecond,
+	})
+	s.now = func() time.Time { return clock }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+
+	// Turn 1: both routes answer a temporary 429, so both get parked and the
+	// upstream 429 passes through.
+	rec1 := httptest.NewRecorder()
+	s.handleMessages(rec1, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if rec1.Code != http.StatusTooManyRequests {
+		t.Fatalf("turn 1 status = %d, want 429 (both routes temporarily throttled)", rec1.Code)
+	}
+
+	// Verify both routes are now parked with the expected cooldown.
+	s.poolMu.Lock()
+	parked := append([]time.Time{}, s.nextEligible...)
+	s.poolMu.Unlock()
+	for i := range parked {
+		if parked[i].IsZero() {
+			t.Fatalf("route %d was not parked after its 429", i)
+		}
+	}
+
+	// Turn 2: every route is still inside its cooldown park, so nothing is
+	// attempted and the honest cooling-down 429 (not 502) must be returned.
+	rec2 := httptest.NewRecorder()
+	s.handleMessages(rec2, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("turn 2 status = %d, want 429 (cooling down), body=%s", rec2.Code, rec2.Body.String())
+	}
+	msg := rec2.Body.String()
+	// Initial park TTL is 5 minutes (routeCooldownTTL(1)); the fake clock is
+	// frozen, so the soonest expiry is exactly 5 minutes out.
+	if !strings.Contains(msg, "cooling down") || !strings.Contains(msg, "retry in ~5m") {
+		t.Fatalf("turn 2 message %q should be the honest cooling-down wording naming the minutes to the soonest expiry", msg)
+	}
+	if strings.Contains(msg, "exhausted for this session") {
+		t.Fatalf("turn 2 message %q wrongly claims permanent exhaustion for a cooldown park", msg)
+	}
+	if !strings.Contains(msg, `"type":"rate_limit_error"`) {
+		t.Fatalf("turn 2 type must stay rate_limit_error so Claude Code retries; got %q", msg)
 	}
 }
 

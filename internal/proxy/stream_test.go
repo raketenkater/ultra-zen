@@ -81,6 +81,63 @@ func (p *pacedReader) Read(b []byte) (int, error) {
 	return 0, io.EOF
 }
 
+// Fix #8: a protocol-complete stream that OPENED a text block but produced no
+// real content — a content delta that is only whitespace (or otherwise empty),
+// zero output tokens, finish_reason "stop" — is the live "text_blocks=1 /
+// output_tokens=0 / end_turn" stop. The relay used to commit it as a finished
+// empty turn because a content block was opened (emittedText=true makes
+// hasContent() true); it must now abort with the same visible
+// upstream_no_content failure so Claude Code rotates and retries instead of
+// idling on a silent answer.
+func TestStreamOpenedBlockNoContentAbortsAsDegenerate(t *testing.T) {
+	// A whitespace-only content delta opens the text block (text_blocks=1) but
+	// delivers no real content; a usage chunk reports zero completion tokens;
+	// the stream closes protocol-complete. This is exactly the degenerate shape
+	// seen 7x from a degraded route.
+	upstream := "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" \"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0}}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := streamTranslate(rec, strings.NewReader(upstream), "glm-5.2")
+	if err == nil {
+		t.Fatalf("opened-block-with-zero-content stream must return an error")
+	}
+	if !strings.Contains(err.Error(), "upstream_no_content") {
+		t.Fatalf("relay error = %v, want upstream_no_content", err)
+	}
+	out := rec.Body.String()
+	if !hasEvent(out, "error") {
+		t.Fatalf("client got no error event:\n%s", out)
+	}
+	if !strings.Contains(out, "upstream_no_content") {
+		t.Fatalf("error event must name the failure:\n%s", out)
+	}
+	if hasEvent(out, "message_delta") || hasEvent(out, "message_stop") {
+		t.Fatalf("degenerate stream must not fabricate completion events:\n%s", out)
+	}
+	if strings.Contains(out, `"end_turn"`) {
+		t.Fatalf("degenerate stream must not emit stop_reason end_turn:\n%s", out)
+	}
+}
+
+// A stream that opened a text block with GENUINE text must still complete — the
+// degenerate detector must not false-positive on a real (even short) answer.
+func TestStreamRealWordStillCompletes(t *testing.T) {
+	upstream := "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := streamTranslate(rec, strings.NewReader(upstream), "m"); err != nil {
+		t.Fatalf("real answer wrongly aborted as degenerate: %v\n%s", err, rec.Body.String())
+	}
+	if !hasEvent(rec.Body.String(), "message_stop") {
+		t.Fatalf("real answer missing message_stop:\n%s", rec.Body.String())
+	}
+	if hasEvent(rec.Body.String(), "error") {
+		t.Fatalf("real answer wrongly produced an error event:\n%s", rec.Body.String())
+	}
+}
+
 // Fix #1: a protocol-complete stream that carried nothing used to be closed
 // out as a fabricated minimal end_turn — the silent-stop mechanism. It must
 // now surface as an error event (visible to Claude Code, which retries) and a
@@ -307,5 +364,73 @@ func TestStreamPartialContentWithFinishCommits(t *testing.T) {
 	}
 	if got := collectText(out); got != "partial thought" {
 		t.Fatalf("text = %q, want the partial content preserved", got)
+	}
+}
+
+// degenerateStreamBody is an HTTP-200 stream that opens a text block but
+// produces no real content and reports zero completion tokens — the live
+// text_blocks=1 / output_tokens=0 / end_turn empty turn.
+func degenerateStreamBody() string {
+	return "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" \"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":0}}\n\n" +
+		"data: [DONE]\n\n"
+}
+
+// goodStreamBody is a healthy protocol-complete stream with real content.
+func goodStreamBody() string {
+	return "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fine\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+}
+
+func streamingResp(body string) *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+// A route that serves degenerate empty turns gets the same expiring-park
+// treatment as a 429: the repeat-offense ladder escalates 5m -> 15m -> 60m,
+// and a genuine completion resets it. A relay that died AFTER real content
+// reached the user must NOT park — it already served tokens, that is not the
+// empty-turn failure.
+func TestStreamDegenerateCooldownParkEscalatesAndClears(t *testing.T) {
+	s := New(Config{Provider: "opencode-go", BaseURL: "http://up", APIKey: "k", Model: "m"})
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	const routeIdx = 0 // the only pool route (no fallbacks)
+
+	// Degenerate turn 1: parks route 0 on the 5-minute rung.
+	s.streamResponse(httptest.NewRecorder(), req, streamingResp(degenerateStreamBody()), "m", "", routeIdx)
+	if s.strikes[routeIdx] != 1 {
+		t.Fatalf("after 1st degenerate turn strikes[%d] = %d, want 1", routeIdx, s.strikes[routeIdx])
+	}
+	if s.nextEligible[routeIdx].IsZero() {
+		t.Fatalf("route %d not parked after 1st degenerate turn", routeIdx)
+	}
+
+	// Degenerate turn 2: escalates to the 15-minute rung.
+	s.streamResponse(httptest.NewRecorder(), req, streamingResp(degenerateStreamBody()), "m", "", routeIdx)
+	if s.strikes[routeIdx] != 2 {
+		t.Fatalf("after 2nd degenerate turn strikes[%d] = %d, want 2 (repeat-offense ladder)", routeIdx, s.strikes[routeIdx])
+	}
+
+	// A genuine completion clears the park so a future failure starts fresh.
+	s.streamResponse(httptest.NewRecorder(), req, streamingResp(goodStreamBody()), "m", "", routeIdx)
+	if s.strikes[routeIdx] != 0 {
+		t.Fatalf("after a good completion strikes[%d] = %d, want 0", routeIdx, s.strikes[routeIdx])
+	}
+	if !s.nextEligible[routeIdx].IsZero() {
+		t.Fatalf("route %d cooldown not cleared after a good completion", routeIdx)
+	}
+
+	// A relay that died mid-stream AFTER real content was handed to the user
+	// must NOT park the route — it served tokens, not an empty turn. Use a
+	// stream that emits "half thought" then hits premature EOF (no finish, no
+	// [DONE]).
+	deadResp := streamingResp("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half thought\"}}]}\n\n")
+	s.streamResponse(httptest.NewRecorder(), req, deadResp, "m", "", routeIdx)
+	if s.strikes[routeIdx] != 0 {
+		t.Fatalf("relay that died after real content must not park; strikes[%d] = %d, want 0", routeIdx, s.strikes[routeIdx])
+	}
+	if !s.nextEligible[routeIdx].IsZero() {
+		t.Fatalf("relay that died after real content must not park; nextEligible[%d] set", routeIdx)
 	}
 }

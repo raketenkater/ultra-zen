@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,15 @@ import (
 	"strings"
 	"time"
 )
+
+// errEmptyTurn marks a protocol-complete stream that committed nothing — the
+// degenerate/empty-turn failure that earns the serving route a cooldown park.
+// It is deliberately distinct from a relay that died mid-flight (premature EOF,
+// connection drop, idle stall) or one that served real content then failed:
+// those are transport conditions, not the route serving empty turns, and must
+// not cost the route a park (mirroring how the forward loop rotates past
+// transport errors without parking).
+var errEmptyTurn = errors.New("upstream_no_content")
 
 // streamIdleTimeout caps how long the relay waits between lines from the
 // upstream SSE stream. There is deliberately no overall http.Client timeout
@@ -99,6 +109,24 @@ type streamState struct {
 	// and reasoning is the fallback so Claude Code is never handed an empty turn.
 	reasoning   strings.Builder
 	emittedText bool
+	// realText tracks whether any non-whitespace content was actually relayed to
+	// the client. It is the degenerate-empty detector's core signal: a provider
+	// that opens a content block but streams only whitespace (or empty) deltas
+	// sets emittedText (any non-empty delta does) yet never delivers a real
+	// answer — the live "text_blocks=1 / output_tokens=0 / end_turn" stop. That
+	// turn must not be committed as a completion.
+	realText bool
+}
+
+// degenerate reports a protocol-complete stream that opened a text block but
+// produced no real content: no non-whitespace text, no tool call, no buffered
+// reasoning. The gateway surfaced a structurally-complete but content-free
+// turn (finish_reason "stop" / end_turn with zero output tokens); committing it
+// as a finished assistant message is exactly the silent-stop mechanism, so the
+// relay aborts it with the same visible upstream_no_content failure the
+// zero-content path uses.
+func (s *streamState) degenerate() bool {
+	return s.textBlocks > 0 && !s.realText && len(s.toolStarted) == 0 && s.reasoning.Len() == 0
 }
 
 // hasContent reports whether the upstream delivered anything worth handing to
@@ -113,6 +141,16 @@ func (s *streamState) hasContent() bool {
 // sent an SSE error event, so it can surface and retry the turn instead of
 // silently stopping.
 func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error {
+	_, err := relayStream(w, body, model)
+	return err
+}
+
+// relayStream is streamTranslate plus the final relay state. The proxy's
+// request path inspects the state to decide what the failure costs the route
+// that served it: a relay that aborted having handed the client nothing earns
+// an expiring cooldown park (streamResponse), while one that died after real
+// content reached the user does not.
+func relayStream(w http.ResponseWriter, body io.Reader, model string) (*streamState, error) {
 	flusher, _ := w.(http.Flusher)
 	st := &streamState{
 		w:           w,
@@ -169,9 +207,9 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 				// finished "end_turn".
 				if !st.sawDone && st.finish == "" {
 					st.abortStream("upstream stream ended prematurely (no finish_reason, no [DONE])")
-					return io.ErrUnexpectedEOF
+					return st, io.ErrUnexpectedEOF
 				}
-				return st.finishStream()
+				return st, st.finishStream()
 			}
 		case <-idle.C:
 			// Silence longer than the cap: the gateway is holding the
@@ -183,7 +221,7 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 			if closer, isCloser := body.(io.Closer); isCloser {
 				closer.Close()
 			}
-			return fmt.Errorf("upstream stream stalled: no data from %s for %v", model, streamIdleTimeout)
+			return st, fmt.Errorf("upstream stream stalled: no data from %s for %v", model, streamIdleTimeout)
 		}
 		// Any line from upstream — data chunk, SSE keepalive comment, blank
 		// event separator — proves the connection is alive; reset the watchdog.
@@ -197,7 +235,7 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 
 		if sline.err != nil {
 			st.abortStream(fmt.Sprintf("upstream connection failed mid-stream: %v", sline.err))
-			return sline.err
+			return st, sline.err
 		}
 		line := sline.text
 		if !strings.HasPrefix(line, "data:") {
@@ -206,7 +244,7 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
 			st.sawDone = true
-			return st.finishStream()
+			return st, st.finishStream()
 		}
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
@@ -227,6 +265,9 @@ func streamTranslate(w http.ResponseWriter, body io.Reader, model string) error 
 		st.ensureStarted(&chunk)
 		if choice.Delta.Content != "" {
 			st.emittedText = true
+			if strings.TrimSpace(choice.Delta.Content) != "" {
+				st.realText = true
+			}
 			st.emitText(choice.Delta.Content)
 		} else if choice.Delta.ReasoningContent != "" {
 			// Reasoning content isn't the real answer when content eventually
@@ -360,17 +401,18 @@ func (s *streamState) emitToolDelta(tc streamTool) {
 // stream carried nothing at all; the relay then surfaces the failure instead of
 // fabricating a successful turn.
 func (s *streamState) finishStream() error {
-	if !s.hasContent() {
-		// A protocol end ([DONE] or a finish_reason chunk) that carries zero
-		// content used to be completed as a fabricated empty end_turn — a
-		// perfectly-formed, perfectly silent assistant message. Claude Code
-		// rendered it as "the model stopped mid-task", the classifier could
-		// not see it (any data:-framed prefix is bodyOK upstream), and no
-		// retry ever happened. Abort instead: the SSE error event plus the
-		// returned error make this a visible, retryable failure, matching how
-		// the non-stream path already rotates past an empty completion.
+	// A protocol end ([DONE] or a finish_reason chunk) that carries nothing — or
+	// that opened a content block and then produced no real content (the live
+	// "text_blocks=1 / output_tokens=0 / end_turn" stop) — used to be completed
+	// as a fabricated empty end_turn: a perfectly-formed, perfectly silent
+	// assistant message. Claude Code rendered it as "the model stopped mid-task",
+	// the classifier could not see it (any data:-framed prefix is bodyOK
+	// upstream), and no retry ever happened. Abort instead: the SSE error event
+	// plus the returned error make this a visible, retryable failure, matching
+	// how the non-stream path already rotates past an empty completion.
+	if !s.hasContent() || s.degenerate() {
 		s.abortStream(fmt.Sprintf("upstream_no_content: %s ended the stream without any text, tool call, or reasoning", s.model))
-		return fmt.Errorf("upstream_no_content from %s (protocol-complete stream with zero content)", s.model)
+		return fmt.Errorf("%w from %s (protocol-complete stream with zero content)", errEmptyTurn, s.model)
 	}
 	// Reasoning-only stream: no real content and no tool calls arrived, but the
 	// model answered in reasoning_content. Surface it as text so Claude Code
@@ -410,9 +452,12 @@ func (s *streamState) finishStream() error {
 		stop = "tool_use"
 	}
 	// One line per completed stream: enough to reconstruct what the client saw
-	// (and to spot the empty-ish turns) without dumping content on every turn.
-	log.Printf("ultra-zen proxy stream: completed model=%s finish_reason=%q stop_reason=%s text_blocks=%d tool_blocks=%d output_tokens=%d",
-		s.model, s.finish, stop, s.textBlocks, len(s.toolStarted), s.output)
+	// (and to spot the degenerate empty turns) without dumping content on every
+	// turn. degenerate=true marks a stream that committed nothing usable (a
+	// content block opened but zero real tokens) — the route that served it is
+	// parked so the next turn rotates.
+	log.Printf("ultra-zen proxy stream: completed model=%s finish_reason=%q stop_reason=%s text_blocks=%d tool_blocks=%d output_tokens=%d degenerate=%t",
+		s.model, s.finish, stop, s.textBlocks, len(s.toolStarted), s.output, s.degenerate())
 	s.writeEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},

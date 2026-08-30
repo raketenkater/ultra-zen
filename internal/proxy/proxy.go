@@ -595,7 +595,19 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if resp == nil {
-		s.reject(w, 429, "rate_limit_error", "every configured free model is exhausted for this session")
+		// Every pool route was ineligible — either still inside a temporary
+		// cooldown park, or permanently exhausted (a spent free allocation).
+		// Distinguish them so the user hears an honest reason: a cooldown is a
+		// "retry in a few minutes" state, not "out of free models" (which would
+		// wrongly tell them the session budget is gone and send them hunting for
+		// a new account). Status stays 429 + rate_limit_error so Claude Code
+		// retries the turn on its own.
+		if parked, soonest := s.coolDownAwait(); parked {
+			mins := cooldownMinutes(soonest.Sub(s.clockNow()))
+			s.reject(w, 429, "rate_limit_error", fmt.Sprintf("all free routes cooling down, retry in ~%dm", mins))
+		} else {
+			s.reject(w, 429, "rate_limit_error", "every configured free model is exhausted for this session")
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -666,7 +678,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if areq.Stream {
-		s.streamResponse(w, r, resp, areq.Model, used.Kind)
+		// The serving route's pool index lets the stream relay park a route that
+		// answers with degenerate empty turns. poolIndexOf is -1 for a non-pool
+		// selectable/worker route; parking no-ops on -1.
+		s.streamResponse(w, r, resp, areq.Model, used.Kind, s.poolIndexOf(used))
 		return
 	}
 	s.nonStreamResponse(w, resp, areq.Model, used.Kind)
@@ -1205,6 +1220,42 @@ func (s *Server) clockNow() time.Time {
 	return time.Now()
 }
 
+// coolDownAwait reports whether at least one pool route is currently inside a
+// temporary cooldown park (nextEligible in the future), and the soonest such
+// park's expiry. When every route is ineligible and nothing responded, this
+// distinguishes an all-parked (cooling-down) pool from an all-permanently-
+// exhausted one, so handleMessages can emit an honest "retry in a few minutes"
+// instead of the misleading "every free model is exhausted". A paused clock or
+// an empty/failed park leaves parked=false.
+func (s *Server) coolDownAwait() (parked bool, soonest time.Time) {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	now := s.clockNow()
+	for i := range s.nextEligible {
+		if now.Before(s.nextEligible[i]) {
+			if soonest.IsZero() || s.nextEligible[i].Before(soonest) {
+				soonest = s.nextEligible[i]
+			}
+		}
+	}
+	return !soonest.IsZero(), soonest
+}
+
+// cooldownMinutes rounds an unexpired cooldown wait to a whole minute for the
+// "retry in ~Nm" message. It never reports 0m (a route cooling down is still
+// cooling down), and any sub-minute or already-expired wait reads as ~1m so the
+// message always names a positive window.
+func cooldownMinutes(wait time.Duration) int {
+	if wait < 0 {
+		wait = 0
+	}
+	mins := int(wait.Round(time.Minute) / time.Minute)
+	if mins < 1 {
+		mins = 1
+	}
+	return mins
+}
+
 func (s *Server) routeExhausted(index int) bool {
 	if index < 0 || index >= len(s.exhaustedRoute) {
 		return false
@@ -1361,10 +1412,62 @@ func isFreeUsageLimit(body []byte) bool {
 // request failed: Model is unavailable."}. Only this class rotates to another
 // pool route: a 400 that names a bad param (invalid_request_error), a context
 // length, or moderation stays on the same upstream so handleMessages' halving
-// retry can fix it. The substring match is intentionally narrow — "upstream
-// request failed" is a generic gateway wrapper, so it must co-occur with a
-// server_error type to count.
+// retry can fix it.
+//
+// The body is parsed structurally first. A lowercased substring scan over the
+// raw bytes is too fragile: a pretty-printed body ("type" : "server_error",
+// spaces around the colon) missed the literal `"type":"server_error"` and fell
+// through to the halving retry on a dead route — exactly the mismatch the live
+// gateway produced ("transient availability 400" logged against a route that
+// answered "Model is unavailable."). Structural parsing also lets a recognized
+// NON-server type (invalid_request_error, context_length, data_inspection_failed)
+// short-circuit to false even when its message happens to wrap an
+// "Upstream request failed" provider note — those must reach the halving
+// retry, never rotate.
 func isTransientUpstreamFailure(body []byte) bool {
+	var payload struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+		Error   *struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		typ, msg := payload.Type, payload.Message
+		if payload.Error != nil {
+			if payload.Error.Type != "" {
+				typ = payload.Error.Type
+			}
+			if payload.Error.Message != "" {
+				msg = payload.Error.Message
+			}
+		}
+		// A parsed body that names a recognized NON-server error type is a
+		// genuine request-shaped 400: it belongs to the halving retry, even if
+		// its message wraps an upstream/provider note.
+		if typ != "" && !strings.EqualFold(strings.TrimSpace(typ), "server_error") {
+			return false
+		}
+		if strings.EqualFold(strings.TrimSpace(typ), "server_error") {
+			return true
+		}
+		// No explicit (or an unrecognized) type: fall back to the message
+		// heuristic. Only "model is unavailable" counts here — it is a strong,
+		// specific availability signal with no request-shaped reading. The
+		// generic wrapper "upstream request failed" is deliberately NOT a
+		// standalone trigger: many gateways prefix every error with it, so a
+		// bare {"error":{"message":"Upstream request failed"}} (no type) is a
+		// request-shaped 400 that must still reach the halving retry (pinned by
+		// TestRetryServedAppliesBodyGate). "upstream request failed" therefore
+		// rotates only when a server_error type confirms it, via the branch
+		// above.
+		lower := strings.ToLower(strings.TrimSpace(msg))
+		return strings.Contains(lower, "model is unavailable")
+	}
+	// Non-JSON fallback: keep the old lowercased substring scan. Here
+	// "upstream request failed" is a generic wrapper, so it must co-occur with
+	// a server_error type to count.
 	msg := strings.ToLower(string(body))
 	if strings.Contains(msg, "model is unavailable") {
 		return true
@@ -1694,9 +1797,11 @@ func chunksToOpenAIResponse(chunks []chatChunk) openAIResponse {
 
 // streamResponse streams the upstream response to the client. For the
 // Responses-API kind the upstream body is a Responses SSE stream that is first
-// translated into chat-completions chunks, which streamTranslate then converts
-// to the Anthropic SSE stream Claude Code reads.
-func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, model, kind string) {
+// translated into chat-completions chunks, which relayStream then converts to
+// the Anthropic SSE stream Claude Code reads. routeIdx is the serving route's
+// pool index (-1 for a non-pool selectable/worker route); it is parked on a
+// degenerate empty turn so the next turn starts on a healthier route.
+func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, model, kind string, routeIdx int) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1705,9 +1810,29 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *ht
 	if kind == UpstreamResponses {
 		body = responsesSSEStream(r.Context(), resp.Body)
 	}
-	if err := streamTranslate(w, body, model); err != nil {
-		log.Printf("ultra-zen proxy stream: %v", err)
+	st, err := relayStream(w, body, model)
+	if err != nil {
+		// Only the protocol-complete empty-turn failure costs the serving route
+		// a cooldown park: the live text_blocks=1 / output_tokens=0 / end_turn
+		// stop where the gateway surfaced a complete but content-free turn. A
+		// relay that died AFTER real content reached the user already served
+		// tokens, and a relay that died before any content (premature EOF,
+		// connection drop, stall) is a transport condition, not the route
+		// serving empty turns — neither gets a park, just the log line.
+		if errors.Is(err, errEmptyTurn) {
+			s.parkRoute(routeIdx)
+			log.Printf("ultra-zen proxy stream: empty turn from %s (text_blocks=%d tool_blocks=%d output_tokens=%d); parking route %d",
+				model, st.textBlocks, len(st.toolStarted), st.output, routeIdx)
+		} else {
+			log.Printf("ultra-zen proxy stream: %v", err)
+		}
+		return
 	}
+	// A genuine completion proves the route works: clear any prior empty-turn
+	// park so a future failure starts a fresh 5-minute cooldown, not an
+	// escalated one. The main forward loop already cleared the cooldown on the
+	// 200, so this is a redundant-but-harmless safety net for the stream path.
+	s.clearRouteCooldown(routeIdx)
 }
 
 // writeError emits an Anthropic-shaped error response.

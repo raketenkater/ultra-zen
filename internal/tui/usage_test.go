@@ -307,7 +307,7 @@ func TestFetchOpenRouterUsageCreditsParity(t *testing.T) {
 }
 
 // TestFetchOpenRouterUsageAtCap pins the shared exhaustion flip: tally 50
-// against a 50/day cap (< $10 lifetime) renders "[openrouter hit]" exactly as
+// against a 50/day cap (< $10 lifetime) renders the drained token exactly as
 // the poller row does.
 func TestFetchOpenRouterUsageAtCap(t *testing.T) {
 	seedORFreeCount(t, 50)
@@ -317,7 +317,7 @@ func TestFetchOpenRouterUsageAtCap(t *testing.T) {
 	if snap.Usage == nil || !snap.Usage.Exhausted {
 		t.Fatalf("row = %+v, want Exhausted", snap.Usage)
 	}
-	if got := usagefmt.FormatProviderUsage(*snap.Usage); got != "[openrouter hit]" {
+	if got := usagefmt.FormatProviderUsage(*snap.Usage); got != "[OR drained]" {
 		t.Fatalf("banner = %q", got)
 	}
 }

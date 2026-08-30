@@ -90,7 +90,35 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 		title = "?"
 	}
 	if u.Exhausted {
-		return fmt.Sprintf("[%s hit]", title)
+		// Drained state: the live signal is "requests will fail" — say that,
+		// not "hit". The Detail carries the upstream's own message (set by
+		// proxy.MarkExhaustedFromBody), so the statusline shows the same
+		// words the user will see in the provider dashboard. We deliberately
+		// do NOT invent a dollar figure: balance is console-only on the
+		// opencode side, and on OpenRouter the /credits endpoint stops
+		// returning a balance once the wallet is empty — the row has no
+		// money fields to render, and a synthetic "0.00" would read as
+		// "spent nothing". Short titles ("OR" / "Zen") stay short; the
+		// provider's full name is the suffix when the row is not a known
+		// credits provider.
+		short := title
+		if title == "openrouter" {
+			short = "OR"
+		}
+		if u.Detail != "" {
+			// Trim very long upstream messages so the statusline stays one
+			// line beside other tokens; the full text is in the provider
+			// dashboard. The "!" prefix is the live user's "I need to act
+			// on this" cue that distinguishes a drained provider from a
+			// transient one — it is what the launch-banner note line also
+			// says, so the two views never disagree on severity.
+			msg := u.Detail
+			if len(msg) > 60 {
+				msg = msg[:60] + "…"
+			}
+			return fmt.Sprintf("[%s drained · %s]", short, msg)
+		}
+		return fmt.Sprintf("[%s drained]", short)
 	}
 	switch u.Kind {
 	case proxy.UsageCredits:
