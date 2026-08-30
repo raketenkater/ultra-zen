@@ -1,9 +1,280 @@
 package claude
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
+
+// TestWriteGatewayCache verifies the /model gateway cache is written in the
+// exact shape Claude Code's cnn() expects (baseUrl, fetchedAt, models with
+// claude-prefixed ids), to the CONFIG dir path the binary actually reads
+// (CLAUDE_CONFIG_DIR || ~/.claude), plus the legacy XDG path.
+func TestWriteGatewayCache(t *testing.T) {
+	configHome := t.TempDir()
+	xdgHome := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configHome)
+	t.Setenv("XDG_CACHE_HOME", xdgHome)
+
+	err := WriteGatewayCache("http://127.0.0.1:1234", []GatewayCacheModel{
+		{ID: "claude-opencode-go-deepseek-v4-flash", DisplayName: "deepseek-v4-flash"},
+		{ID: "claude-codex-gpt-5.6-sol", DisplayName: "GPT-5.6-Sol"},
+		// OpenRouter free tier, as main.go builds it: the marker rides on the
+		// display name, the claude-prefixed id stays byte-identical (Claude-
+		// ModelID sanitizes '/' ':' ' ' to '-' but keeps dots, so
+		// "poolside/laguna-s-2.1:free" becomes "poolside-laguna-s-2.1-free").
+		{ID: "claude-openrouter-poolside-laguna-s-2.1-free", DisplayName: WithFreeMarker("Laguna S 2.1 — OpenRouter")},
+	})
+	if err != nil {
+		t.Fatalf("WriteGatewayCache: %v", err)
+	}
+	// Primary path: what cnn() reads.
+	path := filepath.Join(configHome, "cache", "gateway-models.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("cache not written at %s: %v", path, err)
+	}
+	var cache map[string]any
+	if err := json.Unmarshal(data, &cache); err != nil {
+		t.Fatalf("cache not valid JSON: %v", err)
+	}
+	if cache["baseUrl"] != "http://127.0.0.1:1234" {
+		t.Fatalf("baseUrl = %v", cache["baseUrl"])
+	}
+	models, _ := cache["models"].([]any)
+	if len(models) != 3 {
+		t.Fatalf("models = %d entries, want 3", len(models))
+	}
+	first := models[0].(map[string]any)
+	if first["id"] != "claude-opencode-go-deepseek-v4-flash" || first["display_name"] != "deepseek-v4-flash" {
+		t.Fatalf("first model = %v", first)
+	}
+	// The free marker survives the JSON round-trip and never touches the id.
+	free := models[2].(map[string]any)
+	if free["id"] != "claude-openrouter-poolside-laguna-s-2.1-free" || free["display_name"] != "Laguna S 2.1 — OpenRouter (free)" {
+		t.Fatalf("free-tier model = %v", free)
+	}
+	// Legacy XDG path: also written as a belt-and-suspenders fallback.
+	legacyPath := filepath.Join(xdgHome, "claude", "cache", "gateway-models.json")
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy cache not written at %s: %v", legacyPath, err)
+	}
+}
+
+// TestWithFreeMarker covers the OpenRouter :free display-name marker used by
+// the gateway cache (feedback: highlight free models in /model). Free rows get
+// " (free)"; already-marked names never double-mark, in any casing; the
+// openrouter/free router's FriendlyName ("OpenRouter Free") already reads free
+// and stays untouched; paid names are never modified.
+func TestWithFreeMarker(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"free model gets marker", "Laguna S 2.1 — OpenRouter", "Laguna S 2.1 — OpenRouter (free)"},
+		{"already suffixed lowercase", "Laguna S 2.1 — OpenRouter (free)", "Laguna S 2.1 — OpenRouter (free)"},
+		{"already suffixed title case", "Laguna S 2.1 — OpenRouter (Free)", "Laguna S 2.1 — OpenRouter (Free)"},
+		{"already suffixed upper case", "DeepSeek V4 Flash (FREE)", "DeepSeek V4 Flash (FREE)"},
+		// Only a trailing marker suppresses: the openrouter/free router's name
+		// ("OpenRouter Free", word not suffix) is still free-tier and gets the
+		// marker so it stands out in the picker like every other :free row.
+		{"openrouter free router marked", "OpenRouter Free — OpenRouter", "OpenRouter Free — OpenRouter (free)"},
+		// A plain name gets exactly one marker — free/paid gating lives in the
+		// caller (main.go only calls this for provider=="openrouter" &&
+		// m.Free), so this function's contract is purely "mark if unmarked".
+		{"plain free-tier name", "DeepSeek V4 Flash — OpenRouter", "DeepSeek V4 Flash — OpenRouter (free)"},
+		{"blank passes through", "", ""},
+		{"idempotent when applied twice", WithFreeMarker("Laguna S 2.1 — OpenRouter"), "Laguna S 2.1 — OpenRouter (free)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WithFreeMarker(tc.in)
+			if got != tc.want {
+				t.Fatalf("WithFreeMarker(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			// Re-marking must never append a second marker.
+			if again := WithFreeMarker(got); again != got {
+				t.Fatalf("WithFreeMarker not idempotent: %q -> %q", got, again)
+			}
+		})
+	}
+}
+
+// TestGatewayCachePathPrecedence verifies GatewayCachePath resolves CLAUDE_CONFIG_DIR
+// over the ~/.claude fallback, exactly as the binary's Ln() does.
+func TestGatewayCachePathPrecedence(t *testing.T) {
+	config := filepath.Join(t.TempDir(), "custom-config")
+	t.Setenv("CLAUDE_CONFIG_DIR", config)
+	if got := GatewayCachePath(); got != filepath.Join(config, "cache", "gateway-models.json") {
+		t.Fatalf("GatewayCachePath = %q, want config-dir path %q", got, filepath.Join(config, "cache", "gateway-models.json"))
+	}
+	// ~/.claude fallback when CLAUDE_CONFIG_DIR is unset. UserHomeDir() reads the
+	// OS home (HOME env on Linux); set it so the fallback is deterministic.
+	home := t.TempDir()
+	origConfig := os.Getenv("CLAUDE_CONFIG_DIR")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	t.Setenv("HOME", home)
+	t.Cleanup(func() {
+		os.Setenv("CLAUDE_CONFIG_DIR", origConfig)
+		os.Setenv("HOME", origHome)
+	})
+	if got := GatewayCachePath(); got != filepath.Join(home, ".claude", "cache", "gateway-models.json") {
+		t.Fatalf("GatewayCachePath with HOME=%s = %q, want ~/.claude path", home, got)
+	}
+}
+
+// TestEnvGatewayDiscovery ensures Claude Code's /model gateway discovery is
+// enabled and the assume-first-party override stays unset (setting it would
+// make hf() true and DISABLE discovery, since gpu() bails when hf() is true).
+func TestEnvGatewayDiscovery(t *testing.T) {
+	// Run with a clean slate for the keys Env() overrides.
+	orig := map[string]string{}
+	for _, k := range []string{
+		"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+		"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL", "ANTHROPIC_API_KEY",
+	} {
+		orig[k] = os.Getenv(k)
+		defer os.Setenv(k, orig[k])
+		os.Unsetenv(k)
+	}
+
+	env := Env("http://127.0.0.1:1234", "deepseek-v4-flash", "", 200000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "1" {
+		t.Fatalf("gateway discovery not enabled: %q", got["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"])
+	}
+	// The assume-first-party override must NOT be set: it would make hf() true,
+	// which gpu() treats as "real Anthropic, no discovery needed" and returns
+	// false, hiding the catalog.
+	if _, ok := got["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"]; ok {
+		t.Fatalf("_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL must stay unset; it disables discovery")
+	}
+	if got["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:1234" {
+		t.Fatalf("base URL = %q", got["ANTHROPIC_BASE_URL"])
+	}
+	if _, leaked := got["ANTHROPIC_API_KEY"]; leaked {
+		t.Fatalf("real API key leaked into env")
+	}
+}
+
+// TestEnvAutocompactWindow verifies Claude Code is told the real context window
+// via the env var it actually reads (CLAUDE_CODE_AUTO_COMPACT_WINDOW — verified
+// in the 2.1.233 binary; CLAUDE_MAX_SESSION_TOKENS is ignored by that build),
+// with the PCT override applied as a constant default.
+func TestEnvAutocompactWindow(t *testing.T) {
+	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", "", 1_000_000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "1000000" {
+		t.Fatalf("CLAUDE_CODE_AUTO_COMPACT_WINDOW = %q, want 1000000 (the real 1M window)", got["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+	}
+	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "85" {
+		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 85 (default)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+	}
+}
+
+// TestEnvAutocompactWindowIgnoresInheritedPCT verifies a stray inherited
+// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (exported by the host Claude process) does
+// NOT override ultra-zen's constant default — this was the bug that kept the
+// threshold at 70 despite the 85 default.
+func TestEnvAutocompactWindowIgnoresInheritedPCT(t *testing.T) {
+	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70")
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+	env := Env("http://127.0.0.1:1", "deepseek-v4-flash", "", 1_000_000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] != "85" {
+		t.Fatalf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = %q, want 85 (inherited 70 must be ignored)", got["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+	}
+}
+
+// TestEnvFastModelTier verifies the small-fast tier (permission classifier and
+// other cheap background calls) rides the fast model while sonnet/opus stay on
+// the primary — and that an empty fastModel keeps every tier on the primary
+// (the pre-fast-model behavior).
+func TestEnvFastModelTier(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
+	env := Env("http://127.0.0.1:1", "glm-5.2", "glm-5.3-flash", 200_000)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["ANTHROPIC_MODEL"] != "glm-5.2" {
+		t.Fatalf("ANTHROPIC_MODEL = %q, want glm-5.2", got["ANTHROPIC_MODEL"])
+	}
+	if got["ANTHROPIC_SMALL_FAST_MODEL"] != "glm-5.3-flash" {
+		t.Fatalf("ANTHROPIC_SMALL_FAST_MODEL = %q, want glm-5.3-flash", got["ANTHROPIC_SMALL_FAST_MODEL"])
+	}
+	if got["ANTHROPIC_DEFAULT_HAIKU_MODEL"] != "glm-5.3-flash" {
+		t.Fatalf("ANTHROPIC_DEFAULT_HAIKU_MODEL = %q, want glm-5.3-flash", got["ANTHROPIC_DEFAULT_HAIKU_MODEL"])
+	}
+	if got["ANTHROPIC_DEFAULT_SONNET_MODEL"] != "glm-5.2" || got["ANTHROPIC_DEFAULT_OPUS_MODEL"] != "glm-5.2" {
+		t.Fatalf("sonnet/opus = %q/%q, want both glm-5.2", got["ANTHROPIC_DEFAULT_SONNET_MODEL"], got["ANTHROPIC_DEFAULT_OPUS_MODEL"])
+	}
+
+	env = Env("http://127.0.0.1:1", "glm-5.2", "", 200_000)
+	got = map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["ANTHROPIC_SMALL_FAST_MODEL"] != "glm-5.2" {
+		t.Fatalf("empty fastModel: ANTHROPIC_SMALL_FAST_MODEL = %q, want glm-5.2 (legacy behavior)", got["ANTHROPIC_SMALL_FAST_MODEL"])
+	}
+}
+
+// TestSettingsJSONCarriesEffortDefault verifies the injected --settings payload
+// carries the ultracode flag AND the effortLevel general default ("ultracode"),
+// so a fresh ultra-zen session always starts at full ultracode thinking budget
+// even when --settings replaces the project's settings.json.
+func TestSettingsJSONCarriesEffortDefault(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(SettingsJSON("bin workflow-hook")), &payload); err != nil {
+		t.Fatalf("SettingsJSON not valid JSON: %v", err)
+	}
+	if payload["ultracode"] != true {
+		t.Fatalf("ultracode = %v, want true", payload["ultracode"])
+	}
+	if got := payload["effortLevel"]; got != "ultracode" {
+		t.Fatalf("effortLevel = %v, want ultracode", got)
+	}
+	// The Workflow stallMs hook must still be present.
+	hooks, _ := payload["hooks"].(map[string]any)
+	if hooks == nil {
+		t.Fatal("hooks missing from settings")
+	}
+}
+
+// TestArgsUserEffortWins verifies an explicit user --effort is preserved and
+// the injected default is skipped, so the user's choice is never clobbered.
+func TestArgsUserEffortWins(t *testing.T) {
+	args := Args("deepseek-v4-flash", "bin workflow-hook", []string{"--effort", "medium"})
+	got := strings.Join(args, " ")
+	if !strings.Contains(got, "--effort medium") {
+		t.Fatalf("user --effort lost: %q", got)
+	}
+	if strings.Count(got, "--effort") != 1 {
+		t.Fatalf("expected exactly one --effort (user's); got %q", got)
+	}
+}
 
 func TestResearchArgs(t *testing.T) {
 	const mcpCfg = `{"mcpServers":{"ddg-search":{"command":"uvx","args":["duckduckgo-mcp-server"]}}}`

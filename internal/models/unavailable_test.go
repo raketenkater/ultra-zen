@@ -47,6 +47,41 @@ func TestClearUnavailableIsProviderScoped(t *testing.T) {
 	}
 }
 
+func TestClearUnavailableModelIsScopedToPair(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := MarkUnavailable("opencode-go", "deepseek-v4-flash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkUnavailable("opencode-go", "laguna-s-2.1-free"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkUnavailable("modelscope", "deepseek-ai/DeepSeek-V4-Pro"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearUnavailableModel("opencode-go", "deepseek-v4-flash"); err != nil {
+		t.Fatal(err)
+	}
+	if IsUnavailable("opencode-go", "deepseek-v4-flash") {
+		t.Fatal("cleared model should be available again")
+	}
+	if !IsUnavailable("opencode-go", "laguna-s-2.1-free") {
+		t.Fatal("clearing one model cleared a sibling denial")
+	}
+	if !IsUnavailable("modelscope", "deepseek-ai/DeepSeek-V4-Pro") {
+		t.Fatal("clearing opencode-go cleared a different provider's denial")
+	}
+}
+
+func TestClearUnavailableModelRequiresBothFields(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := ClearUnavailableModel("", "deepseek-v4-flash"); err == nil {
+		t.Fatal("expected error for empty provider")
+	}
+	if err := ClearUnavailableModel("opencode-go", ""); err == nil {
+		t.Fatal("expected error for empty model")
+	}
+}
+
 func TestUnavailableExpiresAfterTTL(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 

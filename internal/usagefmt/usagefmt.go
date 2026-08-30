@@ -1,0 +1,239 @@
+// Package usagefmt renders a uniform per-provider usage token shared by the
+// in-session statusline (cmd/ultra-zen) and the launch-time TUI banner
+// (internal/tui), so both show identical, correct per-provider summaries.
+package usagefmt
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/raketenkater/ultra-zen/internal/proxy"
+)
+
+// humanizeReset renders an ISO timestamp as a compact relative reset label.
+// It returns "" when the timestamp cannot be parsed.
+func humanizeReset(resetsAt string) string {
+	if resetsAt == "" {
+		return ""
+	}
+	ts, err := time.Parse(time.RFC3339, resetsAt)
+	if err != nil {
+		// Try the datetime without timezone (OpenRouter limit_reset is often
+		// a bare ISO like "2026-08-26T00:00:00").
+		ts, err = time.Parse("2006-01-02T15:04:05", resetsAt)
+		if err != nil {
+			return ""
+		}
+	}
+	now := time.Now()
+	diff := ts.Sub(now)
+	if diff < 0 {
+		return "reset"
+	}
+	switch {
+	case diff < time.Minute:
+		return "now"
+	case diff < time.Hour:
+		return fmt.Sprintf("%dm", int(diff.Minutes()))
+	case diff < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(diff.Hours()))
+	default:
+		return ts.Local().Format("15:04")
+	}
+}
+
+// humanizeResetSeconds renders a numeric rate-limit reset value. Header reset
+// values are either a Unix epoch (very large) or seconds-until-reset (small);
+// we disambiguate by magnitude, matching the parser's heuristic.
+func humanizeResetSeconds(v int64) string {
+	if v <= 0 {
+		return ""
+	}
+	if v > 1e10 {
+		return humanizeReset(time.Unix(v, 0).UTC().Format(time.RFC3339))
+	}
+	d := time.Duration(v) * time.Second
+	switch {
+	case d < time.Minute:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// zenWindowMark flags a Zen window the gateway says is unhealthy (any
+// status other than "ok"/empty — "rate-limited" is the value seen on a
+// spent-out window). It is deliberately one character: the statusline row
+// must stay short beside the [OR ...] token.
+func zenWindowMark(w *proxy.WindowStat) string {
+	if w == nil {
+		return ""
+	}
+	switch w.State {
+	case "", "ok":
+		return ""
+	}
+	return "!"
+}
+
+// FormatProviderUsage renders one ProviderUsage into a single compact bracketed
+// token. It is the single source of truth for both the statusline and the TUI
+// banner.
+func FormatProviderUsage(u proxy.ProviderUsage) string {
+	title := u.Name
+	if title == "" {
+		title = "?"
+	}
+	if u.Exhausted {
+		// Drained state: the live signal is "requests will fail" — say that,
+		// not "hit". The Detail carries the upstream's own message (set by
+		// proxy.MarkExhaustedFromBody), so the statusline shows the same
+		// words the user will see in the provider dashboard. We deliberately
+		// do NOT invent a dollar figure: balance is console-only on the
+		// opencode side, and on OpenRouter the /credits endpoint stops
+		// returning a balance once the wallet is empty — the row has no
+		// money fields to render, and a synthetic "0.00" would read as
+		// "spent nothing". Short titles ("OR" / "Zen") stay short; the
+		// provider's full name is the suffix when the row is not a known
+		// credits provider.
+		short := title
+		if title == "openrouter" {
+			short = "OR"
+		}
+		if u.Detail != "" {
+			// Trim very long upstream messages so the statusline stays one
+			// line beside other tokens; the full text is in the provider
+			// dashboard. The "!" prefix is the live user's "I need to act
+			// on this" cue that distinguishes a drained provider from a
+			// transient one — it is what the launch-banner note line also
+			// says, so the two views never disagree on severity.
+			msg := u.Detail
+			if len(msg) > 60 {
+				msg = msg[:60] + "…"
+			}
+			return fmt.Sprintf("[%s drained · %s]", short, msg)
+		}
+		return fmt.Sprintf("[%s drained]", short)
+	}
+	switch u.Kind {
+	case proxy.UsageCredits:
+		switch title {
+		case "openrouter":
+			// Account credits (from /credits) are the headline number: the
+			// balance, plus the :free request tally against today's cap. The
+			// tally counts only requests routed through ultra-zen, so it is a
+			// floor for "used" — which is why the token states the counted
+			// usage ("~N/cap used") and never derives "left" from it: cap minus
+			// a floored usage is an upper bound of the true remaining and would
+			// overstate what the user has left to spend.
+			if u.Credits != nil {
+				tok := fmt.Sprintf("[OR $%.2f credits", *u.Credits)
+				if u.FreeReqsLimit != nil {
+					var used int64
+					if u.FreeReqsUsed != nil {
+						used = *u.FreeReqsUsed
+					}
+					tok += fmt.Sprintf(" · ~%d/%d free req used", used, *u.FreeReqsLimit)
+				}
+				return tok + "]"
+			}
+			if u.Remaining == nil && u.FreeLimit == nil {
+				// /key reported a null limit_remaining (and no /credits
+				// data): the key is unmetered. Render the fact instead of
+				// falling through to the ambiguous "[openrouter —]" dash,
+				// so the statusline and launch banner show the same token.
+				return "[OR unlimited]"
+			}
+			reset := humanizeReset(resetOf(u.Daily))
+			if u.FreeLimit != nil && *u.FreeLimit > 0 {
+				// Free tier: daily cap + remaining balance + daily reset.
+				if u.Remaining != nil {
+					tok := fmt.Sprintf("[OR free $%.3f left", *u.Remaining)
+					if reset != "" {
+						tok += " · daily reset " + reset
+					}
+					return tok + "]"
+				}
+				return fmt.Sprintf("[OR free $%.3f cap]", *u.FreeLimit)
+			}
+			if u.Remaining != nil {
+				if u.Limit != nil && *u.Limit > 0 {
+					return fmt.Sprintf("[OR $%.3f left / $%.3f cap]", *u.Remaining, *u.Limit)
+				}
+				return fmt.Sprintf("[OR $%.3f left]", *u.Remaining)
+			}
+		case "opencode-go":
+			// Zen: surface the rolling/weekly/monthly windows. The live
+			// /usage payload carries no money fields (the credit wallet is
+			// console-only), so a "$" figure appears only if opencode ever
+			// ships the requested top-level "balance" sibling, which
+			// proxy.BuildZenUsage already parses into Credits — unknown
+			// money is omitted, never rendered as $0.00. A window the
+			// gateway flags unhealthy (status "rate-limited") is marked "!"
+			// — the paid plan's only real exhaustion signal on this row.
+			var parts []string
+			if w := u.Rolling; w != nil {
+				parts = append(parts, fmt.Sprintf("5h %d%%%s", w.Percent, zenWindowMark(w)))
+			}
+			if w := u.Weekly; w != nil {
+				parts = append(parts, fmt.Sprintf("wk %d%%%s", w.Percent, zenWindowMark(w)))
+			}
+			if w := u.Monthly; w != nil {
+				parts = append(parts, fmt.Sprintf("mo %d%%%s", w.Percent, zenWindowMark(w)))
+			}
+			if len(parts) > 0 {
+				if u.Credits != nil {
+					return fmt.Sprintf("[Zen $%.2f left · %s]", *u.Credits, strings.Join(parts, " · "))
+				}
+				return fmt.Sprintf("[Zen %s]", strings.Join(parts, " · "))
+			}
+			if u.Credits != nil {
+				return fmt.Sprintf("[Zen $%.2f left]", *u.Credits)
+			}
+			if u.Remaining != nil {
+				return fmt.Sprintf("[Zen $%.3f left]", *u.Remaining)
+			}
+		}
+		// Generic credits provider.
+		if u.Remaining != nil {
+			return fmt.Sprintf("[%s $%.3f left]", title, *u.Remaining)
+		}
+	case proxy.UsageRequests:
+		// Request-metered providers: remaining/limit + reset window.
+		if u.RequestsLimit != nil && u.RequestsUsed != nil {
+			rem := *u.RequestsLimit - *u.RequestsUsed
+			reset := ""
+			if u.RequestsReset != nil {
+				reset = humanizeResetSeconds(*u.RequestsReset)
+			}
+			tok := fmt.Sprintf("[%s %d/%d", title, rem, *u.RequestsLimit)
+			if reset != "" {
+				tok += " · reset " + reset
+			}
+			return tok + "]"
+		}
+		if u.RequestsUsed != nil {
+			return fmt.Sprintf("[%s %d req]", title, *u.RequestsUsed)
+		}
+		if u.Percent != nil {
+			return fmt.Sprintf("[%s %d%%]", title, *u.Percent)
+		}
+	}
+	if u.Detail != "" {
+		return fmt.Sprintf("[%s —]", title)
+	}
+	return fmt.Sprintf("[%s —]", title)
+}
+
+// resetOf returns the ResetsAt of a window or "".
+func resetOf(w *proxy.WindowStat) string {
+	if w == nil {
+		return ""
+	}
+	return w.ResetsAt
+}

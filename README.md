@@ -6,6 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/raketenkater/ultra-zen)](https://goreportcard.com/report/github.com/raketenkater/ultra-zen)
 
 Run Claude Code — including Ultracode workflows — on free and low-cost models.
+Single Go binary, one install command, one setup command.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="ultra-zen-selector.png">
@@ -49,7 +50,33 @@ ultra-zen
 curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
 ```
 
-Or with Go:
+The script is POSIX `sh` (no bash required). It detects linux/darwin on
+amd64/arm64, downloads the matching release tarball from GitHub Releases,
+verifies the sha256 checksum when the release publishes `checksums.txt`, and
+installs both the `ultra-zen` binary and a `uz` symlink into `~/.local/bin`.
+When that directory is not on `PATH` it prints the exact `export PATH=...`
+line for your shell; it only appends that line to your shell config after you
+confirm (or when you pass `ULTRA_ZEN_ADD_PATH=1` — a piped run never writes
+files unprompted).
+
+```bash
+# System-wide instead (needs sudo, installs to /usr/local/bin for all users):
+curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh -s -- --system
+
+# Pick a version or a directory:
+ULTRA_ZEN_VERSION=v0.2.1 curl -fsSL ... | sh -s -- --dir=$HOME/bin
+```
+
+All three install locations:
+
+| Location        | How                                  | Notes                                   |
+|-----------------|--------------------------------------|-----------------------------------------|
+| `~/.local/bin`  | default (curl script, `make install`) | no root needed; ensure it is on `PATH`  |
+| `/usr/local/bin`| `--system` flag or `sudo make system` | system-wide, all users                  |
+| custom `--dir=` | `--dir=<dir>` or `ULTRA_ZEN_BINDIR`   | the PATH check applies the same way     |
+
+Or with Go (drop the binary in `$(go env GOPATH)/bin` and create the `uz`
+symlink there):
 
 ```bash
 go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest
@@ -60,17 +87,53 @@ From source:
 ```bash
 git clone https://github.com/raketenkater/ultra-zen
 cd ultra-zen
-make build
+make install     # builds, installs to GOBIN/GOPATH/bin + uz symlink, checks PATH
 ```
+
+### Quick start
+
+```bash
+uz setup providers   # store the keys you have (opencode Zen, OpenRouter, ...)
+uz                   # pick a model, launch Claude Code
+```
+
+Only what you actually use needs a key: opencode Zen needs `opencode auth
+login` (or paste its key into the setup prompt), OpenRouter needs a key from
+[openrouter.ai/keys](https://openrouter.ai/keys) — everything else is
+optional and can be added later with `k` in the picker or `uz keys set`.
+
+### Configure providers (`uz setup providers`)
+
+One command sets up keys — this is what makes ultra-zen config-free in
+practice: the binary, the `uz` launcher, and the keys all land without you
+touching a config file.
+
+It prints a per-provider table — which key source supplies each provider (env
+var, per-user store, system store, opencode's `auth.json`, codex login), the
+tier, and the live usage row when a proxy is running — then, for every
+provider without a key, offers a masked prompt. Each key is validated against
+the provider's cheapest endpoint (`GET /models`, OpenRouter's `GET /key`)
+before it is stored in `~/.config/ultra-zen/keys/` (mode `0600`), and is never
+printed back. Re-running is always safe; configured providers are skipped.
+
+Non-interactive alternative (the table is printed with the same recipes when
+stdin is a pipe):
+
+```bash
+echo <key> | uz keys set openrouter -
+uz keys set modelscope -        # paste, Ctrl-D to finish
+```
+
+`uz setup` (without `providers`) installs the binary + `uz` symlink into a bin
+dir of your choosing and verifies `PATH`; see [System-wide access](#system-wide-access-uz).
 
 ### Prerequisites
 
 - **Claude Code** on `PATH` (`npm i -g @anthropic-ai/claude-code`).
-- **opencode** logged in with the `opencode-go` provider:
-  `opencode auth login` → select the opencode provider. The API key is read
-  from `~/.local/share/opencode/auth.json` (or `~/.config/opencode/auth.json`).
-- **OpenRouter API key** (for `--provider openrouter`):
-  get one at [openrouter.ai/keys](https://openrouter.ai/keys).
+- **A key for at least one provider** (see Quick start). The default provider
+  opencode Zen reads the key from `~/.local/share/opencode/auth.json` (or
+  `~/.config/opencode/auth.json`) after `opencode auth login`, or from the
+  key store when you pasted it in `uz setup providers`.
 - **uvx** (optional) for web research — when present, `ultra-zen` wires a
   no-key DuckDuckGo MCP and disables the Anthropic-only `WebSearch` tool.
 
@@ -81,15 +144,49 @@ Every provider that needs a key is resolved in this order:
 1. **Flag / env var** — `--api-key`, `--openrouter-key`, or the provider's env
    var (`OPENROUTER_API_KEY`, `MODELSCOPE_API_KEY`, `GROQ_API_KEY`, ...).
 2. **The stored key** — `~/.config/ultra-zen/keys/<provider>` (one file per
-   provider, mode `0600`). Use the TUI's key manager (press `k` in the
-   selector) or write the file directly.
-3. **Interactive prompt** — when running interactively with no key set, the
+   provider, mode `0600`). Set once via `uz setup providers`, the TUI's key
+   manager (press `k` in the selector), or `uz keys set`.
+3. **The system-wide stored key** — `/etc/ultra-zen/keys/<provider>` (mode
+   `0644`, set up by `sudo ultra-zen setup --copy-keys`), so a shared
+   credential covers users with no personal key.
+4. **Interactive prompt** — when running interactively with no key set, the
    TUI asks you to paste one, then **saves it to the key store** so you only
    enter it once.
 
-Precedence is `flag/env` → `stored` → `prompt`, so an env var always wins over
-a stored key. Clearing a stored key (empty string) makes the prompt appear
-again.
+Precedence is `flag/env` → `stored (user)` → `stored (system)` → `prompt`, so
+an env var always wins over a stored key, and a per-user key always wins over a
+shared system key (any user can opt out of the shared credential for their own
+sessions). Clearing a stored key (empty string) makes the prompt appear again.
+
+### System-wide access (`uz`)
+
+`ultra-zen setup` installs the binary plus a `uz` symlink so the launcher is on
+`PATH` from any directory for any user on the machine, verifies the target
+directory is on `PATH` (printing the exact `export` line — and offering to
+write it into your shell config, only with your consent — when it is not), and
+initialises the shared key store at `/etc/ultra-zen/keys`:
+
+```bash
+sudo ultra-zen setup --copy-keys      # install to /usr/local/bin, share your keys
+uz --list                             # works from any directory, any user
+uz glm-5.1 -- --resume                # passthrough args, Claude Code stays in the cwd you launched from
+```
+
+- `uz` is a symlink to the same `ultra-zen` binary; nothing behaves differently
+  under either name. Claude Code is launched in the directory you ran it from
+  (ultra-zen never changes the working directory).
+- The system store is **world-readable (0644)** — any local user can read the
+  shared keys. This is the deliberate trade-off of "any user on the machine":
+  it is only appropriate for a trusted workstation. Prefer the per-user store
+  when you need a personal key that others can't read (a per-user key wins).
+- Writes to the system store need root: `sudo ultra-zen keys --system set
+  <provider> <key>`, `sudo ultra-zen keys --system clear <provider>`. The
+  `ULTRA_ZEN_SYSTEM_KEYS` env var redirects the store (mostly for testing).
+- `make system` and `install.sh --system` perform the same setup.
+- `make install` (like the curl script) installs to `GOBIN`/`GOPATH/bin`,
+  creates the `uz` symlink there, and warns with the exact `export PATH`
+  line when that directory is not on `PATH` — the classic
+  "installed but command not found" trap.
 
 ## Usage
 
@@ -140,6 +237,12 @@ environment. Lists `:free` models, including `qwen/qwen3-coder:free`,
 `deepseek/deepseek-chat:free`, `google/gemini-2.5-flash:free`, and
 `openrouter/free` (auto-routes to the best available free model).
 
+**GWDG SAIA** (`--provider saia`): uses the OpenAI-compatible Academic Cloud
+endpoint at `https://chat-ai.academiccloud.de/v1`. Set `SAIA_API_KEY`, or
+store the key once with `uz setup providers` or `uz keys set saia -`. Models
+are discovered live from SAIA; `qwen3-coder-next` is the recommended coding
+model.
+
 OpenRouter currently allows **50 free-model requests per day** on a free
 account. After the account has purchased at least **$10 in credits**, that
 allowance becomes **1,000 free-model requests per day**. The credits remain
@@ -149,23 +252,44 @@ spend $10 on free requests. See OpenRouter's current
 to 20 requests/minute; ultra-zen therefore paces one session to 20 RPM by
 default (`--openrouter-rpm 0` disables this).
 
-**Codex / ChatGPT subscription** (`--provider codex`): points at a local
-OpenAI-compatible endpoint backed by a ChatGPT Plus/Pro login — e.g.
-[ChatMock](https://github.com/RayBytes/ChatMock), which serves GPT-5 through the
-Codex OAuth client without an OpenAI API key. Start the endpoint, then:
+**Codex / ChatGPT subscription** (`--provider codex`): two backends, one flag.
 
-```bash
-export CODEX_BASE_URL=http://127.0.0.1:8000/v1
-ultra-zen --provider codex
-```
+1. **ChatGPT subscription (auto-detected)** — if you have the
+   [codex CLI](https://github.com/openai/codex) installed and logged in with a
+   ChatGPT Plus/Pro account, ultra-zen detects everything from
+   `~/.codex/auth.json` and talks directly to the ChatGPT backend (the OpenAI
+   Responses API). No URL, no key, no ChatMock:
 
-When run interactively, ultra-zen prompts for the key or URL if it isn't set,
-so you don't have to export anything up front.
+   ```bash
+   ultra-zen --provider codex          # auto-detect → pick a GPT model
+   ultra-zen --list --provider codex   # GPT-5.6-sol, GPT-5.5, GPT-5.4, …
+   ```
 
-**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere|modelscope`):
+   The model catalog is fetched live from `chatgpt.com/backend-api/codex/models`
+   with the account's bearer token, falling back to the codex CLI's own
+   `models_cache.json` if the endpoint is unreachable. Expiring access tokens
+   are refreshed automatically through the same OAuth flow the codex CLI uses,
+   and `auth.json` is rewritten atomically so the CLI stays in sync. The TUI's
+   start screen shows a **Codex (ChatGPT sub)** row whenever the login is
+   detected.
+
+2. **Local endpoint** — point at an OpenAI-compatible endpoint backed by a
+   ChatGPT login, e.g. [ChatMock](https://github.com/RayBytes/ChatMock), which
+   serves GPT-5 through the Codex OAuth client without an OpenAI API key:
+
+   ```bash
+   export CODEX_BASE_URL=http://127.0.0.1:8000/v1
+   ultra-zen --provider codex
+   ```
+
+When run interactively with neither a codex login nor a URL set, ultra-zen
+prompts for the endpoint URL. The explicit local endpoint always wins over
+auto-detection, so `CODEX_BASE_URL` / `--codex-url` are authoritative when set.
+
+**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere|modelscope|saia`):
 BYO-key OpenAI-compatible endpoints with their own free tiers, beyond opencode
-Zen. Each needs its own personal API key — set the provider's env var or pass
-`--api-key`:
+Zen. Each needs its own personal API key — set the provider's env var, pass
+`--api-key`, or store it once with `uz setup providers` / `uz keys set`:
 
 | `--provider`  | Env var            | Get a key                                           |
 |---------------|---------------------|-----------------------------------------------------|
@@ -174,6 +298,7 @@ Zen. Each needs its own personal API key — set the provider's env var or pass
 | `huggingface` | `HF_TOKEN`          | https://huggingface.co/settings/tokens               |
 | `cohere`      | `COHERE_API_KEY`    | https://dashboard.cohere.com/api-keys                |
 | `modelscope`  | `MODELSCOPE_API_KEY` | https://modelscope.ai/my/myaccesstoken               |
+| `saia`        | `SAIA_API_KEY`      | https://saia.gwdg.de/dashboard                       |
 
 ```bash
 ultra-zen --provider groq
@@ -312,6 +437,10 @@ cannot be combined with an explicit `--free-model` pool.
 - **free tier** (`https://opencode.ai/zen/v1`) — `*-free` models.
 - **OpenRouter** (`https://openrouter.ai/api/v1`) — `:free` models and
   `openrouter/free`.
+- **Codex / ChatGPT subscription** (`https://chatgpt.com/backend-api/codex`) —
+  the auto-detected backend's `GET /models` catalog (falling back to the codex
+  CLI's `models_cache.json`), listing the models a ChatGPT Plus/Pro account can
+  serve.
 
 Free pools keep the selected primary plus ordered OpenRouter routes in the
 local proxy. The proxy rotates only on rate-limit responses; ordinary invalid
@@ -329,6 +458,37 @@ The proxy (`internal/proxy`) translates both directions:
 | `stop_reason`                    | `finish_reason`                  |
 | SSE `message_start`…`message_stop` | SSE `data:` chunks             |
 
+For the auto-detected **ChatGPT subscription** backend, the proxy additionally
+bridges to the **OpenAI Responses API**: chat-completions requests are
+translated to `{model, input, instructions, tools, stream}` (the codex backend
+requires `stream:true` and rejects `store`/`max_output_tokens`), and the
+Responses SSE stream (`response.output_text.delta`, `response.output_item.done`,
+`response.completed`) is folded back into the chat-completions chunks the rest
+of the pipeline already handles. So the same battle-tested Anthropic↔OpenAI
+translation — tool-call repair, phantom-block fixes, reasoning folding — applies
+unchanged to ChatGPT models.
+
+The proxy advertises the full launch-provider model catalog at `/v1/models`, so
+Claude Code's `/model` command lists every model from the active provider (not
+just the selected one) and switches between them live. Two things make that
+work:
+
+- **Gateway discovery is enabled** — ultra-zen injects
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`, which makes Claude Code fetch
+  `/v1/models` from the proxy (verified against the installed Claude Code
+  binary). The `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` override is
+  deliberately NOT set: it would tell Claude Code the proxy IS first-party
+  Anthropic, which disables discovery.
+- **The catalog is pre-cached** — ultra-zen writes Claude Code's
+  `gateway-models.json` cache file directly before launch, so the `/model`
+  picker populates instantly without depending on Claude Code's own
+  startup-race-prone discovery fetch.
+- **Advertised ids survive the picker filter** — Claude Code's `/model`
+  gateway discovery drops any id that doesn't match `/(claude|anthropic)/i`, so
+  the proxy advertises every model under a `claude-<provider>-<model>` id (e.g.
+  `claude-codex-gpt-5.6-sol`) and routes it back to the real upstream model.
+  The display name stays the human model name.
+
 Reasoning models emit their answer in `reasoning_content`; the proxy surfaces
 it as a text block so Claude Code never sees an empty message.
 
@@ -338,7 +498,7 @@ The launcher sets:
 - `ANTHROPIC_BASE_URL` → the local proxy
 - `ANTHROPIC_AUTH_TOKEN=ultra-zen`, `ANTHROPIC_MODEL` + all tier vars → selected model
 - Watchdog/timeouts relaxed so a remote model never trips idle timers
-- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60` (compact early for smaller context windows)
+- `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=85` (compact before the proxy's emergency context rescue)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="ultra-zen-launch.png">
@@ -349,6 +509,11 @@ The launcher sets:
 A `PreToolUse` hook rewrites Workflow `agent()` scripts to set `stallMs` to
 the maximum safe value, so background fan-out never aborts a quiet model.
 
+Ultracode is on by default, and every session starts at the highest thinking
+budget (`--effort ultracode`): the injected `--settings` payload carries
+`"ultracode": true` and `"effortLevel": "ultracode"`. Your own `--effort` flag
+always wins.
+
 ### Web research
 The Anthropic-only `WebSearch` tool cannot run against the local proxy, so
 when `uvx` is present it is disabled and replaced with a no-key DuckDuckGo MCP
@@ -358,16 +523,37 @@ together as one block, so without `uvx` the built-in `WebSearch` is left
 untouched rather than disabling web research entirely. Your own
 `--disallowedTools` / `--mcp-config` / `--allowedTools` args always win.
 
+## Subcommands
+
+```bash
+ultra-zen keys                    # list providers and whether a key is stored
+ultra-zen keys set <p> <key>      # store a key ('-' reads stdin)
+ultra-zen keys clear <p>          # remove a stored key
+ultra-zen setup                   # install binary + uz symlink, verify PATH
+ultra-zen setup providers         # key status table + add missing keys
+ultra-zen sessions                # list recorded resumable sessions (this dir)
+ultra-zen resume                  # reopen the newest one
+ultra-zen usage                   # one-line per-provider usage (statusline hook)
+ultra-zen workflow-hook           # internal: Workflow stallMs rewrite (PreToolUse)
+```
+
+`keys --system ...` targets `/etc/ultra-zen/keys` (needs sudo). The `usage`
+alias `statusline` prints `[OR $0.013 left] [Zen 5h 42% · wk 10%] …`-style
+tokens and degrades to "no running ultra-zen proxy" so it never error-spams a
+statusline hook.
+
 ## Project layout
 
 ```
-cmd/ultra-zen/      entry point: selector + launcher + provider dispatch
+cmd/ultra-zen/      entry point: selector + launcher + subcommand dispatch
 internal/auth/      opencode auth.json reader (or env for OpenRouter)
-internal/models/    live model list from Zen gateway or OpenRouter
+internal/keys/      per-user (~/.config) + system (/etc) API-key store
+internal/models/    live model catalogs for every supported provider
 internal/proxy/     Anthropic↔OpenAI translation (request/response/stream)
 internal/claude/    env build + settings injection + exec
-internal/tui/       Bubble Tea model selector
+internal/tui/       Bubble Tea model selector + key/free-pool screens
 internal/workflow/  Workflow script rewriter (stallMs injection hook)
+internal/session/   launch recording + resume replay
 ```
 
 ## License

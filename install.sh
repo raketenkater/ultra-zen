@@ -1,237 +1,122 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+# ultra-zen installer — POSIX sh (no bash required, works under dash/busybox).
+# Usage:  curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
+# Args:   sh -s -- --system        install system-wide to /usr/local/bin via sudo
+#         sh -s -- --dir=<dir>     install into <dir>
+# Env:    ULTRA_ZEN_VERSION=v0.2.1 pin a version (default: latest release)
+#         ULTRA_ZEN_BINDIR=<dir>   install target (default ~/.local/bin)
+#         ULTRA_ZEN_SYSTEM=1       same as --system
+#         ULTRA_ZEN_ADD_PATH=1     consent to append the PATH export to your
+#                                  shell config non-interactively (a piped run
+#                                  never prompts and never writes without it)
+set -eu
 
-# ultra-zen installer — single-command setup
-# Usage: curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
-
-# Clean up the temp dir on any exit. TMPDIR is a global (set during main) so
-# this fires reliably even after main() returns — referencing an unset local
-# under `set -u` would error on every exit.
-cleanup() {
-    if [ "${TMPDIR_SET:-false}" = true ]; then
-        rm -rf "$TMPDIR"
-    fi
-}
-trap cleanup EXIT
-
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-# Configuration
 REPO="raketenkater/ultra-zen"
 BINARY="ultra-zen"
 BINDIR="${ULTRA_ZEN_BINDIR:-}"
-VERSION="${ULTRA_ZEN_VERSION:-latest}"
-INSTALL_DIR=""
-NEEDS_SUDO=false
-# Global (not function-local) so the EXIT trap below can reference it even
-# after main() returns; under `set -u` a trap on an unset local would error.
-TMPDIR=""
-TMPDIR_SET=false
+VERSION="${ULTRA_ZEN_VERSION:-}"
+SYSTEM="${ULTRA_ZEN_SYSTEM:-}"
+ADD_PATH="${ULTRA_ZEN_ADD_PATH:-}"
 
-log_info()  { echo -e "${GREEN}→${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}!${NC} $1"; }
-log_error() { echo -e "${RED}✗${NC} $1"; }
-log_step()  { echo -e "${CYAN}==>${NC} $1"; }
+log()  { printf '→ %s\n' "$1"; }
+warn() { printf '! %s\n' "$1"; }
+die()  { printf '✗ %s\n' "$1" >&2; exit 1; }
+confirm() { printf '%s' "$1"; read -r ans || return 1; [ "$ans" = y ] || [ "$ans" = Y ] || [ "$ans" = yes ]; }
 
-# --- Platform detection ---
-detect_platform() {
-    local os arch
+for arg in ${1+"$@"}; do
+  case "$arg" in
+    --system)   SYSTEM=1 ;;
+    --dir=*)    BINDIR="${arg#--dir=}" ;;
+    --add-path) ADD_PATH=1 ;;
+    *) die "unknown option: $arg (supported: --system, --dir=<dir>, --add-path)" ;;
+  esac
+done
 
-    case "$(uname -s)" in
-        Linux)  os="linux" ;;
-        Darwin) os="darwin" ;;
-        *)
-            log_error "Unsupported OS: $(uname -s)"
-            log_info "ultra-zen supports Linux and macOS."
-            log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
-            exit 1
-            ;;
-    esac
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64|Linux-amd64)   platform=linux_amd64 ;;
+  Linux-aarch64|Linux-arm64)  platform=linux_arm64 ;;
+  Darwin-x86_64)              platform=darwin_amd64 ;;
+  Darwin-arm64)               platform=darwin_arm64 ;;
+  *) die "unsupported platform $(uname -s)-$(uname -m); build from source: go install github.com/$REPO/cmd/ultra-zen@latest" ;;
+esac
 
-    case "$(uname -m)" in
-        x86_64|amd64) arch="amd64" ;;
-        aarch64|arm64) arch="arm64" ;;
-        *)
-            log_error "Unsupported architecture: $(uname -m)"
-            log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
-            exit 1
-            ;;
-    esac
+if [ -z "$VERSION" ]; then
+  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)
+  [ -n "$VERSION" ] || die "could not resolve the latest release; pin one: ULTRA_ZEN_VERSION=v0.2.1 curl ... | sh"
+fi
 
-    echo "${os}_${arch}"
-}
+if [ -z "$BINDIR" ]; then
+  if [ "$SYSTEM" = "1" ]; then BINDIR=/usr/local/bin; else BINDIR="$HOME/.local/bin"; fi
+fi
 
-# --- Find a writable install directory ---
-find_bindir() {
-    # User override
-    if [ -n "$BINDIR" ]; then
-        INSTALL_DIR="$BINDIR"
-        return
-    fi
+tarball="${BINARY}_${VERSION}_${platform}.tar.gz"
+log "installing ${VERSION} (${platform}) into ${BINDIR}"
+tmp=$(mktemp -d) || die "mktemp failed"
+trap 'rm -rf "$tmp"' EXIT INT TERM
 
-    # Try /usr/local/bin first (may need sudo)
-    if [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
-        INSTALL_DIR="/usr/local/bin"
-    elif [ -d "/usr/local/bin" ]; then
-        INSTALL_DIR="/usr/local/bin"
-        NEEDS_SUDO=true
-    elif [ -d "$HOME/.local/bin" ]; then
-        INSTALL_DIR="$HOME/.local/bin"
+curl -fsSL -o "$tmp/$tarball" "https://github.com/$REPO/releases/download/$VERSION/$tarball" \
+  || die "download failed; check https://github.com/$REPO/releases for published binaries"
+
+# Verify the checksum when the release publishes checksums.txt (goreleaser
+# does); a release without one is only a warning, never a hard failure.
+if curl -fsSL -o "$tmp/checksums.txt" "https://github.com/$REPO/releases/download/$VERSION/checksums.txt" 2>/dev/null; then
+  want=$(grep " $tarball\$" "$tmp/checksums.txt" | awk '{print $1}' | head -n 1 || true)
+  if [ -n "$want" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      echo "$want  $tmp/$tarball" | sha256sum -c - >/dev/null 2>&1 || die "checksum mismatch for $tarball"
+    elif command -v shasum >/dev/null 2>&1; then
+      echo "$want  $tmp/$tarball" | shasum -a 256 -c - >/dev/null 2>&1 || die "checksum mismatch for $tarball"
     else
-        INSTALL_DIR="$HOME/.local/bin"
-        mkdir -p "$INSTALL_DIR"
+      warn "no sha256 tool found; skipping checksum verification"
     fi
-}
+  fi
+else
+  warn "release $VERSION publishes no checksums.txt; skipping verification"
+fi
 
-# --- Resolve latest version ---
-resolve_version() {
-    if [ "$VERSION" != "latest" ]; then
-        echo "$VERSION"
-        return
-    fi
-    local tag
-    tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | \
-        grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"\(.*\)"/\1/')
-    if [ -z "$tag" ]; then
-        log_error "Could not determine latest release version."
-        log_info "Try pinning a version: curl -fsSL ... | ULTRA_ZEN_VERSION=v0.1.0 sh"
-        log_info "Or build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
-        exit 1
-    fi
-    echo "$tag"
-}
+tar -xzf "$tmp/$tarball" -C "$tmp"
+[ -f "$tmp/$BINARY" ] || die "archive did not contain $BINARY"
 
-# --- Main ---
-main() {
-    log_step "ultra-zen installer"
+mkdir -p "$BINDIR" || die "cannot create $BINDIR"
+if [ -w "$BINDIR" ]; then
+  cp "$tmp/$BINARY" "$BINDIR/"
+  chmod 0755 "$BINDIR/$BINARY"
+else
+  log "$BINDIR is not writable; using sudo (password prompt on your terminal)"
+  sudo cp "$tmp/$BINARY" "$BINDIR/" || die "sudo install failed"
+  sudo chmod 0755 "$BINDIR/$BINARY"
+fi
+ln -sf "$BINARY" "$BINDIR/uz" 2>/dev/null || sudo ln -sf "$BINARY" "$BINDIR/uz"
 
-    local platform version tarball url
+"$BINDIR/$BINARY" --version 2>/dev/null || warn "$BINDIR/$BINARY did not report a version"
 
-    platform=$(detect_platform)
-    version=$(resolve_version)
-    log_info "Platform: ${platform}, Version: ${version}"
+command -v claude >/dev/null 2>&1 \
+  || warn "Claude Code is not on PATH; install it: npm install -g @anthropic-ai/claude-code"
 
-    find_bindir
-    log_info "Install directory: ${INSTALL_DIR}"
-
-    # Download URL
-    tarball="${BINARY}_${version}_${platform}.tar.gz"
-    url="https://github.com/${REPO}/releases/download/${version}/${tarball}"
-
-    # Create temp dir. The temp path is stored in globals so the EXIT trap can
-    # remove it even after main() returns; the trap itself is installed once at
-    # the top of the script (see below).
-    TMPDIR=$(mktemp -d)
-    TMPDIR_SET=true
-
-    # Download
-    log_step "Downloading ${tarball}..."
-    if ! curl -fsSL --progress-bar -o "${TMPDIR}/${tarball}" "$url"; then
-        log_error "Download failed: ${url}"
-        log_info "The release may not yet have binaries for your platform."
-        log_info "Build from source: go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest"
-        exit 1
-    fi
-
-    # Extract
-    log_step "Extracting..."
-    tar -xzf "${TMPDIR}/${tarball}" -C "${TMPDIR}"
-
-    # Verify binary exists
-    if [ ! -f "${TMPDIR}/${BINARY}" ]; then
-        log_error "Binary not found in archive. Contents:"
-        ls -la "${TMPDIR}/"
-        exit 1
-    fi
-
-    # Install
-    log_step "Installing to ${INSTALL_DIR}..."
-    if [ "$NEEDS_SUDO" = true ]; then
-        log_info "Need sudo for ${INSTALL_DIR}"
-        sudo cp "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
-        sudo chmod +x "${INSTALL_DIR}/${BINARY}"
+case ":$PATH:" in *":$BINDIR:"*) : ;; *)
+  line="export PATH=\"$BINDIR:\$PATH\""
+  warn "$BINDIR is not on your PATH"
+  printf '  add it:  %s\n' "$line"
+  # Only write shell config with consent: an interactive y, or the explicit
+  # ULTRA_ZEN_ADD_PATH=1 for piped runs. Never silently.
+  if [ "$ADD_PATH" = 1 ] || { [ -t 0 ] && confirm "write this line into your shell config now? [y/N] "; }; then
+    rc="$HOME/.profile"
+    case "${SHELL##*/}" in zsh) rc="$HOME/.zshrc" ;; esac
+    [ -f "$rc" ] || rc="$HOME/.bashrc"
+    if [ -f "$rc" ] && grep -qF "$BINDIR" "$rc"; then
+      log "$rc already mentions $BINDIR; not touching it"
     else
-        cp "${TMPDIR}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
-        chmod +x "${INSTALL_DIR}/${BINARY}"
+      printf '\n# added by ultra-zen install\n%s\n' "$line" >> "$rc" \
+        && log "written to $rc — open a new shell or run: $line"
     fi
+  else
+    warn "PATH not updated (a piped run never writes without ULTRA_ZEN_ADD_PATH=1)"
+  fi
+  ;;
+esac
 
-    # Verify installation
-    if ! command -v "${BINARY}" >/dev/null 2>&1 && ! [ -x "${INSTALL_DIR}/${BINARY}" ]; then
-        log_warn "${BINARY} installed but may not be on PATH."
-        if [ "$INSTALL_DIR" = "$HOME/.local/bin" ]; then
-            log_info "Add to your shell config:"
-            echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-        fi
-    fi
+log "done. next steps:"
+echo "  uz setup providers   # store provider API keys (opencode Zen, OpenRouter, ...)"
+echo "  uz                   # pick a model and launch Claude Code"
 
-    # Final check
-    if "${INSTALL_DIR}/${BINARY}" --version >/dev/null 2>&1; then
-        log_info "$(${INSTALL_DIR}/${BINARY} --version)"
-        log_info "ultra-zen installed to ${INSTALL_DIR}/${BINARY}"
-    else
-        log_warn "Binary may not be functional: ${INSTALL_DIR}/${BINARY} --version"
-    fi
-
-    # --- Claude Code detection ---
-    echo ""
-    log_step "Checking prerequisites..."
-
-    local node_needed=false
-    local claude_installed=true
-
-    if ! command -v node >/dev/null 2>&1; then
-        node_needed=true
-    fi
-
-    if ! command -v claude >/dev/null 2>&1; then
-        claude_installed=false
-    fi
-
-    if [ "$node_needed" = true ]; then
-        log_warn "Node.js is not installed. Claude Code requires Node.js >= 18."
-        log_info "Install Node.js: https://nodejs.org"
-        echo ""
-    fi
-
-    if [ "$claude_installed" = false ]; then
-        log_warn "Claude Code is not installed or not on PATH."
-        if [ "$node_needed" = false ]; then
-            log_info "Install Claude Code:"
-            echo ""
-            echo "  npm install -g @anthropic-ai/claude-code"
-            echo ""
-        else
-            log_info "After installing Node.js, run:"
-            echo ""
-            echo "  npm install -g @anthropic-ai/claude-code"
-            echo ""
-        fi
-    else
-        log_info "Claude Code found: $(claude --version 2>/dev/null || echo 'installed')"
-    fi
-
-    # --- uvx check (for web research) ---
-    if ! command -v uvx >/dev/null 2>&1; then
-        log_warn "uvx not found — web research (DDG MCP) will be unavailable."
-        log_info "Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    fi
-
-    echo ""
-    log_step "Next steps:"
-    if [ "$claude_installed" = false ]; then
-        echo "  Install Claude Code (see above), then run: ultra-zen"
-    else
-        echo "  ultra-zen"
-    fi
-    echo ""
-    echo "  With OpenRouter:  OPENROUTER_API_KEY=sk-or-v1-... ultra-zen --provider openrouter"
-    echo "  With worker split: ultra-zen glm-5.1 --worker mini-max-m2.5"
-    echo "  Docs: https://github.com/raketenkater/ultra-zen"
-}
-
-main "$@"

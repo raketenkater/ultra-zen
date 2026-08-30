@@ -26,14 +26,6 @@ type keyManager struct {
 	quit bool
 }
 
-// providerDesc is the per-row description for the key manager list.
-func providerKeyDesc(p string) string {
-	if keys.Has(p) {
-		return "key stored — Enter to change, x to clear"
-	}
-	return "no key — Enter to set"
-}
-
 func newKeyManager() keyManager {
 	providers := []string{
 		"openrouter",
@@ -42,6 +34,7 @@ func newKeyManager() keyManager {
 		"cerebras",
 		"huggingface",
 		"cohere",
+		"saia",
 		"opencode-go",
 	}
 	// Keep a stable, readable order rather than map iteration order.
@@ -51,11 +44,8 @@ func newKeyManager() keyManager {
 	for _, p := range providers {
 		items = append(items, keyRow{p: p})
 	}
-	l := list.New(items, list.NewDefaultDelegate(), 60, 20)
-	l.Title = "API keys"
-	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(true)
-	l.SetShowHelp(false)
+	l := list.New(items, columnDelegate{}, 60, 20)
+	configureList(&l)
 	return keyManager{list: l, providers: providers}
 }
 
@@ -64,8 +54,15 @@ type keyRow struct {
 	p string
 }
 
-func (k keyRow) Title() string       { return k.p }
-func (k keyRow) Description() string { return providerKeyDesc(k.p) }
+func (k keyRow) Title() string { return k.p }
+
+// tailParts: presence is the fact; absence (empty tail) reads as "no key".
+func (k keyRow) tailParts() []string {
+	if keys.Has(k.p) {
+		return []string{"stored"}
+	}
+	return nil
+}
 func (k keyRow) FilterValue() string { return k.p }
 
 func (m *keyManager) Init() tea.Cmd { return nil }
@@ -148,15 +145,9 @@ func (m keyManager) View() string {
 	if m.editor != nil {
 		return m.editor.View()
 	}
-	var b string
-	b += titleStyle.Render("═══ ultra-zen ═══") + "\n"
-	b += subtitleStyle.Render("  API keys — Enter set/change · x clear · Esc back") + "\n\n"
-	b += m.list.View() + "\n"
-	if m.err != "" {
-		b += mutedStyle.Render("  error: "+m.err) + "\n"
-	}
-	b += mutedStyle.Render("  Keys are stored at " + keys.Path())
-	return b
+	body := m.list.View() + "\n" + mutedStyle.Render(keys.Path())
+	footer := mutedStyle.Render("enter set  x clear  esc back  ctrl+c quit")
+	return frame("keys", "", body, footer, m.err, m.list.Width()+4)
 }
 
 func (m *keyManager) restoreSelection(provider string) {
@@ -178,6 +169,7 @@ func buildKeyItems() []list.Item {
 		"cerebras",
 		"huggingface",
 		"cohere",
+		"saia",
 		"opencode-go",
 	}
 	sort.Strings(providers)
@@ -203,6 +195,8 @@ func providerHint(p string) string {
 		return "get one at https://huggingface.co/settings/tokens"
 	case "cohere":
 		return "get one at https://dashboard.cohere.com/api-keys"
+	case "saia":
+		return "manage keys at https://saia.gwdg.de/dashboard"
 	case "opencode-go":
 		return "managed by `opencode auth login`; a saved key overrides it"
 	default:

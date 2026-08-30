@@ -26,6 +26,30 @@ jobs:
       - name: Build
         run: go build ./cmd/ultra-zen/
 
+      - name: Gofmt
+        # Gofmt must pass on everything except a fixed set of pre-existing
+        # drifted files (missing trailing newlines, owned by other work).
+        # Anything NOT in the exclusion list that fails gofmt fails CI, so new
+        # drift cannot creep in. When one of these files is next touched,
+        # gofmt it and drop it from this list.
+        run: |
+          excluded="internal/auth/auth.go internal/claude/claude.go internal/flock/flock.go internal/flock/flock_test.go internal/models/recheck_test.go internal/workflow/workflow_test.go"
+          bad=""
+          for f in $(gofmt -l . | grep -v '^\.ggrun-cram-review/' || true); do
+            skip=""
+            for x in $excluded; do
+              [ "$f" = "$x" ] && skip=1 && break
+            done
+            [ -n "$skip" ] || bad="$bad $f"
+          done
+          if [ -n "$bad" ]; then
+            echo "gofmt drift (not excluded):$bad"
+            exit 1
+          fi
+
+      - name: Install script syntax
+        run: sh -n install.sh
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest

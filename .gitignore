@@ -1,5 +1,8 @@
 /ultra-zen
+/uz
 /dist/
 *.test
 *.out
 .env
+# workflow scratch worktrees (auto-created and cleaned up)
+.claude/worktrees/

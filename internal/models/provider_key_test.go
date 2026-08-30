@@ -26,6 +26,21 @@ func TestProviderKeyUsesSavedOpenCodeKey(t *testing.T) {
 	}
 }
 
+func TestSAIAProviderUsesEnvironmentThenStoredKey(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("SAIA_API_KEY", "saia-env-key")
+	if got := ProviderKey("saia", "", ""); got != "saia-env-key" {
+		t.Fatalf("SAIA env key = %q, want saia-env-key", got)
+	}
+	t.Setenv("SAIA_API_KEY", "")
+	if err := keys.Save("saia", "saia-stored-key"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ProviderKey("saia", "", ""); got != "saia-stored-key" {
+		t.Fatalf("SAIA stored key = %q, want saia-stored-key", got)
+	}
+}
+
 func TestListKeepsZenFreeModelsWhenGoTierUnavailable(t *testing.T) {
 	client := &http.Client{Transport: modelRoundTripFunc(func(req *http.Request) (*http.Response, error) {
 		status := http.StatusOK

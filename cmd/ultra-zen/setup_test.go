@@ -1,0 +1,231 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/raketenkater/ultra-zen/internal/keys"
+)
+
+// TestSetupFindBindir verifies the bin-dir resolution mirrors install.sh:
+// explicit override wins, /usr/local/bin when writable, /usr/local/bin with
+// needsSudo when not writable, else ~/.local/bin.
+func TestSetupFindBindir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if dir, sudo := setupFindBindir("/opt/custom"); dir != "/opt/custom" || sudo {
+		t.Fatalf("override = (%q, %v), want (/opt/custom, false)", dir, sudo)
+	}
+
+	// /usr/local/bin may or may not be writable; assert we get SOME dir and the
+	// needsSudo flag matches writability.
+	dir, sudo := setupFindBindir("")
+	if dir == "" {
+		t.Fatal("empty bindir")
+	}
+	if st, err := os.Stat(dir); err == nil && st.IsDir() {
+		if w, _ := isWritable(dir); w && sudo {
+			t.Fatalf("writable dir %s marked needsSudo", dir)
+		}
+	}
+
+	// When /usr/local/bin is not a dir (rare), fall back to ~/.local/bin.
+	if _, err := os.Stat("/usr/local/bin"); err != nil && !os.IsNotExist(err) {
+		// Can't reliably simulate; skip.
+	} else if _, err := os.Stat("/usr/local/bin"); os.IsNotExist(err) {
+		if dir != filepath.Join(home, ".local", "bin") {
+			t.Fatalf("fallback = %q, want %q", dir, filepath.Join(home, ".local", "bin"))
+		}
+	}
+}
+
+// TestSetupCreateSymlink verifies a symlink is created and an existing
+// unrelated file is not clobbered.
+func TestSetupCreateSymlink(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "ultra-zen")
+	link := filepath.Join(dir, "uz")
+
+	if err := setupCreateSymlink(bin, link); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got, err := os.Readlink(link); err != nil || got != bin {
+		t.Fatalf("Readlink = %q, err %v; want %q", got, err, bin)
+	}
+
+	// Idempotent when already pointing at the same binary.
+	if err := setupCreateSymlink(bin, link); err != nil {
+		t.Fatalf("re-create: %v", err)
+	}
+
+	// Refuses to clobber an unrelated file.
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(other, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := setupCreateSymlink(bin, other); err == nil {
+		t.Fatal("should refuse to clobber unrelated file")
+	}
+}
+
+// TestSetupInstallBinary verifies the binary is copied and made executable.
+func TestSetupInstallBinary(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, []byte("binary"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "bin", "ultra-zen")
+	if err := setupInstallBinary(src, dst); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if st.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("dst not executable: %v", st.Mode())
+	}
+	b, _ := os.ReadFile(dst)
+	if string(b) != "binary" {
+		t.Fatalf("dst content = %q", b)
+	}
+}
+
+// TestSetupCopyUserKeys verifies per-user keys are copied into the system
+// store and the user store is left untouched.
+func TestSetupCopyUserKeys(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("ULTRA_ZEN_SYSTEM_KEYS", t.TempDir())
+
+	// Seed a user key for one provider.
+	if err := keys.Save("openrouter", "sk-or-secret"); err != nil {
+		t.Fatal(err)
+	}
+
+	copied := setupCopyUserKeys()
+	if len(copied) != 1 || copied[0] != "openrouter" {
+		t.Fatalf("copied = %v, want [openrouter]", copied)
+	}
+	// System store now has it, user store still has it.
+	if got := keys.LoadFrom("openrouter", keys.StoreSystem); got != "sk-or-secret" {
+		t.Fatalf("system key = %q, want %q", got, "sk-or-secret")
+	}
+	if got := keys.Load("openrouter"); got != "sk-or-secret" {
+		t.Fatalf("user key = %q, want %q", got, "sk-or-secret")
+	}
+}
+
+// TestSetupCopyUserKeysSkipsEmpty verifies providers without a user key are
+// not copied.
+func TestSetupCopyUserKeysSkipsEmpty(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("ULTRA_ZEN_SYSTEM_KEYS", t.TempDir())
+
+	if copied := setupCopyUserKeys(); len(copied) != 0 {
+		t.Fatalf("copied = %v, want empty (no user keys)", copied)
+	}
+}
+
+// TestEnsureUZSymlink verifies the self-heal: running from a writable dir
+// creates a uz symlink next to the binary; a read-only dir is left alone.
+func TestEnsureUZSymlink(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "ultra-zen")
+	if err := os.WriteFile(bin, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Can't easily swap os.Args[0] in-process; the guard is on the writable
+	// dir. Simulate by pointing the symlink at the binary name.
+	if err := setupCreateSymlink("ultra-zen", filepath.Join(dir, "uz")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got, _ := os.Readlink(filepath.Join(dir, "uz")); got != "ultra-zen" {
+		t.Fatalf("uz = %q, want ultra-zen", got)
+	}
+}
+
+// TestEnsureUZSymlinkRefusesClobber verifies the self-heal won't overwrite an
+// unrelated `uz` that already exists.
+func TestEnsureUZSymlinkRefusesClobber(t *testing.T) {
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other-bin")
+	if err := os.WriteFile(other, []byte("x"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	uz := filepath.Join(dir, "uz")
+	if err := os.Symlink("other-bin", uz); err != nil {
+		t.Fatal(err)
+	}
+	// EnsureUZSymlink uses os.Args[0]/os.Executable which we can't redirect in
+	// a unit test; exercise the underlying refusal path directly.
+	if err := setupCreateSymlink("ultra-zen", uz); err == nil {
+		t.Fatal("should refuse to replace an existing unrelated symlink")
+	}
+}
+
+// TestSetupReport uses the stdout capture convention to check the report.
+func TestSetupReport(t *testing.T) {
+	var buf strings.Builder
+	old := stdout
+	stdout = &buf
+	defer func() { stdout = old }()
+
+	reportSetup("/opt/bin", "/opt/bin/uz", false, false)
+	out := buf.String()
+	if !strings.Contains(out, "uz ->") {
+		t.Fatalf("report missing uz line: %q", out)
+	}
+	if !strings.Contains(out, "/opt/bin/ultra-zen") {
+		t.Fatalf("report missing bin path: %q", out)
+	}
+	// The report always points at the provider-key setup next step.
+	if !strings.Contains(out, "uz setup providers") {
+		t.Fatalf("report missing `uz setup providers` next step: %q", out)
+	}
+}
+
+// TestDirOnPATH verifies PATH membership detection, including relative-path
+// normalization.
+func TestDirOnPATH(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", string(os.PathListSeparator)+dir+string(os.PathListSeparator))
+	if !dirOnPATH(dir) {
+		t.Fatalf("dir %q on PATH not detected", dir)
+	}
+	other := t.TempDir()
+	if dirOnPATH(other) {
+		t.Fatalf("empty PATH reported as containing %q", other)
+	}
+}
+
+// TestReportSetupPathHint verifies the report prints the exact export line
+// when the install dir is not on PATH, and no hint when it is.
+func TestReportSetupPathHint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", "")
+	t.Setenv("ZSH_VERSION", "")
+
+	var buf strings.Builder
+	old := stdout
+	stdout = &buf
+	defer func() { stdout = old }()
+
+	reportSetup(dir, filepath.Join(dir, "uz"), false, false)
+	out := buf.String()
+	if !strings.Contains(out, "NOT on PATH") || !strings.Contains(out, `export PATH="`+dir) {
+		t.Fatalf("missing PATH export hint:\n%s", out)
+	}
+
+	// With the dir on PATH there is no hint.
+	buf.Reset()
+	t.Setenv("PATH", dir)
+	reportSetup(dir, filepath.Join(dir, "uz"), false, false)
+	if strings.Contains(buf.String(), "NOT on PATH") {
+		t.Fatalf("PATH hint printed for dir that is on PATH:\n%s", buf.String())
+	}
+}

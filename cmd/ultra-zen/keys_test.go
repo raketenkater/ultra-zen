@@ -10,7 +10,7 @@ import (
 // validKeyProvider should accept every provider ultra-zen can store a key
 // for and reject everything else.
 func TestValidKeyProvider(t *testing.T) {
-	valid := []string{"openrouter", "opencode-go", "groq", "cerebras", "huggingface", "cohere", "modelscope"}
+	valid := []string{"openrouter", "opencode-go", "groq", "cerebras", "huggingface", "cohere", "modelscope", "saia"}
 	for _, p := range valid {
 		if !validKeyProvider(p) {
 			t.Errorf("validKeyProvider(%q) = false, want true", p)
@@ -21,6 +21,20 @@ func TestValidKeyProvider(t *testing.T) {
 		if validKeyProvider(p) {
 			t.Errorf("validKeyProvider(%q) = true, want false", p)
 		}
+	}
+}
+
+func TestKeysSetReadsSecretFromStdin(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+
+	oldStdin := stdin
+	stdin = strings.NewReader("saia-secret-from-stdin\n")
+	defer func() { stdin = oldStdin }()
+
+	cmdKeys([]string{"set", "saia", "-"})
+	if got := keys.Load("saia"); got != "saia-secret-from-stdin" {
+		t.Fatalf("stored SAIA key = %q, want stdin value", got)
 	}
 }
 

@@ -1,9 +1,13 @@
 package tui
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 )
@@ -25,10 +29,42 @@ func feedProvider(m *fallbackManager, provider string, ids ...string) {
 	m.rebuildList()
 }
 
-// toggleRow presses Enter on the row at index i (which toggles a model).
+// toggleRow presses Enter on the i-th model row (headers are not rows).
 func toggleRow(t *testing.T, m *fallbackManager, i int) {
-	m.list.Select(i)
+	selectModelRow(m, i)
 	m.toggle()
+}
+
+// selectModelRow positions the cursor on the i-th rowModel item, skipping
+// section headers — the pool list interleaves providers with headers, so raw
+// item indices carry no meaning.
+func selectModelRow(m *fallbackManager, i int) {
+	n := 0
+	for idx, item := range m.list.Items() {
+		if row, ok := item.(fallbackRow); ok && row.kind == rowModel {
+			if n == i {
+				m.list.Select(idx)
+				return
+			}
+			n++
+		}
+	}
+	panic("selectModelRow: index out of range")
+}
+
+// selectKindRow positions the cursor on the i-th fallbackRow of a given kind.
+func selectKindRow(m *fallbackManager, kind rowKind, i int) {
+	n := 0
+	for idx, item := range m.list.Items() {
+		if row, ok := item.(fallbackRow); ok && row.kind == kind {
+			if n == i {
+				m.list.Select(idx)
+				return
+			}
+			n++
+		}
+	}
+	panic("selectKindRow: index out of range")
 }
 
 func TestRoutesEmptyByDefault(t *testing.T) {
@@ -42,8 +78,8 @@ func TestToggleAddsAndRemovesFromOrder(t *testing.T) {
 	m := newFallbackManager("")
 	feedProvider(&m, "modelscope", "deepseek-ai/DeepSeek-V4-Flash", "ZhipuAI/GLM-5.2")
 
-	// Toggle the first model (index 0).
-	m.list.Select(0)
+	// Toggle the first model.
+	selectModelRow(&m, 0)
 	m.toggle()
 	routes := m.routes()
 	if len(routes) != 1 {
@@ -54,7 +90,7 @@ func TestToggleAddsAndRemovesFromOrder(t *testing.T) {
 	}
 
 	// Toggle it off again — order should be empty.
-	m.list.Select(0)
+	selectModelRow(&m, 0)
 	m.toggle()
 	if got := m.routes(); len(got) != 0 {
 		t.Fatalf("routes() after untoggle = %v, want empty", got)
@@ -150,13 +186,13 @@ func TestApplyLoadShowsMissingKey(t *testing.T) {
 func TestToggleKeepsExactCursorAndFooterOrder(t *testing.T) {
 	m := newFallbackManager("")
 	feedProvider(&m, "openrouter", "a:free", "b:free", "c:free")
-	m.list.Select(2)
+	selectModelRow(&m, 2)
 	m.toggle()
 	row, ok := m.list.SelectedItem().(fallbackRow)
 	if !ok || row.modelID != "c:free" {
 		t.Fatalf("cursor moved to %#v after toggle, want c:free", m.list.SelectedItem())
 	}
-	m.list.Select(0)
+	selectModelRow(&m, 0)
 	m.toggle()
 	got := m.orderKeys()
 	if len(got) != 2 || got[0] != "c:free" || got[1] != "a:free" {
@@ -182,6 +218,78 @@ func TestExistingPoolRestoredWhenReopened(t *testing.T) {
 	}
 }
 
+// markSlot renders the i-th model row and returns the gutter's mark column
+// (plain text, col 2 of the 4-col pool gutter).
+func markSlot(t *testing.T, m *fallbackManager, i int) string {
+	t.Helper()
+	var rows []int
+	for idx, item := range m.list.Items() {
+		if row, ok := item.(fallbackRow); ok && row.kind == rowModel {
+			rows = append(rows, idx)
+		}
+	}
+	item := m.list.Items()[rows[i]]
+	lm := list.New(m.list.Items(), columnDelegate{showMark: true}, 80, 20)
+	configureList(&lm)
+	var buf bytes.Buffer
+	// index -1 never matches the model's cursor, so the row renders unselected.
+	columnDelegate{showMark: true}.Render(&buf, lm, -1, item)
+	runes := []rune(ansi.Strip(buf.String()))
+	return string(runes[2])
+}
+
+func TestPoolRankDigitsInGutter(t *testing.T) {
+	m := newFallbackManager("")
+	feedProvider(&m, "openrouter", "a:free", "b:free", "c:free")
+	toggleRow(t, &m, 0) // order: a
+	toggleRow(t, &m, 1) // order: a, b
+
+	// In-pool rows carry their 1-based rotation rank; out-of-pool the off mark.
+	if got := markSlot(t, &m, 0); got != "1" {
+		t.Fatalf("rank of a:free = %q, want 1", got)
+	}
+	if got := markSlot(t, &m, 1); got != "2" {
+		t.Fatalf("rank of b:free = %q, want 2", got)
+	}
+	if got := markSlot(t, &m, 2); got != gMarkOff {
+		t.Fatalf("mark of c:free = %q, want %q", got, gMarkOff)
+	}
+
+	// Untoggle then retoggle a: it rejoins at the END of the order, so b
+	// becomes rank 1, a rank 2 — the off-mark swaps back to a digit.
+	toggleRow(t, &m, 0)
+	if got := markSlot(t, &m, 0); got != gMarkOff {
+		t.Fatalf("untoggled a:free = %q, want %q", got, gMarkOff)
+	}
+	toggleRow(t, &m, 0)
+	if got := markSlot(t, &m, 0); got != "2" {
+		t.Fatalf("retoggled a:free rank = %q, want 2 (rejoins order last)", got)
+	}
+	if got := markSlot(t, &m, 1); got != "1" {
+		t.Fatalf("b:free rank after a rejoined last = %q, want 1", got)
+	}
+}
+
+func TestPoolRankBeyondNineUsesGlyph(t *testing.T) {
+	m := newFallbackManager("")
+	ids := make([]string, 12)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("m%02d:free", i)
+	}
+	feedProvider(&m, "openrouter", ids...)
+	for i := range ids {
+		toggleRow(t, &m, i)
+	}
+	// Rank 10 cannot fit one gutter column: membership falls back to the on
+	// glyph, and the 4-col gutter (name at col 4) holds.
+	if got := markSlot(t, &m, 9); got != gMarkOn {
+		t.Fatalf("rank-10 row mark = %q, want %q", got, gMarkOn)
+	}
+	if got := markSlot(t, &m, 0); got != "1" {
+		t.Fatalf("rank-1 row mark = %q, want 1", got)
+	}
+}
+
 func TestFallbackKeyEntryIsInline(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := newFallbackManager("")
@@ -193,7 +301,9 @@ func TestFallbackKeyEntryIsInline(t *testing.T) {
 		}
 	}
 	m.rebuildList()
-	m.list.Select(0)
+	// The keyless provider renders as a status row under its section header;
+	// Enter on it must open the inline key editor.
+	selectKindRow(&m, rowNoKey, 0)
 	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.editor == nil {
 		t.Fatal("Enter did not open an inline editor")

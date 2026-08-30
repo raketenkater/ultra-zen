@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/raketenkater/ultra-zen/internal/workflow"
 )
@@ -25,15 +27,21 @@ const noTimeoutMS = 2147483647
 const contextWindowDefault = 200_000
 
 // Env returns the child environment that points Claude Code at the local proxy.
-// Every inference tier maps to the same model so background/subagent work stays
-// on the selected Zen model. The real ANTHROPIC_API_KEY is dropped so the dummy
-// auth token + base URL take effect.
+// Sonnet/opus tiers map to the selected Zen model; the small-fast tier (Claude
+// Code's permission classifier and other cheap background calls) maps to
+// fastModel, so those calls run on a cheap tier instead of competing with the
+// main loop on the same model's rate limit. An empty fastModel keeps the old
+// behavior: every tier on the selected model. The real ANTHROPIC_API_KEY is
+// dropped so the dummy auth token + base URL take effect.
 //
 // contextLength is the model's real context window in tokens as reported by the
 // gateway's GET /models endpoint. It sets CLAUDE_MAX_SESSION_TOKENS so Claude
 // Code knows the actual window and can compute the autocompact threshold
 // correctly. When zero (gateway didn't report it), a safe default is used.
-func Env(proxyURL, model string, contextLength int) []string {
+func Env(proxyURL, model, fastModel string, contextLength int) []string {
+	if fastModel == "" {
+		fastModel = model
+	}
 	maxTokens := contextLength
 	if maxTokens <= 0 {
 		maxTokens = contextWindowDefault
@@ -47,7 +55,9 @@ func Env(proxyURL, model string, contextLength int) []string {
 			"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
 			"API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT", "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS",
 			"CLAUDE_ENABLE_BYTE_WATCHDOG", "CLAUDE_ENABLE_STREAM_WATCHDOG",
-			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_MAX_SESSION_TOKENS":
+			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_MAX_SESSION_TOKENS",
+			"CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+			"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL":
 			continue
 		}
 		env = append(env, kv)
@@ -56,10 +66,19 @@ func Env(proxyURL, model string, contextLength int) []string {
 		"ANTHROPIC_BASE_URL="+proxyURL,
 		"ANTHROPIC_AUTH_TOKEN=ultra-zen",
 		"ANTHROPIC_MODEL="+model,
-		"ANTHROPIC_SMALL_FAST_MODEL="+model,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+model,
+		"ANTHROPIC_SMALL_FAST_MODEL="+fastModel,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+fastModel,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL="+model,
 		"ANTHROPIC_DEFAULT_OPUS_MODEL="+model,
+		// /model gateway discovery: Claude Code fetches /v1/models from the
+		// proxy when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set AND the
+		// base URL is NOT treated as first-party (hf() must be false). The proxy
+		// URL (127.0.0.1) already fails the api.anthropic.com host check, so no
+		// first-party override is set — and _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL
+		// must stay unset, because it would make hf() true and DISABLE discovery.
+		// The proxy advertises claude-prefixed ids so the discovery filter
+		// (/(claude|anthropic)/i) keeps them.
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1",
 		fmt.Sprintf("API_TIMEOUT_MS=%d", noTimeoutMS),
 		fmt.Sprintf("CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=%d", noTimeoutMS),
 		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",
@@ -68,20 +87,157 @@ func Env(proxyURL, model string, contextLength int) []string {
 		// Set the real context window so Claude Code's autocompaction engine
 		// knows exactly when to compact. Without this Claude Code defaults to a
 		// 200k assumption, so the conversation overflows the gateway's real limit
-		// and fails with "context_length" before compation ever triggers. The
-		// percentage override compacts earlier than the default ~92% to leave
-		// headroom for tool-call overhead that the tokeniser doesn't count.
+		// and fails with "context_length" before compaction ever triggers.
+		//
+		// Claude Code 2.1.x reads CLAUDE_CODE_AUTO_COMPACT_WINDOW (a token count,
+		// min'd against the model's window from /v1/models) for this, NOT
+		// CLAUDE_MAX_SESSION_TOKENS (verified: that var is absent from the 2.1.233
+		// binary). We set BOTH: the real one for the window, plus the legacy
+		// MAX_SESSION_TOKENS for older builds that still read it. The percentage
+		// override compacts close to the limit to maximise usable context while
+		// leaving a little headroom for tool-call overhead that the tokeniser
+		// doesn't count.
+		//
+		// CLAUDE_AUTOCOMPACT_PCT_OVERRIDE is intentionally NOT inherited from the
+		// environment: the Claude Code process itself exports a stray 70 into its
+		// child env (verified in this session), which would silently override the
+		// 85 default below. The inherited value is stripped in the loop above, so
+		// ultra-zen always applies its own default. Users who want a different
+		// threshold can set ultra-zen's own config (e.g. CLAUDE_AUTOCOMPACT_PCT
+		// through the settings file) rather than a raw env var Claude Code also
+		// manages.
+		fmt.Sprintf("CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d", maxTokens),
 		fmt.Sprintf("CLAUDE_MAX_SESSION_TOKENS=%d", maxTokens),
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70"),
+		fmt.Sprintf("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=%d", defaultAutocompactPCT),
 	)
 }
 
-// envOr returns the current environment value for key, or def if unset/empty.
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+// defaultAutocompactPCT is the fraction of the context window at which Claude
+// Code compacts. 85 is a middle ground between Claude Code's default ~92% and
+// the old 70% — enough headroom to avoid overflow but far more usable context
+// than compacting at 70%. It is a constant (not inherited from the env) so a
+// stray CLAUDE_AUTOCOMPACT_PCT_OVERRIDE exported by the host Claude process
+// cannot silently override it.
+const defaultAutocompactPCT = 85
+
+// GatewayCachePath returns the Claude Code gateway-models cache file that feeds
+// its /model command. The path is resolved exactly as the installed binary does:
+// Rms.join(Ln(), "cache", "gateway-models.json") where Ln() is the CONFIG dir —
+// CLAUDE_CONFIG_DIR if set, else ~/.claude — NOT the XDG cache dir. Verified by
+// decompiling the Claude Code 2.1.226 binary: Ln()=pn(()=>(bcc()??
+// gwe.join(vcc.homedir(),".claude")).normalize("NFC")), bcc()=CLAUDE_CONFIG_DIR,
+// _pu()=Rms.join(ypu(),"gateway-models.json"). The old code consulted
+// CLAUDE_CODE_GATEWAY_CACHE_DIR (which does not exist in the binary) and wrote to
+// ~/.cache/claude/cache, a file /model never reads — leaving the picker stale.
+func GatewayCachePath() string {
+	configDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if configDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		configDir = filepath.Join(home, ".claude")
 	}
-	return def
+	return filepath.Join(configDir, "cache", "gateway-models.json")
+}
+
+// legacyGatewayCachePath is the XDG-style path older Claude Code builds may
+// still read (~/.cache/claude/cache/gateway-models.json). WriteGatewayCache also
+// writes here as a belt-and-suspenders fallback so a catalog pre-write reaches
+// every binary variant.
+func legacyGatewayCachePath() string {
+	cache := os.Getenv("XDG_CACHE_HOME")
+	if cache == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		cache = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(cache, "claude", "cache", "gateway-models.json")
+}
+
+// GatewayCacheModel is one entry in the gateway-models cache file. It matches
+// the schema Claude Code validates with (hpu = {id, display_name?}.strip()).
+type GatewayCacheModel struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"display_name"`
+}
+
+// freeMarker is the trailing display-name suffix that flags an OpenRouter
+// free-tier model in Claude Code's /model picker. The gateway-cache schema is
+// only {id, display_name}, so the hint has to ride on the name; the id stays
+// byte-identical because Claude Code and the proxy route by it.
+const freeMarker = " (free)"
+
+// WithFreeMarker appends freeMarker to a display name unless it already ends in
+// a free marker, so applying it twice never produces "(free) (free)". The
+// already-marked check is case-insensitive and covers the exact suffix the
+// --all-models view adds (" (free)") in any casing. Blank names pass through.
+func WithFreeMarker(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return name
+	}
+	if strings.HasSuffix(strings.ToLower(name), "(free)") {
+		return name
+	}
+	return name + freeMarker
+}
+
+// WriteGatewayCache pre-writes Claude Code's /model gateway-models cache so the
+// picker shows the full catalog immediately on launch — without depending on
+// Claude Code's own (fragile) gateway discovery fetch (bpu) to populate it.
+//
+// Claude Code's cnn() reads this file and maps every entry into the /model
+// picker when CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY is set and the file's
+// baseUrl matches ANTHROPIC_BASE_URL. ultra-zen therefore writes exactly the
+// shape the binary expects: {baseUrl, fetchedAt, models:[{id, display_name}]}.
+//
+// models are the advertised catalog entries (already claude-prefixed ids, since
+// the /model discovery filter drops anything not matching /(claude|anthropic)/i).
+// baseURL must be the proxy URL passed to claude as ANTHROPIC_BASE_URL, byte-for-
+// byte, or cnn() ignores the cache.
+func WriteGatewayCache(baseURL string, models []GatewayCacheModel) error {
+	cache := map[string]any{
+		"baseUrl":   baseURL,
+		"fetchedAt": time.Now().UTC().Format(time.RFC3339),
+		"models":    models,
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return fmt.Errorf("encode gateway cache: %w", err)
+	}
+	// Primary: the path Claude Code's /model reader (cnn) actually reads.
+	path := GatewayCachePath()
+	if path == "" {
+		return fmt.Errorf("gateway cache path unavailable")
+	}
+	if err := writeGatewayCacheFile(path, data); err != nil {
+		return err
+	}
+	// Belt-and-suspenders: also write the legacy XDG path so older binaries that
+	// may read it still see the catalog. A failure here is non-fatal.
+	if legacy := legacyGatewayCachePath(); legacy != "" && legacy != path {
+		_ = writeGatewayCacheFile(legacy, data)
+	}
+	return nil
+}
+
+// writeGatewayCacheFile atomically writes the cache: temp file then rename, so a
+// concurrent Claude Code read never sees a partially-written cache.
+func writeGatewayCacheFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("gateway cache dir: %w", err)
+	}
+	tmp := path + ".ultra-zen-tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("gateway cache write: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("gateway cache replace: %w", err)
+	}
+	return nil
 }
 
 // SettingsJSON returns the inline --settings JSON injected at launch. It wires
@@ -94,21 +250,44 @@ func envOr(key, def string) string {
 // binary so the hook works even if ultra-zen is not on PATH.
 
 // SettingsJSON returns the settings payload passed via --settings. hookCmd is
-// the command to run for the Workflow PreToolUse hook (typically the absolute
-// path to the ultra-zen binary plus "workflow-hook").
+// the absolute path to the ultra-zen binary; it is used for the Workflow
+// PreToolUse hook (hookCmd + " workflow-hook") and the always-visible usage
+// statusline (hookCmd + " usage").
 //
-// The payload carries the ultracode flag. --settings replaces the project
-// .claude/settings.json for this session, so if ultracode is not emitted here a
-// project that opts in via its settings file would launch without it.
+// GATING: this payload is injected ONLY when ultra-zen launches Claude Code
+// (claude.Args adds --settings unless the user passed their own). Running
+// `claude` directly never sees it, so the statusline appears solely in uz->
+// launched sessions — never in standalone claude invocations.
+//
+// The payload carries the ultracode flag and the effort level. --settings
+// replaces the project .claude/settings.json for this session, so if ultracode
+// and effortLevel are not emitted here, a project that opts in via its settings
+// file (or sets an effortLevel there) would launch without either. The effort
+// default is "ultracode" (the build's maximum thinking budget); a user's
+// explicit --effort flag on the CLI wins because Args() only injects --effort
+// when the user didn't pass one.
 func SettingsJSON(hookCmd string) string {
+	// statusLine runs `uz usage` (also aliased `uz statusline`), which queries the
+	// running proxy's GET /v1/usage and prints one compact per-provider line.
+	// refreshInterval keeps it live even when the session is idle (e.g. after a
+	// free-tier limit resets); the command itself is <1ms on loopback and exits 0
+	// with "no running ultra-zen proxy" if the proxy file is missing, so it never
+	// error-spams the statusline.
+	statusLine := map[string]any{
+		"type":            "command",
+		"command":         hookCmd + " usage",
+		"refreshInterval": 30,
+	}
 	settings := map[string]any{
-		"ultracode": true,
+		"ultracode":    true,
+		"effortLevel":  defaultEffort,
+		"statusLine":   statusLine,
 		"hooks": map[string]any{
 			"PreToolUse": []map[string]any{
 				{
 					"matcher": "Workflow",
 					"hooks": []map[string]any{
-						{"type": "command", "command": hookCmd},
+						{"type": "command", "command": hookCmd + " workflow-hook"},
 					},
 				},
 			},
@@ -117,6 +296,11 @@ func SettingsJSON(hookCmd string) string {
 	b, _ := json.Marshal(settings)
 	return string(b)
 }
+
+// defaultEffort is the session-wide effort level ultra-zen sets as the general
+// default ("ultracode" — the build's maximum thinking budget). A user's
+// explicit --effort flag on the CLI wins over this injected setting.
+const defaultEffort = "ultracode"
 
 // Args returns the claude arguments: the selected model, the inline --settings,
 // and any user-supplied passthrough args. The explicit --model makes ultra-zen
@@ -138,11 +322,11 @@ func Args(model, hookCmd string, userArgs []string) []string {
 	if !hasArg(userArgs, "--settings") {
 		out = append(out, "--settings", SettingsJSON(hookCmd))
 	}
-	// Default to the highest effort ("max") so a fresh ultra-zen session starts
-	// at full thinking budget — matching the "ultracode effort" launch intent.
-	// If the user already passed --effort, leave theirs alone.
+	// Default to the highest effort ("ultracode") so a fresh ultra-zen session
+	// starts at full thinking budget — matching the "ultracode effort" launch
+	// intent. If the user already passed --effort, leave theirs alone.
 	if !hasArg(userArgs, "--effort") {
-		out = append(out, "--effort", "max")
+		out = append(out, "--effort", "ultracode")
 	}
 	out = append(out, workflowPromptArgs(userArgs)...)
 	out = append(out, researchArgs(userArgs)...)

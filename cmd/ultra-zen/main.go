@@ -29,6 +29,7 @@ import (
 
 	"github.com/raketenkater/ultra-zen/internal/auth"
 	"github.com/raketenkater/ultra-zen/internal/claude"
+	"github.com/raketenkater/ultra-zen/internal/codex"
 	"github.com/raketenkater/ultra-zen/internal/keys"
 	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/proxy"
@@ -49,7 +50,26 @@ const autoSourceMaxRoutes = 3
 // autoSourceOrder is the display order for probing other BYO free-tier
 // providers during automatic pool discovery (after the active provider, Zen,
 // and OpenRouter). Only providers with an already-stored key are ever loaded.
-var autoSourceOrder = []string{"modelscope", "groq", "cerebras", "huggingface", "cohere"}
+var autoSourceOrder = []string{"modelscope", "groq", "cerebras", "huggingface", "cohere", "saia"}
+
+// codexSub is set when the --provider codex launch auto-detected the ChatGPT
+// subscription (no explicit --codex-url). It switches the proxy's upstream wire
+// protocol to the Responses API and threads the ChatGPT-Account-ID header.
+var codexSub bool
+
+// codexAccountID is the ChatGPT account id from ~/.codex/auth.json, sent as the
+// ChatGPT-Account-ID header on codex-sub requests.
+var codexAccountID string
+
+// codexClientVersion returns the client_version string for the ChatGPT backend
+// model catalog, mirroring the installed codex CLI ("" falls back to a sensible
+// default the backend accepts).
+func codexClientVersion() string {
+	if v := codex.Version(); v != "" {
+		return v
+	}
+	return "0.147.0"
+}
 
 // modelFlag is a repeatable, comma-friendly model list. Keeping each selected
 // model explicit makes a free pool deterministic while still allowing the
@@ -84,10 +104,16 @@ func applySavedFreePool(freeModels modelFlag, modelID string, cliWorkerRequested
 // argv that opened the picker. Without this, a TUI launch records no model and
 // resume either opens the picker again or replays the model on the wrong
 // default provider.
-func tuiLaunchArgs(model, provider, worker string, freeModels modelFlag, port, openRouterRPM int) []string {
+func tuiLaunchArgs(model, provider, worker, fast string, freeModels modelFlag, port, openRouterRPM int) []string {
 	args := []string{model, "--provider", provider}
 	if worker != "" {
 		args = append(args, "--worker", worker)
+	}
+	// "auto" records as nothing: it is the default, and replaying an explicit
+	// auto from an old session whose catalog has changed could pick differently
+	// than the original launch did. "none" and explicit ids record verbatim.
+	if fast != "" && fast != "auto" {
+		args = append(args, "--fast-model", fast)
 	}
 	for _, route := range freeModels {
 		args = append(args, "--free-model", route)
@@ -103,7 +129,7 @@ func tuiLaunchArgs(model, provider, worker string, freeModels modelFlag, port, o
 
 // splitFreeModelSpec accepts provider-qualified free routes while keeping bare
 // OpenRouter model IDs backward compatible. The BYO-key providers
-// (modelscope/groq/cerebras/huggingface/cohere) mirror models.FreeTierProviders;
+// (modelscope/groq/cerebras/huggingface/cohere/saia) mirror models.FreeTierProviders;
 // codex is recognized but its models are subscription-backed (Free:false) and
 // are rejected by addRoute. Examples:
 //
@@ -130,6 +156,8 @@ func splitFreeModelSpec(value string) (provider, model string, err error) {
 		provider, model = "huggingface", strings.TrimPrefix(value, "huggingface:")
 	case strings.HasPrefix(value, "cohere:"):
 		provider, model = "cohere", strings.TrimPrefix(value, "cohere:")
+	case strings.HasPrefix(value, "saia:"):
+		provider, model = "saia", strings.TrimPrefix(value, "saia:")
 	case strings.HasPrefix(value, "codex:"):
 		provider, model = "codex", strings.TrimPrefix(value, "codex:")
 	default:
@@ -151,20 +179,153 @@ func freeTierModels(list []models.Model) []models.Model {
 	return models.SortByRecent(free, models.LoadRecent())
 }
 
+// advertisedModel is one provider/model pair advertised at /v1/models.
+type advertisedModel struct {
+	provider string
+	m        models.Model
+}
+
+// buildAdvertisedCatalog merges the full model catalogs of every reachable
+// provider into (a) the list Claude Code's /model command shows (cfg.Models)
+// and (b) the selectable upstreams that make each advertised model routable.
+// The primary provider's catalog comes first; OpenRouter, opencode Zen, then
+// the BYO free tiers follow. This deliberately widens the advertised/routable
+// set beyond the capped automatic-rotation pool so /model no longer hides a
+// provider's models — while leaving the rotation pool (cfg.Fallbacks) unchanged.
+//
+// primaryProvider is the active provider, selectedID the launch model the caller
+// already routes via its primary Upstream. The selected model is omitted from
+// the selectable set (it stays owned solely by the primary route so launch-time
+// routing, incl. the orchestrator/worker split, is preserved). primaryKind and
+// accountID carry the primary wire protocol + ChatGPT account id, inherited by
+// the primary provider's other selectable models (codex-sub needs both). The
+// free catalogs (zen/openrouter/BYO tiers) are already restricted to free models
+// by their List functions, so no further free-filtering is applied here.
+func buildAdvertisedCatalog(
+	primaryProvider, selectedID string,
+	primaryList, zenList, openRouterList []models.Model,
+	freeTierLists map[string][]models.Model,
+	byoProviders []string,
+	key, zenKey, openRouterKey string,
+	freeTierKeys map[string]string,
+	primaryKind, accountID string,
+) ([]proxy.ModelInfo, []proxy.Upstream) {
+	var advs []advertisedModel
+	seen := map[string]bool{}
+	keyOf := func(p, id string) string { return p + "\x00" + id }
+	add := func(p string, list []models.Model) {
+		if list == nil {
+			return
+		}
+		for _, m := range list {
+			if k := keyOf(p, m.ID); seen[k] {
+				continue
+			}
+			seen[keyOf(p, m.ID)] = true
+			advs = append(advs, advertisedModel{provider: p, m: m})
+		}
+	}
+
+	// Primary catalog first (paid + free; reachable with the primary key).
+	add(primaryProvider, primaryList)
+	// Each other provider's own free catalog, with its separately stored key.
+	if primaryProvider != "opencode-go" {
+		add("opencode-go", zenList)
+	}
+	if primaryProvider != "openrouter" {
+		add("openrouter", openRouterList)
+	}
+	for _, p := range byoProviders {
+		if p == primaryProvider {
+			continue // already merged via primaryList
+		}
+		add(p, freeTierLists[p])
+	}
+
+	routeKey := func(p string) string {
+		switch {
+		case p == primaryProvider:
+			return key
+		case p == "opencode-go":
+			return zenKey
+		case p == "openrouter":
+			return openRouterKey
+		default:
+			return freeTierKeys[p]
+		}
+	}
+
+	modelInfos := make([]proxy.ModelInfo, 0, len(advs))
+	selectable := make([]proxy.Upstream, 0, len(advs))
+	for _, a := range advs {
+		modelInfos = append(modelInfos, proxy.ModelInfo{
+			ID: a.m.ID, Name: a.m.Name, Provider: a.provider, ContextLength: a.m.ContextLength, Free: a.m.Free,
+		})
+		if a.provider == primaryProvider && a.m.ID == selectedID {
+			continue // primary model: owned solely by the primary route
+		}
+		u := proxy.Upstream{
+			Provider: a.provider, BaseURL: a.m.Base, APIKey: routeKey(a.provider),
+			Model: a.m.ID, ContextLength: a.m.ContextLength,
+		}
+		if a.provider == primaryProvider {
+			u.Kind = primaryKind
+			u.AccountID = accountID
+		}
+		selectable = append(selectable, u)
+	}
+	return modelInfos, selectable
+}
+
 // loadTUIProvider switches the primary backend when the all-provider start
 // screen selects a model outside the provider main initially loaded. The TUI
 // only offers providers whose credentials were discovered, so this path never
 // opens another prompt; it resolves the same flag/env/store/auth precedence as
 // the normal startup path and verifies the model list again before launch.
-func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string) ([]models.Model, string, error) {
+func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string, allModels bool) ([]models.Model, string, error) {
 	switch {
+	case provider == "codex-sub":
+		// Re-detect the ChatGPT subscription (same path as the --provider codex
+		// startup); sets the global flags so the proxy gets the Responses kind
+		// and account id.
+		auth, ok := codex.Detect()
+		if !ok {
+			return nil, "", fmt.Errorf("codex login is no longer available; run `codex login`")
+		}
+		if auth.NeedsRefresh() {
+			if err := codex.Refresh(client, auth); err == nil {
+				auth, _ = codex.Detect()
+			}
+		}
+		codexSub = true
+		codexAccountID = auth.AccountID
+		list, err := models.ListCodexSub(client, models.CodexSubBase, auth.AccessToken, auth.AccountID, codexClientVersion())
+		if err != nil {
+			cached, cacheErr := models.ListCodexModelsFromCache(models.CodexSubBase)
+			if cacheErr != nil {
+				return nil, "", err
+			}
+			list = cached
+		}
+		return list, auth.AccessToken, nil
 	case provider == "openrouter":
 		key := models.ProviderKey(provider, openRouterFlag, "")
 		if key == "" {
 			return nil, "", fmt.Errorf("OpenRouter key is no longer available")
 		}
-		list, err := models.ListOpenRouter(client, key)
-		return list, key, err
+		// Must match the primary fetch so a model picked in the picker (paid or
+		// ranked) is found here too — otherwise models.Find returns nil and the
+		// launch fails. Default = ranked with the free tier uncapped and the
+		// paid weekly top capped; --all-models = full.
+		if allModels {
+			list, err := models.ListOpenRouterAll(client, key)
+			return list, key, err
+		}
+		ranked, err := models.ListOpenRouterRanked(client, key)
+		if err != nil {
+			return nil, "", err
+		}
+		return models.CapOpenRouterPicker(ranked), key, nil
 	case provider == "opencode-go":
 		key := keys.Load("opencode-go")
 		if key == "" {
@@ -213,6 +374,26 @@ func main() {
 		cmdKeys(os.Args[2:])
 		return
 	}
+	// `usage` (alias `statusline`) prints a one-line per-provider usage snapshot
+	// for Claude Code's statusline from the running proxy. Missing proxy => print
+	// "no running ultra-zen proxy" and exit 0 so the statusline never error-spams.
+	if len(os.Args) > 1 && (os.Args[1] == "usage" || os.Args[1] == "statusline") {
+		cmdUsage()
+		return
+	}
+	// `setup` installs the binary + `uz` symlink system-wide, verifies PATH,
+	// and initialises the shared key store at /etc/ultra-zen/keys;
+	// `setup providers` shows the per-provider key status table and adds
+	// missing keys. See setup.go and setup_providers.go.
+	if len(os.Args) > 1 && os.Args[1] == "setup" {
+		cmdSetup(os.Args[2:])
+		return
+	}
+
+	// Self-heal: make sure a `uz` symlink exists next to the running binary so
+	// the launcher is on PATH after any install path (go install, make install,
+	// curl-pipe) that only drops the binary. Best-effort; never blocks a launch.
+	ensureUZSymlink()
 
 	// Redirect the proxy's log output (log.Printf in internal/proxy) to a file
 	// instead of stderr. Claude Code's TUI owns stderr, so any log line written
@@ -227,15 +408,17 @@ func main() {
 	var freeModels modelFlag
 	var (
 		authPath      = flag.String("auth", "", "path to opencode auth.json (default: auto)")
-		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, or codex")
+		provider      = flag.String("provider", "opencode-go", "backend provider: opencode-go, openrouter, saia, codex, or another supported free-tier provider")
 		openRouterKey = flag.String("openrouter-key", "", "OpenRouter API key (or set OPENROUTER_API_KEY)")
 		codexBaseURL  = flag.String("codex-url", "", "Codex endpoint base URL (or set CODEX_BASE_URL), e.g. http://127.0.0.1:8000/v1")
 		codexKey      = flag.String("codex-key", "", "Codex endpoint API key (or set CODEX_API_KEY)")
-		apiKey        = flag.String("api-key", "", "API key for --provider groq/cerebras/huggingface/cohere (or set that provider's own env var)")
+		apiKey        = flag.String("api-key", "", "API key for --provider saia/groq/cerebras/huggingface/cohere/modelscope (or set that provider's env var)")
 		workerModel   = flag.String("worker", "", "cheaper model for background sub-agents (orchestrator/worker split)")
+		fastModel     = flag.String("fast-model", "", "cheap model for Claude Code's small-fast tier (permission classifier etc.); default auto-picks a flash-tier model from the same provider, \"none\" keeps every tier on the main model")
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
+		allModels     = flag.Bool("all-models", false, "expose EVERY model (paid+free) from every provider; default shows every free OpenRouter model plus the top 100 most-used paid ones (by real usage)")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
 		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")
@@ -252,7 +435,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Providers:")
 		fmt.Fprintln(os.Stderr, "  --provider opencode-go   Zen gateway go + free tier (default, reads opencode auth)")
 		fmt.Fprintln(os.Stderr, "  --provider openrouter    OpenRouter free models (set OPENROUTER_API_KEY)")
-		fmt.Fprintln(os.Stderr, "  --provider codex         Local Codex endpoint (ChatGPT sub, e.g. ChatMock)")
+		fmt.Fprintln(os.Stderr, "  --provider saia          GWDG Academic Cloud SAIA (set SAIA_API_KEY or store a user key)")
+		fmt.Fprintln(os.Stderr, "  --provider codex         Codex: auto-detect the ChatGPT subscription (codex login) or a local endpoint")
 		fmt.Fprintln(os.Stderr, "  --provider groq          Groq free tier (set GROQ_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider cerebras      Cerebras free tier (set CEREBRAS_API_KEY or --api-key)")
 		fmt.Fprintln(os.Stderr, "  --provider huggingface   HuggingFace Inference router (set HF_TOKEN or --api-key)")
@@ -266,13 +450,21 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Legacy orchestrator/worker split:")
 		fmt.Fprintln(os.Stderr, "  --worker <model>         Use a cheaper model for background sub-agents")
 		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Small-fast tier (permission classifier):")
+		fmt.Fprintln(os.Stderr, "  --fast-model <model>     Cheap model for Claude Code's small-fast tier")
+		fmt.Fprintln(os.Stderr, "                           (default: auto-pick a flash-tier model; \"none\" = main model)")
+		fmt.Fprintln(os.Stderr, "")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	cliWorkerRequested := false
+	cliFastRequested := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "worker" {
 			cliWorkerRequested = true
+		}
+		if f.Name == "fast-model" {
+			cliFastRequested = true
 		}
 	})
 
@@ -311,6 +503,12 @@ func main() {
 		case strings.HasPrefix(arg, "--worker="):
 			*workerModel = strings.TrimPrefix(arg, "--worker=")
 			cliWorkerRequested = true
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--fast-model" && i+1 < len(claudeArgs):
+			*fastModel = claudeArgs[i+1]
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
+		case strings.HasPrefix(arg, "--fast-model="):
+			*fastModel = strings.TrimPrefix(arg, "--fast-model=")
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		case arg == "--free-model" && i+1 < len(claudeArgs):
 			_ = freeModels.Set(claudeArgs[i+1])
@@ -357,6 +555,9 @@ func main() {
 		case strings.HasPrefix(arg, "--port="):
 			*port, _ = strconv.Atoi(strings.TrimPrefix(arg, "--port="))
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
+		case arg == "--proxy-only":
+			*proxyOnly = true
+			claudeArgs = append(claudeArgs[:i], claudeArgs[i+1:]...)
 		case arg == "--resume-session" && i+1 < len(claudeArgs):
 			*resumeSession = claudeArgs[i+1]
 			claudeArgs = append(claudeArgs[:i], claudeArgs[i+2:]...)
@@ -398,6 +599,19 @@ func main() {
 	// open a TUI prompt for a missing key rather than exiting.
 	interactive := modelID == "" && !*listOnly
 
+	// First-run system setup: if system-wide access (uz + shared keys for all
+	// users) isn't set up yet, ask the user once whether to run it now. Only
+	// fires on a real interactive launch, never on --list/subcommands/scripts.
+	if interactive {
+		if exe, err := os.Executable(); err == nil {
+			if promptSystemSetup(exe) {
+				// setup ran (possibly with a password prompt). Continue the
+				// launch regardless; the system store now exists for future runs.
+				fmt.Fprintln(os.Stderr, "\nultra-zen: system-wide setup complete — continuing launch.")
+			}
+		}
+	}
+
 	switch def, isFreeTier := models.FreeTierProviders[*provider]; {
 	case isFreeTier:
 		k := *apiKey
@@ -438,7 +652,18 @@ func main() {
 		}
 		key = k
 		var err error
-		list, err = models.ListOpenRouter(httpClient, key)
+		if *allModels {
+			list, err = models.ListOpenRouterAll(httpClient, key)
+		} else {
+			// Default: the usage-ranked catalog (free block first, ordered by
+			// the weekly rankings) with the paid "most used" block capped so the
+			// picker stays usable — every :free model is kept.
+			var ranked []models.Model
+			ranked, err = models.ListOpenRouterRanked(httpClient, key)
+			if err == nil {
+				list = models.CapOpenRouterPicker(ranked)
+			}
+		}
 		if err != nil {
 			die(err)
 		}
@@ -447,15 +672,44 @@ func main() {
 		if base == "" {
 			base = os.Getenv("CODEX_BASE_URL")
 		}
-		if base == "" && interactive {
-			base = tui.PromptKey("Codex endpoint base URL", "e.g. http://127.0.0.1:8000/v1 (ChatMock)", false)
-		}
-		if base == "" {
-			die(fmt.Errorf("codex provider requires a base URL: set CODEX_BASE_URL or pass --codex-url\nPoint it at a local Codex endpoint (e.g. ChatMock on http://127.0.0.1:8000/v1)"))
-		}
 		ck := *codexKey
 		if ck == "" {
 			ck = os.Getenv("CODEX_API_KEY")
+		}
+		var codexErr error
+		if base == "" {
+			// No explicit local endpoint: fall back to the ChatGPT subscription
+			// auto-detected from the installed codex CLI's login. This is the
+			// zero-setup path — no CODEX_BASE_URL, no ChatMock, no key.
+			if auth, ok := codex.Detect(); ok {
+				if auth.NeedsRefresh() {
+					if err := codex.Refresh(httpClient, auth); err == nil {
+						auth, _ = codex.Detect()
+					}
+				}
+				codexSub = true
+				codexAccountID = auth.AccountID
+				base = models.CodexSubBase
+				key = auth.AccessToken
+				list, codexErr = models.ListCodexSub(httpClient, base, auth.AccessToken, auth.AccountID, codexClientVersion())
+				if codexErr != nil {
+					// The live catalog may be unreachable (network / rate limit);
+					// fall back to the codex CLI's own cached catalog.
+					cached, cacheErr := models.ListCodexModelsFromCache(base)
+					if cacheErr != nil {
+						die(fmt.Errorf("codex-sub: %w", codexErr))
+					}
+					list = cached
+					codexErr = nil
+				}
+				break
+			}
+			if interactive {
+				base = tui.PromptKey("Codex endpoint base URL", "e.g. http://127.0.0.1:8000/v1 (ChatMock)", false)
+			}
+		}
+		if base == "" {
+			die(fmt.Errorf("codex provider requires a base URL: set CODEX_BASE_URL or pass --codex-url\nPoint it at a local Codex endpoint (e.g. ChatMock on http://127.0.0.1:8000/v1), or `codex login` for the ChatGPT subscription"))
 		}
 		if ck == "" {
 			ck = "codex" // ChatMock ignores the key
@@ -471,7 +725,11 @@ func main() {
 		if storedKey != "" {
 			key = storedKey
 			var err error
-			list, err = models.List(httpClient, key)
+			if *allModels {
+				list, err = models.ListZenAll(httpClient, key)
+			} else {
+				list, err = models.List(httpClient, key)
+			}
 			if err != nil {
 				die(err)
 			}
@@ -491,7 +749,11 @@ func main() {
 		if err != nil {
 			die(err)
 		}
-		list, err = models.List(httpClient, key)
+		if *allModels {
+			list, err = models.ListZenAll(httpClient, key)
+		} else {
+			list, err = models.List(httpClient, key)
+		}
 		if err != nil {
 			die(err)
 		}
@@ -520,10 +782,10 @@ func main() {
 	var tuiFreePool []tui.FreeRoute
 	launchedFromTUI := false
 	if modelID == "" {
-		var workerPick, resumeID, tuiProvider string
+		var workerPick, fastPick, resumeID, tuiProvider string
 		var quit bool
-		res := tui.Run(list, *provider, buildResumeOption())
-		modelID, tuiProvider, workerPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.ResumeSessionID, res.Quit
+		res := tui.Run(list, *provider, buildResumeOption(), *allModels)
+		modelID, tuiProvider, workerPick, fastPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.Fast, res.ResumeSessionID, res.Quit
 		tuiFreePool = res.FreePool
 		if resumeID != "" {
 			cmdSessionResume(resumeID, nil)
@@ -535,7 +797,7 @@ func main() {
 		launchedFromTUI = true
 		if tuiProvider != "" && (tuiProvider != *provider || len(list) == 0 || key == "") {
 			var err error
-			list, key, err = loadTUIProvider(httpClient, tuiProvider, *authPath, *openRouterKey, *apiKey)
+			list, key, err = loadTUIProvider(httpClient, tuiProvider, *authPath, *openRouterKey, *apiKey, *allModels)
 			if err != nil {
 				die(fmt.Errorf("load TUI provider %s: %w", tuiProvider, err))
 			}
@@ -544,6 +806,11 @@ func main() {
 		// CLI --worker flag overrides TUI pick; TUI pick fills the default.
 		if *workerModel == "" && workerPick != "" && !freePoolRequested {
 			*workerModel = workerPick
+		}
+		// CLI --fast-model flag overrides TUI pick ("none"/explicit id/auto);
+		// the TUI's "" (Esc = auto) only fills when no flag was passed.
+		if !cliFastRequested && fastPick != "" {
+			*fastModel = fastPick
 		}
 	}
 	// A TUI-configured pool (from the 'f' screen) is folded into freeModels when
@@ -570,7 +837,7 @@ func main() {
 			}
 			plist, pkey := list, key
 			if poolProvider != *provider {
-				plist, pkey, err = loadTUIProvider(httpClient, poolProvider, *authPath, *openRouterKey, *apiKey)
+				plist, pkey, err = loadTUIProvider(httpClient, poolProvider, *authPath, *openRouterKey, *apiKey, *allModels)
 				if err != nil {
 					continue
 				}
@@ -628,7 +895,11 @@ func main() {
 			return fmt.Errorf("set OPENROUTER_API_KEY or pass --openrouter-key")
 		}
 		var err error
-		openRouterList, err = models.ListOpenRouter(httpClient, openRouterPoolKey)
+		if *allModels {
+			openRouterList, err = models.ListOpenRouterAll(httpClient, openRouterPoolKey)
+		} else {
+			openRouterList, err = models.ListOpenRouter(httpClient, openRouterPoolKey)
+		}
 		if err != nil {
 			return err
 		}
@@ -637,7 +908,7 @@ func main() {
 	}
 
 	// ensureFreeTier lazily loads the free-model list for a BYO-key free-tier
-	// provider (modelscope/groq/cerebras/huggingface/cohere). Caches per
+	// provider (modelscope/groq/cerebras/huggingface/cohere/saia). Caches per
 	// provider. Requires the key to already exist (flag/env/keys store) — no
 	// interactive prompt, because a TUI-configured pool already implies the user
 	// saw a key prompt in the picker.
@@ -661,7 +932,13 @@ func main() {
 			return fmt.Errorf("no key for %s; set %s or --api-key", p, def.EnvKey)
 		}
 		freeTierKeys[p] = k
-		list, err := models.ListFreeTierProvider(httpClient, p, k)
+		var list []models.Model
+		var err error
+		if *allModels {
+			list, err = models.ListFreeTierProviderAll(httpClient, p, k)
+		} else {
+			list, err = models.ListFreeTierProvider(httpClient, p, k)
+		}
 		if err != nil {
 			return err
 		}
@@ -682,7 +959,11 @@ func main() {
 		zenPoolKey = keys.Load("opencode-go")
 		if zenPoolKey != "" {
 			var err error
-			zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+			if *allModels {
+				zenList, err = models.ListZenAll(httpClient, zenPoolKey)
+			} else {
+				zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+			}
 			if err != nil {
 				return err
 			}
@@ -697,7 +978,11 @@ func main() {
 		if err != nil {
 			return err
 		}
-		zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+		if *allModels {
+			zenList, err = models.ListZenAll(httpClient, zenPoolKey)
+		} else {
+			zenList, err = models.ListZenFree(httpClient, zenPoolKey)
+		}
 		if err != nil {
 			return err
 		}
@@ -716,10 +1001,11 @@ func main() {
 		}
 		seenRoutes[key] = true
 		fallbackRoutes = append(fallbackRoutes, proxy.Upstream{
-			Provider: provider,
-			BaseURL:  model.Base,
-			APIKey:   routeKey,
-			Model:    model.ID,
+			Provider:      provider,
+			BaseURL:       model.Base,
+			APIKey:        routeKey,
+			Model:         model.ID,
+			ContextLength: model.ContextLength,
 		})
 	}
 
@@ -842,7 +1128,7 @@ func main() {
 					continue
 				}
 				addRoute("opencode-go", fallback, zenPoolKey)
-			case "modelscope", "groq", "cerebras", "huggingface", "cohere":
+			case "modelscope", "groq", "cerebras", "huggingface", "cohere", "saia":
 				if err := ensureFreeTier(poolProvider); err != nil {
 					warn("skip %s free fallback %q: %v", poolProvider, id, err)
 					continue
@@ -911,31 +1197,71 @@ func main() {
 		}
 	}
 
-	// Build the model list for /v1/models (Claude Code's /model command).
-	modelInfos := make([]proxy.ModelInfo, 0, len(list))
-	for _, m := range list {
-		modelInfos = append(modelInfos, proxy.ModelInfo{ID: m.ID, Name: m.Name})
+	// Build the /v1/models catalog (Claude Code's /model command) from the FULL
+	// catalog of every provider ultra-zen can reach, not just the primary plus
+	// the capped automatic-rotation pool. Each advertised model is also made
+	// selectable (routable) so /model shows — and honors — every available model.
+	//
+	// The ensure* closures load a provider's catalog only when a key exists and
+	// return immediately when already loaded, so this is safe and repeatable
+	// regardless of which free-pool branch ran above. A provider with no key is
+	// simply absent from the catalog.
+	primaryKind := ""
+	if codexSub {
+		primaryKind = proxy.UpstreamResponses
 	}
-	for _, route := range fallbackRoutes {
-		if models.Find(list, route.Model) == nil {
-			modelInfos = append(modelInfos, proxy.ModelInfo{ID: route.Model, Name: route.Model})
+	_ = ensureZen()
+	_ = ensureOpenRouter(false)
+	for _, p := range autoSourceOrder {
+		if p != *provider {
+			_ = ensureFreeTier(p)
 		}
 	}
+	modelInfos, selectable := buildAdvertisedCatalog(
+		*provider, selected.ID,
+		list, zenList, openRouterList, freeTierLists, autoSourceOrder,
+		key, zenPoolKey, openRouterPoolKey, freeTierKeys,
+		primaryKind, codexAccountID,
+	)
 
 	// Start the proxy.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	primaryUp := proxy.Upstream{
+		Provider:      *provider,
+		BaseURL:       selected.Base,
+		APIKey:        key,
+		Model:         selected.ID,
+		Kind:          primaryKind,
+		AccountID:     codexAccountID,
+		ContextLength: selected.ContextLength,
+	}
+	upstreams := make([]proxy.Upstream, 0, 1+len(fallbackRoutes)+len(selectable))
+	upstreams = append(upstreams, primaryUp)
+	upstreams = append(upstreams, fallbackRoutes...)
+	upstreams = append(upstreams, selectable...)
+
 	srv := proxy.New(proxy.Config{
 		Provider:      *provider,
 		BaseURL:       selected.Base,
 		APIKey:        key,
 		Model:         selected.ID,
+		Kind:          primaryKind,
+		AccountID:     codexAccountID,
 		WorkerModel:   *workerModel,
 		Fallbacks:     fallbackRoutes,
 		OpenRouterRPM: *openRouterRPM,
 		Port:          *port,
 		Models:        modelInfos,
+		Upstreams:     upstreams,
+		AllModels:     *allModels,
+		ContextLength: selected.ContextLength,
 		OnUnavailable: func(route proxy.Upstream) {
+			// Subscription-backed codex models are not account-gated free tiers;
+			// a transient denial should not hide them from future launches.
+			if codexSub && route.Provider == *provider {
+				return
+			}
 			if err := models.MarkUnavailable(route.Provider, route.Model); err != nil {
 				log.Printf("ultra-zen: could not remember unavailable %s model %s: %v", route.Provider, route.Model, err)
 			}
@@ -949,20 +1275,77 @@ func main() {
 		die(err)
 	}
 
+	// Pre-write Claude Code's /model gateway-models cache so the picker shows the
+	// full catalog immediately, without depending on Claude Code's own (fragile,
+	// startup-race-prone) discovery fetch. The ids must be the claude-prefixed
+	// advertised ids so they survive the /(claude|anthropic)/i picker filter.
+	gatewayModels := make([]claude.GatewayCacheModel, 0, len(modelInfos))
+	for _, m := range modelInfos {
+		display := proxy.ModelDisplayName(m.Name, m.Provider)
+		if *allModels {
+			if m.Free {
+				display = display + " (free)"
+			} else {
+				display = display + " (paid)"
+			}
+		}
+		// Free-tier OpenRouter models get a " (free)" marker in every view —
+		// the quota is account-wide and :free requests are capped per day, so
+		// the picker should make that tier obvious. Free-ness is authoritative
+		// from the catalog (m.Free, derived from the ":free" id suffix or the
+		// openrouter/free router by models.ListOpenRouter*), never from the
+		// display name. WithFreeMarker keeps this idempotent, so an entry the
+		// --all-models branch above already suffixed never double-marks. The ID
+		// is untouched: Claude Code and the proxy route by it, byte-identical.
+		if m.Provider == "openrouter" && m.Free {
+			display = claude.WithFreeMarker(display)
+		}
+		gatewayModels = append(gatewayModels, claude.GatewayCacheModel{
+			ID:          proxy.ClaudeModelID(m.Provider, m.ID),
+			DisplayName: display,
+		})
+	}
+	if err := claude.WriteGatewayCache(srv.BaseURL(), gatewayModels); err != nil {
+		warn("could not pre-write /model gateway cache: %v", err)
+	}
+
+	// Re-poll denied models while the session runs so a model that comes back
+	// (daily free limit reset, access restored) shows up again without waiting
+	// out the full 24h TTL in unavailable-models.json. Stops with ctx on exit.
+	models.StartRecheckPoller(ctx, httpClient, key)
+	srv.StartUsagePoller(ctx, httpClient)
+
 	if *proxyOnly {
 		fmt.Fprintf(os.Stderr, "ultra-zen proxy ready on %s (model=%s, upstream=%s)\n", srv.BaseURL(), selected.ID, selected.Base)
 		<-ctx.Done()
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "\n  ultra-zen ▸ %s  (%s)\n", selected.ID, selected.Base)
+	// Launch banner: plain stderr, NO ANSI (it interleaves with Claude Code's
+	// own colored banner). One fact per line, labels aligned — the summary of
+	// what is about to run.
+	fast := resolveFastModel(*fastModel, *provider, selected, list)
+	fmt.Fprintf(os.Stderr, "ultra-zen · %s\n", selected.ID)
 	if *workerModel != "" {
-		fmt.Fprintf(os.Stderr, "  worker    ▸ %s\n", *workerModel)
+		fmt.Fprintf(os.Stderr, "  worker     %s\n", *workerModel)
 	}
-	for i, fallback := range fallbackRoutes {
-		fmt.Fprintf(os.Stderr, "  fallback %d ▸ %s  (%s)\n", i+1, fallback.Model, fallback.BaseURL)
+	switch {
+	case fast != "" && fast != selected.ID:
+		fmt.Fprintf(os.Stderr, "  fast       %s\n", fast)
+	case fastTierCollapsed(*fastModel, fast, selected.ID):
+		// Tier-collapse guard: without a distinct fast model the permission
+		// classifier hammers the primary's rate limit right next to the main
+		// loop — say so instead of leaving it a silent mystery.
+		fmt.Fprintf(os.Stderr, "  fast       - same as primary: classifier shares the main rate limit\n")
 	}
-	fmt.Fprintf(os.Stderr, "  proxy on %s  →  claude\n\n", srv.BaseURL())
+	switch {
+	case len(fallbackRoutes) == 0:
+	case routeChain(fallbackRoutes) != "":
+		fmt.Fprintf(os.Stderr, "  fallbacks  %s\n", routeChain(fallbackRoutes))
+	default:
+		fmt.Fprintf(os.Stderr, "  fallbacks  %d routes\n", len(fallbackRoutes))
+	}
+	fmt.Fprintf(os.Stderr, "  proxy      %s\n\n", srv.BaseURL())
 
 	// Forward SIGINT/SIGTERM to claude and tear down the proxy.
 	sigCh := make(chan os.Signal, 1)
@@ -972,7 +1355,7 @@ func main() {
 		cancel()
 	}()
 
-	env := claude.Env(srv.BaseURL(), selected.ID, selected.ContextLength)
+	env := claude.Env(srv.BaseURL(), selected.ID, fast, selected.ContextLength)
 
 	// Resolve the ultra-zen binary path so the Workflow PreToolUse hook can
 	// invoke `ultra-zen workflow-hook` by absolute path (works even if ultra-zen
@@ -981,14 +1364,14 @@ func main() {
 	if exe, err := os.Executable(); err == nil {
 		hookBin = exe
 	}
-	args := claude.Args(selected.ID, hookBin+" workflow-hook", claudeArgs)
+	args := claude.Args(selected.ID, hookBin, claudeArgs)
 
 	cacheDir := sessionCacheDir()
 	sessionLaunchArgs := originalArgs
 	if launchedFromTUI {
-		sessionLaunchArgs = tuiLaunchArgs(selected.ID, *provider, *workerModel, freeModels, *port, *openRouterRPM)
+		sessionLaunchArgs = tuiLaunchArgs(selected.ID, *provider, *workerModel, *fastModel, freeModels, *port, *openRouterRPM)
 	}
-	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *port, sessionLaunchArgs)
+	sessionSpec, sessionErr := resolveLaunchSession(cacheDir, *resumeSession, *provider, selected.ID, *workerModel, *fastModel, *port, sessionLaunchArgs)
 	if sessionErr != nil {
 		cancel()
 		die(fmt.Errorf("resume: %w", sessionErr))
@@ -1021,7 +1404,7 @@ func main() {
 	runErr := cmd.Run()
 	// Record on exit as well as on launch: the workflow run ID is assigned
 	// inside Claude Code, so only now is the resume handle complete.
-	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *port, sessionLaunchArgs)
+	refreshSessionRecord(cacheDir, sessionSpec, *provider, selected.ID, *workerModel, *fastModel, *port, sessionLaunchArgs)
 	if runErr != nil {
 		cancel()
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
@@ -1030,6 +1413,115 @@ func main() {
 		die(runErr)
 	}
 	cancel()
+}
+
+// resolveFastModel picks the model for Claude Code's small-fast tier (the
+// permission classifier and other cheap background calls), so those calls stop
+// competing with the main loop on the primary model's rate limit.
+//
+//   - "none" (or "off") returns "" → Env keeps every tier on the main model
+//     (the pre-fast-model behavior).
+//   - An explicit model id resolves against the provider catalog and dies on an
+//     unknown id — a typo'd --fast-model should fail loudly, not silently fall
+//     back to a frontier model for every permission check.
+//   - Empty (the default) auto-picks the cheapest-looking model from the same
+//     provider's catalog: a speed-tier keyword in the id or name — flash,
+//     lightning, mini, lite, nano, tiny, small, xs (covering both opencode
+//     Zen's "glm-5.3-flash" and OpenRouter's free-catalog names like
+//     "nemotron-3.5-lightning" and "north-mini-code") — preferring free
+//     variants, and never the primary itself. If nothing matches — or the
+//     only candidate IS the primary — the main model is kept.
+//
+// When the resolved tier ends up equal to the primary (an explicit
+// --fast-model naming it, or an auto-pick that found no flash/mini/lite
+// sibling), fastTierCollapsed reports true so the launch banner warns that
+// every tier now shares one rate limit. "none" never warns: it is the
+// deliberate legacy choice, not a silent collapse.
+//
+// Deliberately NOT auto-substituting a cross-provider flash model here:
+// modelRoute (internal/proxy buildModelRoute) registers a route only for
+// models present in a loaded provider catalog, and none of those catalogs
+// contain a provably-routable cross-provider substitute that resolveFastModel
+// can see — an unroutable fast model would hard-fail every classifier call,
+// where the collapse merely shares the primary's quota. That trade is worse,
+// so the guard warns instead of substituting.
+//
+// The returned id is a plain gateway id; Env only emits env vars, and the proxy's
+// modelRoute resolves both plain and claude-prefixed spellings.
+func resolveFastModel(flagValue, provider string, primary *models.Model, list []models.Model) string {
+	switch strings.ToLower(strings.TrimSpace(flagValue)) {
+	case "", "auto":
+	case "none", "off":
+		return ""
+	default:
+		m := models.Find(list, flagValue)
+		if m == nil {
+			die(fmt.Errorf("fast model %q not found in %s catalog; run `ultra-zen --list` to see available models", flagValue, provider))
+		}
+		return m.ID
+	}
+	if primary == nil || len(list) == 0 {
+		return ""
+	}
+	best := ""
+	bestScore := -1
+	for _, m := range list {
+		if m.ID == primary.ID {
+			continue // never demote the classifier to the primary itself via auto-pick
+		}
+		// Segment match, not substring: "minimax-m3" contains "mini" but is a
+		// huge model — a plain Contains would misroute the classifier to it.
+		// Splitting on non-alphanumerics makes "glm-5.3-flash" → [glm 5.3 flash]
+		// while "minimax-m3" → [minimax m3] matches nothing.
+		hay := strings.ToLower(m.ID + " " + m.Name)
+		segs := strings.FieldsFunc(hay, func(r rune) bool {
+			return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+		})
+		var score int
+		for _, seg := range segs {
+			switch {
+			case seg == "flash", seg == "lightning":
+				score = 100
+			case seg == "mini", seg == "lite":
+				if score < 80 {
+					score = 80
+				}
+			case seg == "nano", seg == "tiny", seg == "small", seg == "xs":
+				if score < 70 {
+					score = 70
+				}
+			}
+		}
+		if score == 0 {
+			continue
+		}
+		if m.Free {
+			score += 10 // free variants spare the paid quota too
+		}
+		if score > bestScore {
+			best, bestScore = m.ID, score
+		}
+	}
+	return best
+}
+
+// fastTierCollapsed reports whether the resolved fast model leaves Claude
+// Code's small-fast tier on the primary model: either the auto-pick found no
+// flash/mini/lite sibling ("" → Env keeps every tier on the main model) or an
+// explicit --fast-model named the primary itself. In both cases the permission
+// classifier silently shares the main rate limit — worth surfacing at launch
+// so a hammered model is explainable. flagValue "none"/"off" is the deliberate
+// legacy choice and never warns; an explicit fast model that is not the
+// primary never warns either.
+func fastTierCollapsed(flagValue, fast, primaryID string) bool {
+	switch strings.ToLower(strings.TrimSpace(flagValue)) {
+	case "none", "off":
+		return false
+	}
+	if primaryID == "" {
+		return false
+	}
+	return fast == "" || fast == primaryID
 }
 
 // waitForHealth polls the proxy health endpoint until it responds or the
@@ -1057,6 +1549,21 @@ func waitForHealth(base string, timeout time.Duration) error {
 func die(err error) {
 	fmt.Fprintf(os.Stderr, "ultra-zen: %v\n", err)
 	os.Exit(1)
+}
+
+// routeChain renders the fallback pool as one arrow-joined line for the
+// launch banner. It returns "" when the chain would exceed 78 columns — the
+// banner then falls back to a route count instead of wrapping.
+func routeChain(routes []proxy.Upstream) string {
+	parts := make([]string, 0, len(routes))
+	for _, r := range routes {
+		parts = append(parts, r.Model)
+	}
+	chain := strings.Join(parts, " → ")
+	if len(chain) > 78 {
+		return ""
+	}
+	return chain
 }
 
 // warn reports a non-fatal problem to stderr (e.g. a stale free-pool route

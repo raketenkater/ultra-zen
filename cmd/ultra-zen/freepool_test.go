@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/raketenkater/ultra-zen/internal/keys"
+	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/tui"
 )
 
@@ -29,6 +30,7 @@ func TestSplitFreeModelSpec(t *testing.T) {
 		{"cerebras:llama-3.3-70b", "cerebras", "llama-3.3-70b"},
 		{"huggingface:qwen/qwen3-14b", "huggingface", "qwen/qwen3-14b"},
 		{"cohere:command-r", "cohere", "command-r"},
+		{"saia:qwen3-coder-next", "saia", "qwen3-coder-next"},
 		{"codex:gpt-5", "codex", "gpt-5"},
 	}
 	for _, test := range tests {
@@ -58,6 +60,7 @@ func TestFreeRouteStringRoundTrips(t *testing.T) {
 		{Provider: "openrouter", Model: "openrouter/free"},
 		{Provider: "opencode-go", Model: "laguna-s-2.1-free"},
 		{Provider: "groq", Model: "llama-3.3-70b-versatile"},
+		{Provider: "saia", Model: "qwen3-coder-next"},
 	}
 	for _, r := range routes {
 		provider, model, err := splitFreeModelSpec(r.String())
@@ -112,13 +115,31 @@ func TestApplySavedFreePoolHonorsExplicitOverrides(t *testing.T) {
 }
 
 func TestTUILaunchArgsRecordFinalProviderAndPool(t *testing.T) {
-	got := tuiLaunchArgs("zai-org/GLM-5.2", "modelscope", "", modelFlag{
+	got := tuiLaunchArgs("zai-org/GLM-5.2", "modelscope", "", "", modelFlag{
 		"modelscope:zai-org/GLM-5.2",
 		"opencode-go:deepseek-free",
 	}, 0, 20)
 	want := "zai-org/GLM-5.2,--provider,modelscope,--free-model,modelscope:zai-org/GLM-5.2,--free-model,opencode-go:deepseek-free"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("tuiLaunchArgs = %v, want %s", got, want)
+	}
+
+	// "auto" records as nothing (it is the launch default); "none" and explicit
+	// ids record verbatim so resume reproduces the original tier split.
+	got = tuiLaunchArgs("glm-5.2", "opencode-go", "", "auto", nil, 0, 20)
+	want = "glm-5.2,--provider,opencode-go"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs auto = %v, want %s", got, want)
+	}
+	got = tuiLaunchArgs("glm-5.2", "opencode-go", "", "none", nil, 0, 20)
+	want = "glm-5.2,--provider,opencode-go,--fast-model,none"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs none = %v, want %s", got, want)
+	}
+	got = tuiLaunchArgs("glm-5.2", "opencode-go", "", "glm-5.3-flash", nil, 0, 20)
+	want = "glm-5.2,--provider,opencode-go,--fast-model,glm-5.3-flash"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("tuiLaunchArgs explicit = %v, want %s", got, want)
 	}
 }
 
@@ -140,20 +161,26 @@ func TestLoadTUIProviderOpenRouter(t *testing.T) {
 			Request: req,
 		}, nil
 	})}
-	list, key, err := loadTUIProvider(client, "openrouter", "", "", "")
+	list, key, err := loadTUIProvider(client, "openrouter", "", "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if key != "stored-or-key" {
 		t.Fatalf("key = %q, want stored key", key)
 	}
-	if len(list) != 1 || list[0].ID != "vendor/free:free" {
-		t.Fatalf("models = %+v, want only free OpenRouter model", list)
+	// The reload now mirrors the picker (ranked top-100 / full catalog), so it
+	// must include paid models too — not just the free-only list. With no ranking
+	// data the models sort alphabetically; both are present.
+	if len(list) != 2 {
+		t.Fatalf("models = %+v, want both free and paid OpenRouter models", list)
+	}
+	if models.Find(list, "vendor/paid") == nil {
+		t.Fatal("paid model missing from TUI reload; picker selection would fail to resolve")
 	}
 }
 
 func TestLoadTUIProviderRejectsUnknown(t *testing.T) {
-	if _, _, err := loadTUIProvider(http.DefaultClient, "unknown", "", "", ""); err == nil {
+	if _, _, err := loadTUIProvider(http.DefaultClient, "unknown", "", "", "", false); err == nil {
 		t.Fatal("unknown TUI provider was accepted")
 	}
 }
