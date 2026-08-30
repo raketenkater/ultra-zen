@@ -1,8 +1,13 @@
 // Package tui is the interactive model selector shown before Claude Code
-// launches. It opens on a list of recommended and recently used
-// orchestrator/worker combos; choosing one launches immediately. Choosing
-// "pick manually" falls through to a two-step flow: pick the orchestrator, then
-// optionally pick a worker for background sub-agents.
+// launches. It opens on ONE screen: the resume row (when a resumable session
+// exists) pinned on top, then every launchable model grouped by provider with
+// a compact health token in each group header, then the preset combos, the
+// free-cycle row, and provider status rows. Enter on a model launches it
+// immediately — the orchestrator/worker steps are only reached through the
+// "manual" preset row for the rare case both tiers must be chosen by hand.
+// 'p' cycles a provider filter (the fast way off a drained gateway),
+// '/' filters as you type, 'f' opens the free-pool editor, 'k' the key
+// manager.
 package tui
 
 import (
@@ -17,6 +22,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/raketenkater/ultra-zen/internal/models"
+	"github.com/raketenkater/ultra-zen/internal/proxy"
 )
 
 // "The Column" design tokens: a gray ramp, one cyan accent (the cursor and
@@ -162,11 +168,21 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	if lw <= 0 {
 		return
 	}
-	// Section headers: one muted line, flush col 0, no cursor. The indent
-	// delta (col 0 vs col 2) is the only separation they need — no rules,
-	// no pills, no blank line above.
+	// Section headers: one muted line, flush col 0, no cursor. The health
+	// token rides at the end — "drained!" renders in alert red, "limited"
+	// muted (it is informational), "ok" muted; a header without data shows no
+	// token at all. The indent delta (col 0 vs col 2) is the only separation
+	// headers need — no rules, no pills, no blank line above.
 	if header, ok := item.(groupHeaderItem); ok {
-		fmt.Fprintf(w, "%s", mutedStyle.Render(header.line()))
+		line := header.line()
+		switch {
+		case header.health == "":
+			fmt.Fprintf(w, "%s", mutedStyle.Render(line))
+		case header.health == "drained!":
+			fmt.Fprintf(w, "%s %s", mutedStyle.Render(line), alertStyle.Render(header.health))
+		default:
+			fmt.Fprintf(w, "%s %s", mutedStyle.Render(line), mutedStyle.Render(header.health))
+		}
 		return
 	}
 	t, ok := item.(tailer)
@@ -408,13 +424,17 @@ func (i providerStatusItem) tailParts() []string {
 }
 func (i providerStatusItem) FilterValue() string { return i.provider + " status" }
 
-// groupHeaderItem is a non-selectable one-line section label ("most used · 100")
-// rendered flush col 0, muted. It is skipped on Enter (see Update): landing the
+// groupHeaderItem is a non-selectable one-line section label ("most used · 100 ·
+// ok") rendered flush col 0, muted. The optional health token (from the
+// launch-time usage snapshots) rides at the end so provider state reads at a
+// glance in the one-screen list; "drained!" is the one token styled in alert
+// red by the delegate. Headers are skipped on Enter (see Update): landing the
 // cursor on one moves to the next real row, so headers never get mistaken for
 // models and never block selection.
 type groupHeaderItem struct {
-	label string // e.g. "OpenRouter" or "Most used" (rendered lowercased)
-	count int
+	label  string // e.g. "OpenRouter" or "Most used" (rendered lowercased)
+	count  int
+	health string // "" | "ok" | "limited" | "drained!"
 }
 
 // line is the rendered header text. The label field keeps its original case
@@ -486,6 +506,20 @@ const (
 	stepFallbacks
 )
 
+// providerFilter is the 'p'-cycled filter over the one-screen list. all is the
+// opening state; a named provider state shows only that provider's groups
+// (headers, models, status rows) — the fast path when one gateway is drained.
+// keep remembers the row selected before the filter started, so cycling back
+// to all restores the user's original pick instead of wherever the filtered
+// lists left the cursor.
+type providerFilter struct {
+	provider string // "" = all providers visible
+	keep     string // startItemKey to restore when the cycle returns to all
+}
+
+// off returns true when no provider filter is active.
+func (f providerFilter) off() bool { return f.provider == "" }
+
 type model struct {
 	list        list.Model
 	all         []models.Model // for rebuilding lists between steps
@@ -498,7 +532,6 @@ type model struct {
 	quit        bool
 	subtitle    string
 	step        step
-	hasCombos   bool
 	keys        *keyManager      // non-nil while the key manager screen is open
 	fallbacks   *fallbackManager // non-nil while the fallback pool screen is open
 	catalog     *fallbackManager // background free-provider discovery
@@ -509,6 +542,7 @@ type model struct {
 	poolErr     string
 	usage       map[string]usageSnapshot // launch-time per-provider usage (set when usageLoaded arrives)
 	allModels   bool                     // --all-models: show paid+free, grouped by tier
+	filter      providerFilter           // 'p'-cycled provider scope of the one-screen list
 }
 
 func (m model) Init() tea.Cmd {
@@ -538,6 +572,47 @@ func (m *model) openFallbacks() tea.Cmd {
 	return m.fallbacks.Init()
 }
 
+// providerHealth renders the compact health token shown in a provider group
+// header: "ok" while the provider has headroom, "limited" when its usage row
+// reports heavy consumption or a rate-limited window, "drained!" when the
+// gateway is exhausted. No usage data (fetch still running, provider without
+// a live usage API) renders nothing — absence of data must not read as health.
+func providerHealth(u *proxy.ProviderUsage) string {
+	if u == nil {
+		return ""
+	}
+	if u.Exhausted {
+		return "drained!"
+	}
+	limited := false
+	if p := u.Percent; p != nil && *p >= 80 {
+		limited = true
+	}
+	if u.Kind == proxy.UsageCredits {
+		for _, w := range []*proxy.WindowStat{u.Rolling, u.Weekly, u.Monthly, u.Daily} {
+			if w == nil {
+				continue
+			}
+			if w.State != "" && w.State != "ok" {
+				limited = true
+			}
+			if w.Percent >= 80 {
+				limited = true
+			}
+		}
+	}
+	if limited {
+		return "limited"
+	}
+	return "ok"
+}
+
+// startItems builds the ONE screen: resume row pinned on top, then the
+// primary provider's models, the discovered providers' models, the preset
+// combos (recent, recommended, manual), the free-cycle row, and provider
+// status rows. The 'p' provider filter restricts which provider groups are
+// included; provider-unspecific rows (resume, presets, free-cycle) stay
+// visible under every filter.
 func (m *model) startItems() []list.Item {
 	var routes []FreeRoute
 	var catalogModels []availableProviderModel
@@ -551,24 +626,11 @@ func (m *model) startItems() []list.Item {
 	if len(m.freePool) > 0 {
 		cycle.first = m.freePool[0].String()
 	}
-	items := []list.Item{cycle}
-	// Launch-time per-provider usage summary (OpenRouter credits, Zen 5h window)
-	// is rendered as a status line in the frame, NOT as a list item — it is
-	// informational, never selectable, so it can never be mistaken for a model.
+	var items []list.Item
+	// The resume row is the pinned top row: resuming the recorded session is
+	// the one job a model list cannot serve, and it never moves.
 	if m.resume != nil {
 		items = append(items, resumeItem{opt: *m.resume})
-	}
-	// Presets group: recommended + recent combos, then the manual fall-through.
-	combos := buildComboItems(m.all)
-	var presets []list.Item
-	for _, item := range combos {
-		if combo, ok := item.(comboItem); ok {
-			presets = append(presets, combo)
-		}
-	}
-	if len(presets) > 0 {
-		items = append(items, groupHeaderItem{label: "Presets", count: len(presets)})
-		items = append(items, presets...)
 	}
 	// Every model from the initially selected provider is directly launchable;
 	// the manual row remains for the legacy orchestrator/worker flow. The free
@@ -579,10 +641,16 @@ func (m *model) startItems() []list.Item {
 	for _, model := range m.all {
 		local[model.ID] = true
 	}
-	primaryModels := buildModelItems(m.all)
-	if len(primaryModels) > 0 {
-		items = append(items, groupHeaderItem{label: groupLabel(m.provider), count: len(primaryModels)})
-		items = append(items, primaryModels...)
+	if m.filter.showProvider(m.provider) {
+		primaryModels := buildModelItems(m.all)
+		if len(primaryModels) > 0 {
+			items = append(items, groupHeaderItem{
+				label:  groupLabel(m.provider),
+				count:  len(primaryModels),
+				health: m.healthFor(m.provider),
+			})
+			items = append(items, primaryModels...)
+		}
 	}
 	// Secondary providers are grouped into their own sections, rendered in the
 	// stable poolProviders display order. OpenRouter is labeled "Most used"
@@ -599,12 +667,30 @@ func (m *model) startItems() []list.Item {
 	}
 	for _, p := range poolProviders {
 		rows, ok := secondary[p]
-		if !ok {
+		if !ok || !m.filter.showProvider(p) {
 			continue
 		}
-		items = append(items, groupHeaderItem{label: groupLabel(p), count: len(rows)})
+		items = append(items, groupHeaderItem{
+			label:  groupLabel(p),
+			count:  len(rows),
+			health: m.healthFor(p),
+		})
 		items = append(items, rows...)
 	}
+	// Presets group: recent/recommended combos plus the manual fall-through,
+	// BELOW the model groups — the common path is model→Enter, and a preset is
+	// the rarer both-tiers-by-hand job. buildComboItems always ends with the
+	// manual row, so the orchestrator/worker flow stays reachable even when no
+	// combo qualifies.
+	presets := buildComboItems(m.all)
+	if len(presets) > 0 {
+		items = append(items, groupHeaderItem{label: "Presets", count: len(presets)})
+		items = append(items, presets...)
+	}
+	// The free-cycle row closes the selectable rows: the rotation pool is
+	// reachable under every filter but out of the main path. It also
+	// guarantees the list is never empty.
+	items = append(items, cycle)
 	// Providers without a usable model list are scattered nowhere: each kind
 	// collapses into one trailing section, provider per row, state in the
 	// tail. The user still sees free models exist (loading) or what to fix
@@ -613,6 +699,9 @@ func (m *model) startItems() []list.Item {
 		var loadingRows, keylessRows, errorRows []list.Item
 		for _, row := range m.catalog.statusRows() {
 			if st, ok := row.(providerStatusItem); ok {
+				if !m.filter.showProvider(st.provider) {
+					continue
+				}
 				switch st.kind {
 				case "loading":
 					loadingRows = append(loadingRows, row)
@@ -638,6 +727,110 @@ func (m *model) startItems() []list.Item {
 		}
 	}
 	return items
+}
+
+// showProvider reports whether a provider's rows belong on the currently
+// filtered one-screen list. The empty filter shows everything.
+func (f providerFilter) showProvider(p string) bool {
+	return f.off() || f.provider == p
+}
+
+// healthFor looks up the provider's health token from the launch-time usage
+// snapshots; providers without a snapshot render no token.
+func (m *model) healthFor(provider string) string {
+	if m.usage == nil {
+		return ""
+	}
+	return providerHealth(m.usage[provider].Usage)
+}
+
+// cycleProviderFilter is the 'p' binding: all providers → primary provider →
+// each discovered provider in poolProviders order → back to all. The cursor
+// stays on the same row when it survives the refilter (startItemKey match),
+// otherwise it drops to the first selectable row.
+func (m *model) cycleProviderFilter() tea.Cmd {
+	// Cycle order: "" (all) → primary → discovered providers.
+	order := append([]string{""}, m.filterCycle()...)
+	idx := -1
+	for i, p := range order {
+		if p == m.filter.provider {
+			idx = i
+			break
+		}
+	}
+	next := ""
+	if idx >= 0 && idx+1 < len(order) {
+		next = order[idx+1]
+	} else if len(order) > 0 {
+		next = order[0]
+	}
+	keep := startItemKey(m.list.SelectedItem())
+	if m.filter.off() {
+		// Leaving the unfiltered view: remember what the user had under the
+		// cursor so coming full circle can restore it.
+		m.filter.keep = keep
+	}
+	m.filter.provider = next
+	cmd := m.list.SetItems(m.startItems())
+	if next == "" {
+		// Back to all: restore the pre-filter pick when it still exists.
+		keep = m.filter.keep
+	}
+	found := false
+	if keep != "" {
+		for i, item := range m.list.Items() {
+			if startItemKey(item) == keep {
+				m.list.Select(i)
+				m.ensureSelectable()
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		if i := m.firstLaunchable(); i >= 0 {
+			m.list.Select(i)
+		}
+	}
+	return cmd
+}
+
+// filterCycle returns the providers the 'p' key cycles through, in display
+// order: the primary provider first, then every discovered provider in stable
+// poolProviders order. Providers with no rows at all are skipped — cycling to
+// an empty screen states nothing.
+func (m *model) filterCycle() []string {
+	out := []string{}
+	if len(m.all) > 0 {
+		out = append(out, m.provider)
+	}
+	seen := map[string]bool{m.provider: true}
+	for _, opt := range m.catalogModels() {
+		if seen[opt.Provider] {
+			continue
+		}
+		seen[opt.Provider] = true
+		out = append(out, opt.Provider)
+	}
+	return out
+}
+
+// firstLaunchable is the automatic-cursor fallback: the first non-header row
+// that is not the pinned resume row. Enter there must mean "launch a model",
+// never "accidentally resume a session". When a resume row is the only
+// selectable row it is still returned — a list with just one row must place
+// the cursor somewhere.
+func (m *model) firstLaunchable() int {
+	for i, item := range m.list.Items() {
+		if _, ok := item.(groupHeaderItem); ok {
+			continue
+		}
+		if _, isResume := item.(resumeItem); isResume {
+			continue
+		}
+		return i
+	}
+	return -1
 }
 
 // groupLabel returns the display name for a provider section header. OpenRouter
@@ -711,6 +904,63 @@ func (m *model) rebuildStart() tea.Cmd {
 	}
 	m.ensureSelectable()
 	return cmd
+}
+
+// selectDefault preselects the last-used model (the default when the picker
+// opens, so the common path is open → Enter). It runs once, from Run, before
+// the first render; every later rebuild preserves the cursor instead. When
+// the last-used model is not on the list yet (its provider's catalog is still
+// loading) the cursor lands on the first selectable row.
+func (m *model) selectDefault() {
+	if want := m.defaultItemKey(); want != "" {
+		for i, item := range m.list.Items() {
+			if startItemKey(item) == want {
+				m.list.Select(i)
+				m.ensureSelectable()
+				return
+			}
+		}
+	}
+	if i := m.firstLaunchable(); i >= 0 {
+		m.list.Select(i)
+	}
+}
+
+// defaultItemKey is the key of the row the one-screen list should preselect on
+// open: the last-used model. The MRU store is the same one SortByRecent uses,
+// so the preselected row is also the top row of its provider group. Falls back
+// to the primary provider's first model, then "" (cursor lands wherever the
+// list opens).
+func (m *model) defaultItemKey() string {
+	recent := models.LoadRecent()
+	if len(recent) > 0 {
+		want := recent[0]
+		for _, mdl := range m.all {
+			if mdl.ID == want {
+				return "model\x00" + mdl.Base + "\x00" + mdl.ID
+			}
+		}
+		for _, opt := range m.catalogModels() {
+			if opt.Model.ID == want {
+				return "provider\x00" + opt.Provider + "\x00" + opt.Model.ID
+			}
+		}
+		// The last-used model belongs to a provider whose catalog has not
+		// arrived yet — it may still appear. Nothing to preselect now.
+		return ""
+	}
+	if len(m.all) > 0 {
+		return "model\x00" + m.all[0].Base + "\x00" + m.all[0].ID
+	}
+	return ""
+}
+
+// catalogModels returns the discovered provider models (nil-safe).
+func (m *model) catalogModels() []availableProviderModel {
+	if m.catalog == nil {
+		return nil
+	}
+	return m.catalog.availableModels()
 }
 
 func startItemKey(item list.Item) string {
@@ -881,10 +1131,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetHeight(msg.Height - 6)
 		return m, nil
 	case tea.KeyMsg:
-		// While the filter prompt is active, k/f/esc are TEXT the user is
+		// While the filter prompt is active, k/f/p/esc are TEXT the user is
 		// typing (filtering for "sk-..." or a model with a k in it) or the
-		// cancel-filter key — they must reach the list, not open screens.
-		// Outside filtering the bindings behave exactly as before.
+		// cancel-filter key — they must reach the list, not open screens or
+		// cycle the provider filter. Outside filtering the bindings behave
+		// exactly as before.
 		filtering := m.list.FilterState() == list.Filtering
 		switch msg.String() {
 		case "k":
@@ -898,6 +1149,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "f":
 			if !filtering && (m.step == stepCombo || m.step == stepOrchestrator || m.step == stepWorker || m.step == stepFast) {
 				return m, m.openFallbacks()
+			}
+		case "p":
+			if !filtering && m.step == stepCombo {
+				return m, m.cycleProviderFilter()
 			}
 		case "ctrl+c":
 			m.quit = true
@@ -945,19 +1200,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item, ok := m.list.SelectedItem().(modelItem); ok {
 					// A concrete model pick must NOT carry the saved free pool —
 					// it would silently attach -free fallbacks that get promoted
-					// on the first hiccup, running a paid pick on free.
+					// on the first hiccup, running a paid pick on free. Enter on
+					// a model on the one-screen list launches immediately: the
+					// worker/fast tiers are preset picks, not default questions.
 					m.freePool = nil
 					m.choice = item.m.ID
 					m.choiceVia = m.provider
 					m.worker = ""
-					return m.enterWorkerStep()
+					return m, tea.Quit
 				}
 				if item, ok := m.list.SelectedItem().(providerModelItem); ok {
 					m.freePool = nil
 					m.choice = item.model.ID
 					m.choiceVia = item.provider
 					m.worker = ""
-					return m.enterWorkerStep()
+					return m, tea.Quit
 				}
 				if _, ok := m.list.SelectedItem().(providerStatusItem); ok {
 					// Opening the key manager lets the user fix the credential;
@@ -1055,9 +1312,16 @@ func frame(ctx, usage, body, footer, errLine string, termWidth int) string {
 }
 
 // stepFooter joins the key hints in muted gray, two spaces apart — no dot
-// chain. The per-step Esc hint (skip/auto) is the only variation.
+// chain. The one-screen step's hint names the p filter (it is the new
+// "switch provider" affordance) and says launch, because Enter there really
+// launches; the manual tier steps are still selections.
 func stepFooter(step step) string {
-	parts := []string{"/ filter", "enter select"}
+	var parts []string
+	if step == stepCombo {
+		parts = []string{"/ filter", "enter launch", "p provider"}
+	} else {
+		parts = []string{"/ filter", "enter select"}
+	}
 	switch step {
 	case stepWorker:
 		parts = append(parts, "esc skip")
@@ -1069,11 +1333,15 @@ func stepFooter(step step) string {
 }
 
 // frameContext is the wordmark's suffix for the current step: where you are,
-// in the terms of what you already picked.
+// in the terms of what you already picked. On the one-screen step an active
+// provider filter is announced, otherwise the primary provider's name.
 func (m model) frameContext() string {
 	switch m.step {
 	case stepCombo:
-		return m.provider
+		if m.filter.off() {
+			return m.provider
+		}
+		return m.provider + " " + gDot + " p:" + m.filter.provider
 	case stepOrchestrator:
 		return "orchestrator"
 	case stepWorker:
@@ -1199,15 +1467,16 @@ type Result struct {
 	FreePool        []FreeRoute
 }
 
-// Run shows the selector and returns the user's choices. The first screen
-// lists combos; picking one returns immediately. "Pick manually" leads to
-// orchestrator then optional worker selection. The 'f' screen configures the
-// free-model rotation pool.
+// Run shows the selector and returns the user's choices. It opens on ONE
+// screen: the resume row (when one exists) pinned on top, every launchable
+// model grouped by provider with a health token per group, the preset combos,
+// and the free-cycle row. Enter on a model launches immediately; the manual
+// preset walks orchestrator → optional worker → fast. The 'f' screen
+// configures the free-model rotation pool, 'p' cycles the provider filter.
 //
-// If resume is non-nil, it is shown as an extra row on the opening screen
-// only; choosing it sets ResumeSessionID and returns immediately with an
-// empty Choice, so the caller can reopen that session instead of launching a
-// fresh one.
+// If resume is non-nil, it is shown as the pinned top row; choosing it sets
+// ResumeSessionID and returns immediately with an empty Choice, so the caller
+// can reopen that session instead of launching a fresh one.
 //
 // allModels gates the --all-models catalog: when true every model (paid+free)
 // from the primary provider is shown, grouped into free/paid sub-sections with
@@ -1225,7 +1494,6 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 		provider:  provider,
 		subtitle:  providerSubtitle(provider),
 		step:      stepCombo,
-		hasCombos: true,
 		catalog:   &catalog,
 		resume:    resume,
 		freePool:  savedPool,
@@ -1237,6 +1505,7 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 	configureList(&l)
 
 	m.list = l
+	m.selectDefault()
 	p := tea.NewProgram(m)
 	res, err := p.Run()
 	if err != nil {
