@@ -63,24 +63,38 @@ func newSessionSpec() (*sessionSpec, error) {
 
 // resolveSessionTarget loads a recorded session for --resume-session. The
 // value is a session ID, or "latest"/"last" for the newest session recorded
-// for this working directory.
+// for this working directory. An explicitly named record whose Claude Code
+// transcript is gone is refused with the reason rather than resumed into a
+// fresh conversation.
 func resolveSessionTarget(cacheDir, workDir, value string) (session.Record, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || strings.EqualFold(value, "latest") || strings.EqualFold(value, "last") {
-		return session.Latest(cacheDir, workDir)
+		return session.Latest(cacheDir, workDir, claudeProjectsDir())
 	}
-	return session.Load(cacheDir, value)
+	rec, err := session.Load(cacheDir, value)
+	if err != nil {
+		return rec, err
+	}
+	if !session.HasTranscript(claudeProjectsDir(), rec) {
+		return rec, fmt.Errorf("session %s has no Claude Code transcript (its launch never opened a conversation)", rec.SessionID)
+	}
+	return rec, nil
 }
 
-// buildResumeOption checks for a session recorded for the current directory
-// and, if one exists, describes it for the TUI's opening screen. Returns nil
-// when there is nothing to resume, so the picker shows no extra row.
+// buildResumeOption checks for a resumable session recorded for the current
+// directory and, if one exists, describes it for the TUI's opening screen.
+// Only sessions whose Claude Code transcript still exists are offered, and
+// when none is, it returns nil so the picker shows no resume row at all.
+// The label names the model and the recorded time, because the newest record
+// is the last launch — after a mid-session /model switch that is not
+// necessarily the session the user was just in; the timestamp is what lets
+// them tell which conversation the row reopens.
 func buildResumeOption() *tui.ResumeOption {
 	workDir, err := os.Getwd()
 	if err != nil {
 		return nil
 	}
-	rec, err := session.Latest(sessionCacheDir(), workDir)
+	rec, err := session.Latest(sessionCacheDir(), workDir, claudeProjectsDir())
 	if err != nil {
 		return nil
 	}
@@ -88,7 +102,13 @@ func buildResumeOption() *tui.ResumeOption {
 	if label == "" {
 		label = rec.SessionID
 	}
+	label = fmt.Sprintf("%s · %s", label, rec.Recorded.Local().Format("2006-01-02 15:04"))
 	desc := rec.Recorded.Local().Format("2006-01-02 15:04")
+	if !rec.Resumable {
+		// Only reachable when no projects dir was resolvable; Latest would
+		// otherwise have skipped this record. Say so rather than offer a corpse.
+		desc = "no transcript · " + desc
+	}
 	if wf, cached := session.LatestRun(claudeProjectsDir(), rec.WorkDir, rec.SessionID); wf != nil {
 		desc = fmt.Sprintf("%s · workflow %s: %d agents cached", desc, wf.RunID, cached)
 	}
@@ -402,7 +422,7 @@ func cmdSessionsList() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	records, err := session.List(cacheDir, workDir)
+	records, err := session.List(cacheDir, workDir, claudeProjectsDir())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -414,8 +434,12 @@ func cmdSessionsList() {
 	fmt.Printf("Recorded ultra-zen sessions for %s:\n\n", workDir)
 	for _, rec := range records {
 		wf, cached := session.LatestRun(claudeProjectsDir(), rec.WorkDir, rec.SessionID)
-		fmt.Printf("  %s  %s  %s\n", rec.SessionID,
-			rec.Recorded.Local().Format("2006-01-02 15:04"), rec.Model)
+		status := ""
+		if !rec.Resumable {
+			status = "  (no transcript)"
+		}
+		fmt.Printf("  %s  %s  %s%s\n", rec.SessionID,
+			rec.Recorded.Local().Format("2006-01-02 15:04"), rec.Model, status)
 		if wf != nil {
 			fmt.Printf("      workflow %s (%s): %d completed agents cached\n", wf.RunID, wf.Name, cached)
 		}

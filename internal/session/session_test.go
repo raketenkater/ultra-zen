@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -112,7 +113,9 @@ func TestListAndLatestAreScopedToWorkDirAndOrdered(t *testing.T) {
 			t.Fatalf("Save: %v", err)
 		}
 	}
-	list, err := List(dir, "/project/a")
+	// An empty projects dir disables the transcript check: every record
+	// counts as resumable, which is this test's concern.
+	list, err := List(dir, "/project/a", "")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
@@ -122,7 +125,10 @@ func TestListAndLatestAreScopedToWorkDirAndOrdered(t *testing.T) {
 	if list[0].SessionID != newer.SessionID {
 		t.Errorf("List not newest-first: got %s", list[0].SessionID)
 	}
-	latest, err := Latest(dir, "/project/a")
+	if !list[0].Resumable || !list[1].Resumable {
+		t.Errorf("List left records unresumable without a projects dir: %+v", list)
+	}
+	latest, err := Latest(dir, "/project/a", "")
 	if err != nil {
 		t.Fatalf("Latest: %v", err)
 	}
@@ -130,18 +136,180 @@ func TestListAndLatestAreScopedToWorkDirAndOrdered(t *testing.T) {
 		t.Errorf("Latest = %s, want %s", latest.SessionID, newer.SessionID)
 	}
 	// A different project must not resume into this one's session.
-	if _, err := Latest(dir, "/project/c"); err == nil {
+	if _, err := Latest(dir, "/project/c", ""); err == nil {
 		t.Error("Latest returned a record for an unrelated work dir")
 	}
 }
 
 func TestListOnMissingDirectoryIsEmptyNotAnError(t *testing.T) {
-	list, err := List(t.TempDir(), "")
+	list, err := List(t.TempDir(), "", "")
 	if err != nil {
 		t.Fatalf("List on empty cache: %v", err)
 	}
 	if len(list) != 0 {
 		t.Errorf("want no records, got %d", len(list))
+	}
+}
+
+// writeTranscript creates the Claude Code transcript file for rec under a
+// temp projects root, so resumability can be judged for real.
+func writeTranscript(t *testing.T, projectsDir string, rec Record) {
+	t.Helper()
+	path := TranscriptPath(projectsDir, rec)
+	if path == "" {
+		t.Fatalf("TranscriptPath empty for %+v", rec)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTranscriptPathMatchesClaudeCodeLayout(t *testing.T) {
+	rec := Record{SessionID: "072e63a1-819a-4682-a742-559695c3cd76", WorkDir: "/home/mik/ultra-zen"}
+	want := filepath.Join("/claude/projects", "-home-mik-ultra-zen", rec.SessionID+".jsonl")
+	if got := TranscriptPath("/claude/projects", rec); got != want {
+		t.Errorf("TranscriptPath = %q, want %q", got, want)
+	}
+	for _, tc := range []Record{
+		{SessionID: rec.SessionID},
+		{SessionID: rec.SessionID, WorkDir: ""},
+	} {
+		if got := TranscriptPath("/claude/projects", tc); got != "" {
+			t.Errorf("TranscriptPath(%+v) = %q, want empty", tc, got)
+		}
+	}
+}
+
+func TestHasTranscriptFailsOpenWithoutProjectsDir(t *testing.T) {
+	rec := Record{SessionID: "072e63a1-819a-4682-a742-559695c3cd76", WorkDir: "/project/a"}
+	if !HasTranscript("", rec) {
+		t.Error("HasTranscript without a projects dir must fail open (true)")
+	}
+}
+
+func TestListMarksResumableAgainstTheTranscript(t *testing.T) {
+	dir := t.TempDir()
+	projects := t.TempDir()
+	live := Record{
+		SessionID: "11111111-1111-4111-8111-111111111111",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-2 * time.Hour),
+	}
+	dead := Record{
+		SessionID: "22222222-2222-4222-8222-222222222222",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-1 * time.Hour),
+	}
+	writeTranscript(t, projects, live)
+	for _, rec := range []Record{dead, live} {
+		if err := Save(dir, rec); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	}
+	list, err := List(dir, "/project/a", projects)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want 2 records, got %d", len(list))
+	}
+	// Newest first: the transcript-less launch is newer but must be marked
+	// dead, not hidden.
+	if list[0].SessionID != dead.SessionID || list[0].Resumable {
+		t.Errorf("newest record should be dead, got %+v", list[0])
+	}
+	if list[1].SessionID != live.SessionID || !list[1].Resumable {
+		t.Errorf("older record with a transcript should be resumable, got %+v", list[1])
+	}
+	latest, err := Latest(dir, "/project/a", projects)
+	if err != nil {
+		t.Fatalf("Latest: %v", err)
+	}
+	if latest.SessionID != live.SessionID {
+		t.Errorf("Latest = %s, want the live %s (not the newer corpse %s)",
+			latest.SessionID, live.SessionID, dead.SessionID)
+	}
+}
+
+func TestLatestErrorsWhenEveryRecordIsDead(t *testing.T) {
+	dir := t.TempDir()
+	projects := t.TempDir()
+	dead := Record{
+		SessionID: "44444444-4444-4444-8444-444444444444",
+		WorkDir:   "/project/a", Recorded: time.Now(),
+	}
+	if err := Save(dir, dead); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	rec, err := Latest(dir, "/project/a", projects)
+	if err == nil {
+		t.Fatalf("Latest returned a corpse: %+v", rec)
+	}
+	if !strings.Contains(err.Error(), "no resumable") {
+		t.Errorf("error should say no resumable session: %v", err)
+	}
+}
+
+func TestListPrunesStaleDeadRecordsOnly(t *testing.T) {
+	dir := t.TempDir()
+	projects := t.TempDir()
+	staleDead := Record{
+		SessionID: "11111111-1111-4111-8111-111111111111",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-8 * 24 * time.Hour),
+	}
+	freshDead := Record{
+		SessionID: "22222222-2222-4222-8222-222222222222",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-1 * time.Hour),
+	}
+	staleLive := Record{
+		SessionID: "33333333-3333-4333-8333-333333333333",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-8 * 24 * time.Hour),
+	}
+	writeTranscript(t, projects, staleLive)
+	for _, rec := range []Record{staleDead, freshDead, staleLive} {
+		if err := Save(dir, rec); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+	}
+	list, err := List(dir, "/project/a", projects)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("want stale-dead pruned, fresh-dead and stale-live kept; got %d records", len(list))
+	}
+	if _, err := os.Stat(filepath.Join(Dir(dir), staleDead.SessionID+".json")); !os.IsNotExist(err) {
+		t.Errorf("stale dead record still on disk (stat err %v)", err)
+	}
+	if _, err := os.Stat(filepath.Join(Dir(dir), freshDead.SessionID+".json")); err != nil {
+		t.Errorf("fresh dead record must survive the TTL window: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(Dir(dir), staleLive.SessionID+".json")); err != nil {
+		t.Errorf("live record must never be pruned: %v", err)
+	}
+	// A workDir-filtered listing must not prune other projects' records that
+	// share the same cache dir: /project/b's stale corpse survives when
+	// /project/a is listed.
+	foreign := Record{
+		SessionID: "44444444-4444-4444-8444-444444444444",
+		WorkDir:   "/project/b", Recorded: time.Now().Add(-30 * 24 * time.Hour),
+	}
+	if err := Save(dir, foreign); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := List(dir, "/project/a", projects); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(Dir(dir), foreign.SessionID+".json")); err != nil {
+		t.Errorf("a filtered listing pruned another project's record: %v", err)
+	}
+	// While an unfiltered listing of the same cache does prune it.
+	if _, err := List(dir, "", projects); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(Dir(dir), foreign.SessionID+".json")); !os.IsNotExist(err) {
+		t.Errorf("unfiltered listing should have pruned the stale foreign corpse (stat err %v)", err)
 	}
 }
 

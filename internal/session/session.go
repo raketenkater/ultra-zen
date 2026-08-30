@@ -10,6 +10,21 @@
 // ggrun, ultra-zen holds no local backend state (no KV cache, no GPU
 // placement) that a later launch could reinterpret, so there is nothing to
 // validate before a resume: the recorded launch args are simply replayed.
+//
+// A record is written at launch, before Claude Code has written anything, so
+// a launch that dies at the picker, is Ctrl-C'd, or exits before the REPL
+// opens leaves a record with no conversation transcript behind it. Such a
+// dead record must not be surfaced for resume: Claude Code would start a
+// fresh conversation or error out. A record counts as resumable iff
+//
+//	<claudeProjectsDir>/<ProjectKey(rec.WorkDir)>/<rec.SessionID>.jsonl
+//
+// exists. List marks resumability per record and prunes dead records past
+// deadRecordTTL (best-effort, never failing the listing), and Latest
+// surfaces only resumable ones. Resumability is judged against the Claude
+// projects root the caller passes in (CLAUDE_CONFIG_DIR / ~/.claude/projects);
+// a caller that cannot supply one gets the old check-free behaviour rather
+// than a silently broken resume.
 package session
 
 import (
@@ -46,6 +61,40 @@ type Record struct {
 	Port        int       `json:"port,omitempty"`
 	LaunchArgs  []string  `json:"launch_args,omitempty"`
 	Workflow    *Workflow `json:"workflow,omitempty"`
+
+	// Resumable reports whether the Claude Code transcript behind this record
+	// still exists. It is judged at read time (see List) and never persisted.
+	Resumable bool `json:"-"`
+}
+
+// deadRecordTTL is how long a transcript-less record survives before List
+// prunes it. It only needs to outlive short-lived false launches plus any
+// window in which a transcript might land late (an external writer, a
+// manually restored projects dir); a week is comfortably generous.
+const deadRecordTTL = 7 * 24 * time.Hour
+
+// TranscriptPath returns where Claude Code stores the conversation for this
+// record: <projectsDir>/<ProjectKey(WorkDir)>/<SessionID>.jsonl. An empty
+// projectsDir yields "" — there is nothing to point at.
+func TranscriptPath(projectsDir string, rec Record) string {
+	if projectsDir == "" || rec.WorkDir == "" || rec.SessionID == "" {
+		return ""
+	}
+	return filepath.Join(projectsDir, ProjectKey(rec.WorkDir), rec.SessionID+".jsonl")
+}
+
+// HasTranscript reports whether the Claude Code conversation behind rec
+// still exists on disk. It is the resumability test: a record without a
+// transcript is a launch that died before Claude Code wrote anything.
+// Without a projectsDir to check against it fails open (true), so a caller
+// that cannot locate the projects root keeps the old check-free behaviour.
+func HasTranscript(projectsDir string, rec Record) bool {
+	path := TranscriptPath(projectsDir, rec)
+	if path == "" {
+		return true
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // NewSessionID returns a random RFC 4122 version 4 UUID. Claude Code's
@@ -135,7 +184,17 @@ func Load(cacheDir, sessionID string) (Record, error) {
 }
 
 // List returns records for workDir, newest first. An empty workDir lists all.
-func List(cacheDir, workDir string) ([]Record, error) {
+//
+// Each record's Resumable field is set from HasTranscript against
+// projectsDir (empty projectsDir leaves every record marked resumable).
+//
+// Prune policy: dead records (no transcript) older than deadRecordTTL are
+// deleted here, best-effort, and only within the listing's scope — a
+// workDir-filtered listing never touches another project's records. Launches
+// are recorded before Claude Code writes anything, so aborted launches would
+// otherwise accumulate forever. Removal never fails or delays the listing —
+// a delete error is ignored and the record is simply returned as it is.
+func List(cacheDir, workDir, projectsDir string) ([]Record, error) {
 	entries, err := os.ReadDir(Dir(cacheDir))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -144,6 +203,7 @@ func List(cacheDir, workDir string) ([]Record, error) {
 		return nil, err
 	}
 	var out []Record
+	cutoff := time.Now().Add(-deadRecordTTL)
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".json") {
@@ -153,7 +213,14 @@ func List(cacheDir, workDir string) ([]Record, error) {
 		if err != nil {
 			continue
 		}
+		rec.Resumable = HasTranscript(projectsDir, rec)
 		if workDir != "" && rec.WorkDir != workDir {
+			continue
+		}
+		if !rec.Resumable && rec.Recorded.Before(cutoff) {
+			// Aborted launch, past any doubt that its transcript is coming.
+			// Best-effort only: an error leaves the record in place.
+			_ = os.Remove(filepath.Join(Dir(cacheDir), name))
 			continue
 		}
 		out = append(out, rec)
@@ -162,16 +229,20 @@ func List(cacheDir, workDir string) ([]Record, error) {
 	return out, nil
 }
 
-// Latest returns the newest record for workDir.
-func Latest(cacheDir, workDir string) (Record, error) {
-	records, err := List(cacheDir, workDir)
+// Latest returns the newest resumable record for workDir, skipping records
+// whose Claude Code transcript is gone. An empty projectsDir disables the
+// transcript check and returns the newest record regardless.
+func Latest(cacheDir, workDir, projectsDir string) (Record, error) {
+	records, err := List(cacheDir, workDir, projectsDir)
 	if err != nil {
 		return Record{}, err
 	}
-	if len(records) == 0 {
-		return Record{}, fmt.Errorf("no recorded ultra-zen session for %s", workDir)
+	for _, rec := range records {
+		if rec.Resumable {
+			return rec, nil
+		}
 	}
-	return records[0], nil
+	return Record{}, fmt.Errorf("no resumable ultra-zen session for %s", workDir)
 }
 
 // JournalPath returns where Claude Code keeps a session's workflow resume
