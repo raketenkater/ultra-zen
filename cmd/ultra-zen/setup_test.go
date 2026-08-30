@@ -183,4 +183,49 @@ func TestSetupReport(t *testing.T) {
 	if !strings.Contains(out, "/opt/bin/ultra-zen") {
 		t.Fatalf("report missing bin path: %q", out)
 	}
+	// The report always points at the provider-key setup next step.
+	if !strings.Contains(out, "uz setup providers") {
+		t.Fatalf("report missing `uz setup providers` next step: %q", out)
+	}
+}
+
+// TestDirOnPATH verifies PATH membership detection, including relative-path
+// normalization.
+func TestDirOnPATH(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", string(os.PathListSeparator)+dir+string(os.PathListSeparator))
+	if !dirOnPATH(dir) {
+		t.Fatalf("dir %q on PATH not detected", dir)
+	}
+	other := t.TempDir()
+	if dirOnPATH(other) {
+		t.Fatalf("empty PATH reported as containing %q", other)
+	}
+}
+
+// TestReportSetupPathHint verifies the report prints the exact export line
+// when the install dir is not on PATH, and no hint when it is.
+func TestReportSetupPathHint(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PATH", "")
+	t.Setenv("ZSH_VERSION", "")
+
+	var buf strings.Builder
+	old := stdout
+	stdout = &buf
+	defer func() { stdout = old }()
+
+	reportSetup(dir, filepath.Join(dir, "uz"), false, false)
+	out := buf.String()
+	if !strings.Contains(out, "NOT on PATH") || !strings.Contains(out, `export PATH="`+dir) {
+		t.Fatalf("missing PATH export hint:\n%s", out)
+	}
+
+	// With the dir on PATH there is no hint.
+	buf.Reset()
+	t.Setenv("PATH", dir)
+	reportSetup(dir, filepath.Join(dir, "uz"), false, false)
+	if strings.Contains(buf.String(), "NOT on PATH") {
+		t.Fatalf("PATH hint printed for dir that is on PATH:\n%s", buf.String())
+	}
 }

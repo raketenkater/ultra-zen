@@ -6,6 +6,7 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/raketenkater/ultra-zen)](https://goreportcard.com/report/github.com/raketenkater/ultra-zen)
 
 Run Claude Code — including Ultracode workflows — on free and low-cost models.
+Single Go binary, one install command, one setup command.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="ultra-zen-selector.png">
@@ -49,7 +50,33 @@ ultra-zen
 curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
 ```
 
-Or with Go:
+The script is POSIX `sh` (no bash required). It detects linux/darwin on
+amd64/arm64, downloads the matching release tarball from GitHub Releases,
+verifies the sha256 checksum when the release publishes `checksums.txt`, and
+installs both the `ultra-zen` binary and a `uz` symlink into `~/.local/bin`.
+When that directory is not on `PATH` it prints the exact `export PATH=...`
+line for your shell; it only appends that line to your shell config after you
+confirm (or when you pass `ULTRA_ZEN_ADD_PATH=1` — a piped run never writes
+files unprompted).
+
+```bash
+# System-wide instead (needs sudo, installs to /usr/local/bin for all users):
+curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh -s -- --system
+
+# Pick a version or a directory:
+ULTRA_ZEN_VERSION=v0.2.1 curl -fsSL ... | sh -s -- --dir=$HOME/bin
+```
+
+All three install locations:
+
+| Location        | How                                  | Notes                                   |
+|-----------------|--------------------------------------|-----------------------------------------|
+| `~/.local/bin`  | default (curl script, `make install`) | no root needed; ensure it is on `PATH`  |
+| `/usr/local/bin`| `--system` flag or `sudo make system` | system-wide, all users                  |
+| custom `--dir=` | `--dir=<dir>` or `ULTRA_ZEN_BINDIR`   | the PATH check applies the same way     |
+
+Or with Go (drop the binary in `$(go env GOPATH)/bin` and create the `uz`
+symlink there):
 
 ```bash
 go install github.com/raketenkater/ultra-zen/cmd/ultra-zen@latest
@@ -60,17 +87,53 @@ From source:
 ```bash
 git clone https://github.com/raketenkater/ultra-zen
 cd ultra-zen
-make build
+make install     # builds, installs to GOBIN/GOPATH/bin + uz symlink, checks PATH
 ```
+
+### Quick start
+
+```bash
+uz setup providers   # store the keys you have (opencode Zen, OpenRouter, ...)
+uz                   # pick a model, launch Claude Code
+```
+
+Only what you actually use needs a key: opencode Zen needs `opencode auth
+login` (or paste its key into the setup prompt), OpenRouter needs a key from
+[openrouter.ai/keys](https://openrouter.ai/keys) — everything else is
+optional and can be added later with `k` in the picker or `uz keys set`.
+
+### Configure providers (`uz setup providers`)
+
+One command sets up keys — this is what makes ultra-zen config-free in
+practice: the binary, the `uz` launcher, and the keys all land without you
+touching a config file.
+
+It prints a per-provider table — which key source supplies each provider (env
+var, per-user store, system store, opencode's `auth.json`, codex login), the
+tier, and the live usage row when a proxy is running — then, for every
+provider without a key, offers a masked prompt. Each key is validated against
+the provider's cheapest endpoint (`GET /models`, OpenRouter's `GET /key`)
+before it is stored in `~/.config/ultra-zen/keys/` (mode `0600`), and is never
+printed back. Re-running is always safe; configured providers are skipped.
+
+Non-interactive alternative (the table is printed with the same recipes when
+stdin is a pipe):
+
+```bash
+echo <key> | uz keys set openrouter -
+uz keys set modelscope -        # paste, Ctrl-D to finish
+```
+
+`uz setup` (without `providers`) installs the binary + `uz` symlink into a bin
+dir of your choosing and verifies `PATH`; see [System-wide access](#system-wide-access-uz).
 
 ### Prerequisites
 
 - **Claude Code** on `PATH` (`npm i -g @anthropic-ai/claude-code`).
-- **opencode** logged in with the `opencode-go` provider:
-  `opencode auth login` → select the opencode provider. The API key is read
-  from `~/.local/share/opencode/auth.json` (or `~/.config/opencode/auth.json`).
-- **OpenRouter API key** (for `--provider openrouter`):
-  get one at [openrouter.ai/keys](https://openrouter.ai/keys).
+- **A key for at least one provider** (see Quick start). The default provider
+  opencode Zen reads the key from `~/.local/share/opencode/auth.json` (or
+  `~/.config/opencode/auth.json`) after `opencode auth login`, or from the
+  key store when you pasted it in `uz setup providers`.
 - **uvx** (optional) for web research — when present, `ultra-zen` wires a
   no-key DuckDuckGo MCP and disables the Anthropic-only `WebSearch` tool.
 
@@ -81,11 +144,11 @@ Every provider that needs a key is resolved in this order:
 1. **Flag / env var** — `--api-key`, `--openrouter-key`, or the provider's env
    var (`OPENROUTER_API_KEY`, `MODELSCOPE_API_KEY`, `GROQ_API_KEY`, ...).
 2. **The stored key** — `~/.config/ultra-zen/keys/<provider>` (one file per
-   provider, mode `0600`). Use the TUI's key manager (press `k` in the
-   selector) or write the file directly.
+   provider, mode `0600`). Set once via `uz setup providers`, the TUI's key
+   manager (press `k` in the selector), or `uz keys set`.
 3. **The system-wide stored key** — `/etc/ultra-zen/keys/<provider>` (mode
-   `0644`, set up by `ultra-zen setup`), so a shared credential covers users
-   with no personal key.
+   `0644`, set up by `sudo ultra-zen setup --copy-keys`), so a shared
+   credential covers users with no personal key.
 4. **Interactive prompt** — when running interactively with no key set, the
    TUI asks you to paste one, then **saves it to the key store** so you only
    enter it once.
@@ -98,8 +161,10 @@ sessions). Clearing a stored key (empty string) makes the prompt appear again.
 ### System-wide access (`uz`)
 
 `ultra-zen setup` installs the binary plus a `uz` symlink so the launcher is on
-`PATH` from any directory for any user on the machine, and initialises the
-shared key store at `/etc/ultra-zen/keys`:
+`PATH` from any directory for any user on the machine, verifies the target
+directory is on `PATH` (printing the exact `export` line — and offering to
+write it into your shell config, only with your consent — when it is not), and
+initialises the shared key store at `/etc/ultra-zen/keys`:
 
 ```bash
 sudo ultra-zen setup --copy-keys      # install to /usr/local/bin, share your keys
@@ -117,8 +182,11 @@ uz glm-5.1 -- --resume                # passthrough args, Claude Code stays in t
 - Writes to the system store need root: `sudo ultra-zen keys --system set
   <provider> <key>`, `sudo ultra-zen keys --system clear <provider>`. The
   `ULTRA_ZEN_SYSTEM_KEYS` env var redirects the store (mostly for testing).
-- `make system` and `install.sh` (when installing to `/usr/local/bin` via
-  sudo) perform the same setup.
+- `make system` and `install.sh --system` perform the same setup.
+- `make install` (like the curl script) installs to `GOBIN`/`GOPATH/bin`,
+  creates the `uz` symlink there, and warns with the exact `export PATH`
+  line when that directory is not on `PATH` — the classic
+  "installed but command not found" trap.
 
 ## Usage
 
@@ -170,8 +238,8 @@ environment. Lists `:free` models, including `qwen/qwen3-coder:free`,
 `openrouter/free` (auto-routes to the best available free model).
 
 **GWDG SAIA** (`--provider saia`): uses the OpenAI-compatible Academic Cloud
-endpoint at `https://chat-ai.academiccloud.de/v1`. Set `SAIA_API_KEY`, or store
-the key once with `ultra-zen keys set saia -` and provide it on stdin. Models
+endpoint at `https://chat-ai.academiccloud.de/v1`. Set `SAIA_API_KEY`, or
+store the key once with `uz setup providers` or `uz keys set saia -`. Models
 are discovered live from SAIA; `qwen3-coder-next` is the recommended coding
 model.
 
@@ -218,10 +286,10 @@ When run interactively with neither a codex login nor a URL set, ultra-zen
 prompts for the endpoint URL. The explicit local endpoint always wins over
 auto-detection, so `CODEX_BASE_URL` / `--codex-url` are authoritative when set.
 
-**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere|modelscope`):
+**Other free-tier providers** (`--provider groq|cerebras|huggingface|cohere|modelscope|saia`):
 BYO-key OpenAI-compatible endpoints with their own free tiers, beyond opencode
-Zen. Each needs its own personal API key — set the provider's env var or pass
-`--api-key`:
+Zen. Each needs its own personal API key — set the provider's env var, pass
+`--api-key`, or store it once with `uz setup providers` / `uz keys set`:
 
 | `--provider`  | Env var            | Get a key                                           |
 |---------------|---------------------|-----------------------------------------------------|
@@ -230,6 +298,7 @@ Zen. Each needs its own personal API key — set the provider's env var or pass
 | `huggingface` | `HF_TOKEN`          | https://huggingface.co/settings/tokens               |
 | `cohere`      | `COHERE_API_KEY`    | https://dashboard.cohere.com/api-keys                |
 | `modelscope`  | `MODELSCOPE_API_KEY` | https://modelscope.ai/my/myaccesstoken               |
+| `saia`        | `SAIA_API_KEY`      | https://saia.gwdg.de/dashboard                       |
 
 ```bash
 ultra-zen --provider groq
@@ -454,16 +523,37 @@ together as one block, so without `uvx` the built-in `WebSearch` is left
 untouched rather than disabling web research entirely. Your own
 `--disallowedTools` / `--mcp-config` / `--allowedTools` args always win.
 
+## Subcommands
+
+```bash
+ultra-zen keys                    # list providers and whether a key is stored
+ultra-zen keys set <p> <key>      # store a key ('-' reads stdin)
+ultra-zen keys clear <p>          # remove a stored key
+ultra-zen setup                   # install binary + uz symlink, verify PATH
+ultra-zen setup providers         # key status table + add missing keys
+ultra-zen sessions                # list recorded resumable sessions (this dir)
+ultra-zen resume                  # reopen the newest one
+ultra-zen usage                   # one-line per-provider usage (statusline hook)
+ultra-zen workflow-hook           # internal: Workflow stallMs rewrite (PreToolUse)
+```
+
+`keys --system ...` targets `/etc/ultra-zen/keys` (needs sudo). The `usage`
+alias `statusline` prints `[OR $0.013 left] [Zen 5h 42% · wk 10%] …`-style
+tokens and degrades to "no running ultra-zen proxy" so it never error-spams a
+statusline hook.
+
 ## Project layout
 
 ```
-cmd/ultra-zen/      entry point: selector + launcher + provider dispatch
+cmd/ultra-zen/      entry point: selector + launcher + subcommand dispatch
 internal/auth/      opencode auth.json reader (or env for OpenRouter)
-internal/models/    live model list from Zen gateway or OpenRouter
+internal/keys/      per-user (~/.config) + system (/etc) API-key store
+internal/models/    live model catalogs for every supported provider
 internal/proxy/     Anthropic↔OpenAI translation (request/response/stream)
 internal/claude/    env build + settings injection + exec
-internal/tui/       Bubble Tea model selector
+internal/tui/       Bubble Tea model selector + key/free-pool screens
 internal/workflow/  Workflow script rewriter (stallMs injection hook)
+internal/session/   launch recording + resume replay
 ```
 
 ## License

@@ -9,10 +9,12 @@ package main
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/raketenkater/ultra-zen/internal/keys"
 )
@@ -195,9 +197,15 @@ func setupCopyUserKeys() (copied []string) {
 	return copied
 }
 
-// cmdSetup is the `ultra-zen setup` entry point. Non-interactive; prints a
-// status report via the stdout var so tests can capture it.
+// cmdSetup is the `ultra-zen setup` entry point. `setup providers` routes to
+// the provider-key flow (setup_providers.go); the default is the binary
+// install. Prints its status report via the stdout var so tests can capture
+// it.
 func cmdSetup(args []string) {
+	if len(args) > 0 && args[0] == "providers" {
+		cmdSetupProviders(&http.Client{Timeout: 20 * time.Second})
+		return
+	}
 	var bindirOverride string
 	var copyKeys bool
 	for i := 0; i < len(args); i++ {
@@ -265,7 +273,10 @@ func flagWord(override string) string {
 	return "--dir " + override
 }
 
-// reportSetup prints where things landed and what the user should run next.
+// reportSetup prints where things landed and what the user should run next,
+// including a PATH verification for the install dir: when the directory is
+// not on PATH it prints the exact export line, and on a real terminal offers
+// (never silently) to append it to the user's shell profile.
 func reportSetup(binDir, uzPath string, needsSudo, copyKeys bool) {
 	fmt.Fprintf(stdout, "\nultra-zen installed to %s/ultra-zen\n", binDir)
 	fmt.Fprintf(stdout, "uz -> %s/ultra-zen (symlink)\n", binDir)
@@ -278,8 +289,19 @@ func reportSetup(binDir, uzPath string, needsSudo, copyKeys bool) {
 			fmt.Fprintf(os.Stderr, "ultra-zen: warning: `uz` on PATH (%s) differs from the installed %s\n", w, uzPath)
 		}
 	}
+	// PATH verification: the most common broken-install report is a binary
+	// that landed in a directory the shell never searches.
+	if !dirOnPATH(binDir) {
+		exportLine := fmt.Sprintf("export PATH=\"%s:$PATH\"", binDir)
+		fmt.Fprintf(stdout, "\nNOT on PATH: %s is not in your PATH.\n", binDir)
+		fmt.Fprintf(stdout, "Add it to your shell config:\n  %s\n", exportLine)
+		if stdinIsTerminal() {
+			offerWriteShellProfile(binDir, exportLine)
+		}
+	}
 	fmt.Fprintf(stdout, "system key store: %s (world-readable 0644; root-writable)\n", keys.SystemDir())
 	fmt.Fprintf(stdout, "\nNext steps:\n")
+	fmt.Fprintf(stdout, "  uz setup providers                 # add provider API keys\n")
 	fmt.Fprintf(stdout, "  uz --list                          # models from any directory\n")
 	if !copyKeys {
 		fmt.Fprintf(stdout, "  sudo ultra-zen setup --copy-keys  # share your API keys with all users\n")
@@ -287,9 +309,73 @@ func reportSetup(binDir, uzPath string, needsSudo, copyKeys bool) {
 	fmt.Fprintf(stdout, "  sudo ultra-zen keys --system set <provider> <key>   # set a shared key\n")
 }
 
+// dirOnPATH reports whether dir is already in the PATH environment.
+func dirOnPATH(dir string) bool {
+	for _, p := range filepath.SplitList(os.Getenv("PATH")) {
+		if abs, err := filepath.Abs(p); err == nil && abs == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// shellProfileCandidates lists the files the PATH export may be appended to,
+// checked in order and only with explicit consent. The user's login shell
+// decides which file actually matters: zsh reads .zshenv/.zprofile/.zshrc
+// and ignores .profile, bash reads .profile (login) or .bashrc.
+func shellProfileCandidates() []string {
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "zsh":
+		return []string{"~/.zshrc", "~/.zshenv"}
+	default:
+		return []string{"~/.profile", "~/.bashrc"}
+	}
+}
+
+// offerWriteShellProfile asks (only on a real terminal, never silently) and,
+// on explicit "y", appends the export line to the first existing shell config
+// file. Refuses when the file already contains the directory.
+func offerWriteShellProfile(binDir, exportLine string) {
+	fmt.Fprint(stdout, "Write this line into your shell config now? [y/N] ")
+	if !setupConfirm() {
+		fmt.Fprintln(stdout, "Skipped. Copy the export line above into your shell config.")
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(stdout, "could not locate home dir: %v\n", err)
+		return
+	}
+	for _, cand := range shellProfileCandidates() {
+		path := filepath.Join(home, strings.TrimPrefix(cand, "~"))
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // try the next candidate
+		}
+		if strings.Contains(string(data), binDir) {
+			fmt.Fprintf(stdout, "%s already mentions %s; not touching it.\n", path, binDir)
+			return
+		}
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			continue
+		}
+		defer f.Close()
+		if _, err := f.WriteString("\n# added by ultra-zen setup\n" + exportLine + "\n"); err != nil {
+			fmt.Fprintf(stdout, "could not write %s: %v\n", path, err)
+			return
+		}
+		fmt.Fprintf(stdout, "written to %s — open a new shell or run: %s\n", path, exportLine)
+		return
+	}
+	fmt.Fprintf(stdout, "No shell config found (%s); copy the export line above manually.\n",
+		strings.Join(shellProfileCandidates(), ", "))
+}
+
 func setupUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
 	fmt.Fprintln(os.Stderr, "  ultra-zen setup                   install binary + uz symlink to a bin dir")
+	fmt.Fprintln(os.Stderr, "  ultra-zen setup providers         show per-provider key status; add missing keys")
 	fmt.Fprintln(os.Stderr, "  ultra-zen setup --copy-keys       also copy your API keys to /etc/ultra-zen/keys")
 	fmt.Fprintln(os.Stderr, "  ultra-zen setup --dir <dir>       install to a specific directory")
 	fmt.Fprintln(os.Stderr, "")
