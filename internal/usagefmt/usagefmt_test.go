@@ -87,3 +87,58 @@ func TestFormatExhausted(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// TestFormatZenHealthMark pins the paid-plan signal: the Zen /usage endpoint
+// exposes no money, and its only exhaustion signal is the gateway's per-window
+// status ("rate-limited"). A healthy window renders exactly as before (no
+// regression for "ok" or a missing status); an unhealthy one gets a single
+// one-character "!" so the row stays short beside the [OR ...] token.
+func TestFormatZenHealthMark(t *testing.T) {
+	all := proxy.ProviderUsage{
+		Name: "opencode-go", Kind: proxy.UsageCredits, Window: proxy.Window5h,
+		Rolling: &proxy.WindowStat{Status: "rolling", Percent: 0, State: "ok"},
+		Weekly:  &proxy.WindowStat{Status: "weekly", Percent: 99, State: "ok"},
+		Monthly: &proxy.WindowStat{Status: "monthly", Percent: 100, State: "rate-limited"},
+	}
+	if got := FormatProviderUsage(all); got != "[Zen 5h 0% · wk 99% · mo 100%!]" {
+		t.Fatalf("got %q", got)
+	}
+	healthy := proxy.ProviderUsage{
+		Name: "opencode-go", Kind: proxy.UsageCredits,
+		Rolling: &proxy.WindowStat{Status: "rolling", Percent: 0, State: "ok"},
+		Weekly:  &proxy.WindowStat{Status: "weekly", Percent: 99}, // no State: legacy payloads
+	}
+	if got := FormatProviderUsage(healthy); got != "[Zen 5h 0% · wk 99%]" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// TestFormatZenMoneyPrecedence pins the forward-compatible money rendering:
+// a Credits value (only ever set from a real "balance" field upstream) shows
+// as "$N.NN left" beside the windows, or alone when the envelope shape gave
+// no windows. Unknown money (nil) must never render as $0.00 — it is omitted.
+func TestFormatZenMoneyPrecedence(t *testing.T) {
+	withWindows := proxy.ProviderUsage{
+		Name: "opencode-go", Kind: proxy.UsageCredits,
+		Credits: f(4.10),
+		Weekly:  &proxy.WindowStat{Status: "weekly", Percent: 99},
+	}
+	if got := FormatProviderUsage(withWindows); got != "[Zen $4.10 left · wk 99%]" {
+		t.Fatalf("got %q", got)
+	}
+	windowsOnly := withWindows
+	windowsOnly.Credits = nil
+	if got := FormatProviderUsage(windowsOnly); got != "[Zen wk 99%]" {
+		t.Fatalf("got %q", got)
+	}
+	noWindows := proxy.ProviderUsage{
+		Name: "opencode-go", Kind: proxy.UsageCredits, Credits: f(7),
+	}
+	if got := FormatProviderUsage(noWindows); got != "[Zen $7.00 left]" {
+		t.Fatalf("got %q", got)
+	}
+	unknown := proxy.ProviderUsage{Name: "opencode-go", Kind: proxy.UsageCredits}
+	if got := FormatProviderUsage(unknown); got != "[opencode-go —]" {
+		t.Fatalf("unknown money must stay a dash row, got %q", got)
+	}
+}

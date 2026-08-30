@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -200,8 +201,13 @@ func ApplyOpenRouterCredits(row *ProviderUsage, total, used float64) {
 	applyOpenRouterCredits(row, total, used)
 }
 
-// fetchZenUsage GETs {base}/usage (opencode.ai zen gateway). It parses the
-// rolling/weekly/monthly windows each carrying a percent and an ISO resetsAt.
+// fetchZenUsage GETs {base}/usage (opencode.ai zen gateway) and stores the
+// canonical opencode-go row built by BuildZenUsage. The endpoint exposes no
+// money fields today — a dollar figure is not reachable with a plain key (the
+// credit balance lives behind the web console; anomalyco/opencode#44189) — so
+// the row shows quota windows plus the gateway's per-window health, and
+// nothing else: unknown money is omitted, never rendered as "$0.00" (which
+// would read as "spent nothing").
 func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 	url := strings.TrimRight(base, "/") + "/usage"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -215,6 +221,32 @@ func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 		return
 	}
 	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		s.usage.setRow("opencode-go", providerOrKeep(s, "opencode-go", "live fetch failed: "+err.Error()))
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		s.usage.setRow("opencode-go", providerOrKeep(s, "opencode-go", "Zen: /usage "+resp.Status))
+		return
+	}
+	row, ok := BuildZenUsage(body)
+	if !ok {
+		s.usage.setRow("opencode-go", providerOrKeep(s, "opencode-go", "parse error: unexpected /usage payload"))
+		return
+	}
+	s.usage.setRow("opencode-go", row)
+}
+
+// BuildZenUsage decodes an opencode /usage response body into the canonical
+// "opencode-go" ProviderUsage row, accepting both the current
+// {"usage":{...}} envelope and the legacy top-level window shape. It is the
+// single parse both usage paths share — the in-session poller here and the
+// launch banner (internal/tui calls this same function) — so a future
+// envelope change cannot fix one path and silently break the other (the
+// prior "[Zen —]" regression). ok=false on garbage or on a well-formed
+// payload carrying no known signal; the caller keeps its last good row.
+func BuildZenUsage(body []byte) (row *ProviderUsage, ok bool) {
 	// The gateway wraps the windows in a "usage" envelope; older shapes put
 	// them at the top level. Accept both: prefer the envelope when present.
 	var payload struct {
@@ -226,26 +258,23 @@ func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 		Rolling *windowPayload `json:"rolling"`
 		Weekly  *windowPayload `json:"weekly"`
 		Monthly *windowPayload `json:"monthly"`
+		// Balance is not in the live payload today: the credit wallet is
+		// console-only (anomalyco/opencode#44189), whose requested shape is
+		// exactly this {"balance":{"usd":...}} sibling of "usage". Absent
+		// fields decode to nil at zero cost, so the money row lights up
+		// automatically if opencode ever ships it.
+		Balance *struct {
+			USD *float64 `json:"usd"`
+		} `json:"balance"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		row := s.usage.getRowSnapshot("opencode-go")
-		if row != nil {
-			row.Detail = "parse error: " + err.Error()
-			s.usage.setRow("opencode-go", row)
-		}
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		if row := s.usage.getRowSnapshot("opencode-go"); row != nil {
-			s.usage.setRow("opencode-go", row)
-		}
-		return
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
 	}
 	rolling, weekly, monthly := payload.Rolling, payload.Weekly, payload.Monthly
 	if payload.Usage != nil {
 		rolling, weekly, monthly = payload.Usage.Rolling, payload.Usage.Weekly, payload.Usage.Monthly
 	}
-	row := &ProviderUsage{Name: "opencode-go", Kind: UsageCredits, Window: Window5h}
+	row = &ProviderUsage{Name: "opencode-go", Kind: UsageCredits, Window: Window5h}
 	if rolling != nil {
 		row.Rolling = rolling.toStat("rolling")
 	}
@@ -255,17 +284,30 @@ func (s *Server) fetchZenUsage(httpClient *http.Client, base, key string) {
 	if monthly != nil {
 		row.Monthly = monthly.toStat("monthly")
 	}
-	s.usage.setRow("opencode-go", row)
+	if payload.Balance != nil && payload.Balance.USD != nil {
+		usd := *payload.Balance.USD
+		row.Credits = &usd
+	}
+	// A 200 that carries neither windows nor a balance is treated as unusable:
+	// the live endpoint always reports the windows, so an object without them
+	// means the envelope shape changed under us — exactly the change that
+	// once regressed the row to "[Zen —]". Keep the last good row instead.
+	if row.Rolling == nil && row.Weekly == nil && row.Monthly == nil && row.Credits == nil {
+		return nil, false
+	}
+	return row, true
 }
 
-// windowPayload is one opencode usage window: a percent and an ISO reset time.
+// windowPayload is one opencode usage window: a percent, the gateway's
+// health string and an ISO reset time.
 type windowPayload struct {
 	Percent  int    `json:"percent"`
+	Status   string `json:"status"`
 	ResetsAt string `json:"resetsAt"`
 }
 
 func (w *windowPayload) toStat(status string) *WindowStat {
-	return &WindowStat{Status: status, Percent: w.Percent, ResetsAt: w.ResetsAt}
+	return &WindowStat{Status: status, Percent: w.Percent, ResetsAt: w.ResetsAt, State: w.Status}
 }
 
 // providerOrKeep returns the last good row (with Detail set) when present, else a

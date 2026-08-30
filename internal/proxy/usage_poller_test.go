@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -206,6 +207,181 @@ func TestFetchOpenRouterUsageKeyRejectedKeepsLastGood(t *testing.T) {
 	}
 	if row.Detail == "" {
 		t.Fatal("rejection left no Detail")
+	}
+}
+
+// zenUsageRaw is the verified live payload of GET
+// https://opencode.ai/zen/go/v1/usage (probed 2026-08-29 with the account's
+// real Zen key): no money fields at all, per-window percent + gateway health
+// status + ISO resetsAt. Both usage paths must agree byte-for-byte on what it
+// becomes, so internal/tui/usage_test.go pins the rendered token against this
+// exact constant.
+const zenUsageRaw = `{"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"2026-08-30T04:26:38.868Z"},"weekly":{"status":"ok","percent":99,"resetsAt":"2026-08-31T00:00:00.868Z"},"monthly":{"status":"rate-limited","percent":100,"resetsAt":"2026-09-17T10:40:16.868Z"}}}`
+
+// fakeZen serves a fixed /usage body (and 404s everything else), mirroring
+// the shape of fakeOpenRouter for the Zen parity tests.
+func fakeZen(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/usage" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+}
+
+// TestFetchZenUsageLiveShape pins the poller row built from the verified live
+// payload: percents land in the right windows, resetsAt is passed through,
+// and — the gap this closes — the gateway's per-window health string ("ok" /
+// "rate-limited") survives into WindowStat.State instead of being silently
+// dropped, so the statusline can mark a spent-out window. No money field is
+// invented: the payload carries none.
+func TestFetchZenUsageLiveShape(t *testing.T) {
+	srv := fakeZen(t, zenUsageRaw)
+	defer srv.Close()
+	s := New(Config{})
+	s.fetchZenUsage(srv.Client(), srv.URL, "zen-key")
+	row := s.usage.getRowSnapshot("opencode-go")
+	if row == nil {
+		t.Fatal("no row stored")
+	}
+	if row.Kind != UsageCredits || row.Window != Window5h {
+		t.Fatalf("row identity = %+v, want credits/5h", row)
+	}
+	if row.Credits != nil || row.Remaining != nil || row.Limit != nil || row.Used != nil {
+		t.Fatalf("row invented money fields from a money-less payload: %+v", row)
+	}
+	checks := []struct {
+		name       string
+		w          *WindowStat
+		percent    int
+		state      string
+		resetsLike string
+	}{
+		{"rolling", row.Rolling, 0, "ok", "2026-08-30T04:26:38"},
+		{"weekly", row.Weekly, 99, "ok", "2026-08-31T00:00:00"},
+		{"monthly", row.Monthly, 100, "rate-limited", "2026-09-17T10:40:16"},
+	}
+	for _, c := range checks {
+		if c.w == nil {
+			t.Fatalf("%s window missing from row %+v", c.name, row)
+		}
+		if c.w.Percent != c.percent {
+			t.Fatalf("%s percent = %d, want %d", c.name, c.w.Percent, c.percent)
+		}
+		if c.w.State != c.state {
+			t.Fatalf("%s State = %q, want gateway health %q", c.name, c.w.State, c.state)
+		}
+		if !strings.HasPrefix(c.w.ResetsAt, c.resetsLike) {
+			t.Fatalf("%s ResetsAt = %q, want it to start with %q", c.name, c.w.ResetsAt, c.resetsLike)
+		}
+	}
+}
+
+// TestFetchZenUsageMissingFields pins the degraded-envelope path: windows
+// that exist still parse (a window without a status simply carries no State);
+// windows that are absent stay nil so usagefmt omits their segment rather
+// than rendering a false 0%.
+func TestFetchZenUsageMissingFields(t *testing.T) {
+	srv := fakeZen(t, `{"usage":{"weekly":{"percent":99}}}`)
+	defer srv.Close()
+	s := New(Config{})
+	s.fetchZenUsage(srv.Client(), srv.URL, "zen-key")
+	row := s.usage.getRowSnapshot("opencode-go")
+	if row == nil {
+		t.Fatal("no row stored")
+	}
+	if row.Rolling != nil || row.Monthly != nil {
+		t.Fatalf("absent windows materialized: %+v", row)
+	}
+	if row.Weekly == nil || row.Weekly.Percent != 99 || row.Weekly.State != "" {
+		t.Fatalf("weekly = %+v, want percent 99 and no State", row.Weekly)
+	}
+}
+
+// TestFetchZenUsageZeroEdge pins the zero edge: a fresh month's 0% windows
+// still render as real 0% rows (0 is a value here, not an absence marker) —
+// and still no money is invented.
+func TestFetchZenUsageZeroEdge(t *testing.T) {
+	srv := fakeZen(t, `{"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"2026-09-01T00:00:00.000Z"},"weekly":{"status":"ok","percent":0,"resetsAt":"2026-09-07T00:00:00.000Z"},"monthly":{"status":"ok","percent":0,"resetsAt":"2026-10-01T00:00:00.000Z"}}}`)
+	defer srv.Close()
+	s := New(Config{})
+	s.fetchZenUsage(srv.Client(), srv.URL, "zen-key")
+	row := s.usage.getRowSnapshot("opencode-go")
+	if row == nil || row.Rolling == nil || row.Weekly == nil || row.Monthly == nil {
+		t.Fatalf("all-nil windows parsed from a zero payload: %+v", row)
+	}
+	if row.Monthly.Percent != 0 || row.Monthly.State != "ok" {
+		t.Fatalf("monthly = %+v, want 0%%/ok", row.Monthly)
+	}
+}
+
+// TestFetchZenUsageKeepsLastGood pins the two keep-the-row paths: a non-200
+// response now records the status in Detail (it previously kept the row
+// silently), and a well-formed JSON object that carries no windows — the
+// envelope-shape change that once regressed the row to "[Zen —]" — is treated
+// as unusable so the last good row survives with a parse-error Detail.
+func TestFetchZenUsageKeepsLastGood(t *testing.T) {
+	good := fakeZen(t, zenUsageRaw)
+	defer good.Close()
+	s := New(Config{})
+	s.fetchZenUsage(good.Client(), good.URL, "zen-key")
+	before := s.usage.getRowSnapshot("opencode-go")
+	if before == nil || before.Weekly == nil || before.Weekly.Percent != 99 {
+		t.Fatalf("seed fetch did not store a good row: %+v", before)
+	}
+
+	bad := fakeZen(t, `{"data":{"windows":[]}}`) // 200, valid JSON, no known shape
+	defer bad.Close()
+	s.fetchZenUsage(bad.Client(), bad.URL, "zen-key")
+	row := s.usage.getRowSnapshot("opencode-go")
+	if row.Weekly == nil || row.Weekly.Percent != 99 || row.Monthly.State != "rate-limited" {
+		t.Fatalf("shapeless 200 wiped the last good row: %+v", row)
+	}
+	if !strings.Contains(row.Detail, "parse error") {
+		t.Fatalf("Detail = %q, want the parse-error note", row.Detail)
+	}
+
+	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"message":"invalid key"}}`))
+	}))
+	defer rejected.Close()
+	s.fetchZenUsage(rejected.Client(), rejected.URL, "zen-key")
+	row = s.usage.getRowSnapshot("opencode-go")
+	if row.Weekly == nil || row.Weekly.Percent != 99 {
+		t.Fatalf("401 wiped the last good row: %+v", row)
+	}
+	if !strings.Contains(row.Detail, "401") {
+		t.Fatalf("Detail = %q, want it to record the rejection status", row.Detail)
+	}
+}
+
+// TestBuildZenUsageBalance pins the forward-compatible money parse: the live
+// payload has no money today, and the shape the console-balance proposal
+// (anomalyco/opencode#44189) asks for is a top-level "balance" sibling of
+// "usage". Absent → no money fields; present → Credits lights up. The status
+// tokens those rows render are pinned in internal/usagefmt and
+// internal/tui/usage_test.go.
+func TestBuildZenUsageBalance(t *testing.T) {
+	row, ok := BuildZenUsage([]byte(zenUsageRaw))
+	if !ok || row == nil {
+		t.Fatalf("live payload rejected: ok=%v row=%+v", ok, row)
+	}
+	if row.Credits != nil {
+		t.Fatalf("money invented from a money-less payload: %+v", row.Credits)
+	}
+	withBal, ok := BuildZenUsage([]byte(zenUsageRaw[:len(zenUsageRaw)-1] + `,"balance":{"usd":4.10,"currency":"USD","asOf":"2026-08-29T00:00:00Z"}}`))
+	if !ok || withBal == nil {
+		t.Fatal("payload with balance sibling rejected")
+	}
+	if withBal.Credits == nil || *withBal.Credits != 4.10 {
+		t.Fatalf("Credits = %v, want the 4.10 balance", withBal.Credits)
+	}
+	if withBal.Rolling == nil || withBal.Monthly.State != "rate-limited" {
+		t.Fatalf("windows lost when balance parsed: %+v", withBal)
 	}
 }
 

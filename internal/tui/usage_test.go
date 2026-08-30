@@ -2,6 +2,7 @@ package tui
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -48,6 +49,15 @@ func TestUsageSummaryTextUsesLineForUnknownProviders(t *testing.T) {
 		t.Fatalf("usageSummaryText = %q, want the Line text", got)
 	}
 }
+
+// zenUsageRaw mirrors the verified live payload of GET
+// https://opencode.ai/zen/go/v1/usage (probed 2026-08-29 with the account's
+// real Zen key): no money fields, per-window percent + gateway health status
+// + ISO resetsAt. The identical constant lives in
+// internal/proxy/usage_poller_test.go; same bytes, same canonical row, same
+// token on both views — these two tests pin that parity contract (same
+// duplication discipline as the fakeOpenRouter pairs).
+const zenUsageRaw = `{"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"2026-08-30T04:26:38.868Z"},"weekly":{"status":"ok","percent":99,"resetsAt":"2026-08-31T00:00:00.868Z"},"monthly":{"status":"rate-limited","percent":100,"resetsAt":"2026-09-17T10:40:16.868Z"}}}`
 
 // TestFetchZenGoUsageEnvelope pins the /usage response shape: the gateway wraps
 // the windows in a "usage" envelope ({"usage":{"rolling":...}}); a parser that
@@ -97,6 +107,127 @@ func TestFetchZenGoUsageTopLevel(t *testing.T) {
 	row := fetchZenGoUsageAt(srv.URL, http.DefaultClient, "test-key")
 	if row.Usage == nil || row.Usage.Rolling == nil || row.Usage.Rolling.Percent != 10 {
 		t.Fatalf("top-level rolling not parsed: %+v", row.Usage)
+	}
+}
+
+// fakeZen serves a fixed /usage body, mirroring the poller test's fake.
+func fakeZen(body string, status int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/usage" {
+			http.NotFound(w, r)
+			return
+		}
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body)
+	}))
+}
+
+// TestZenUsageBannerParityLivePayload pins the launch banner token built from
+// the verified live payload: "[Zen 5h 0% · wk 99% · mo 100%!]" — the monthly
+// window carries the gateway's "rate-limited" health and must render marked.
+// The poller side (internal/proxy/usage_poller_test.go) pins the identical
+// canonical row from the identical bytes, and both views render through
+// usagefmt, so the golden here IS the statusline token. No dollars: the
+// payload has none, and the formatter must not invent any.
+func TestZenUsageBannerParityLivePayload(t *testing.T) {
+	srv := fakeZen(zenUsageRaw, http.StatusOK)
+	defer srv.Close()
+	snap := fetchZenGoUsageAt(srv.URL, srv.Client(), "test-key")
+	if snap.Usage == nil || !snap.Ready {
+		t.Fatalf("live payload produced no row: %+v", snap)
+	}
+	want := "[Zen 5h 0% · wk 99% · mo 100%!]"
+	got := usagefmt.FormatProviderUsage(*snap.Usage)
+	if got != want {
+		t.Fatalf("banner = %q, want %q", got, want)
+	}
+	if len([]rune(got)) > 40 {
+		t.Fatalf("Zen token too wide for the statusline: %q (%d chars)", got, len([]rune(got)))
+	}
+}
+
+// TestZenUsageBannerMissingFields pins the degraded path: an envelope with a
+// single status-less window renders only that window's segment — no false
+// 0% siblings, no "[Zen —]" regression, no money.
+func TestZenUsageBannerMissingFields(t *testing.T) {
+	srv := fakeZen(`{"usage":{"weekly":{"percent":99}}}`, http.StatusOK)
+	defer srv.Close()
+	snap := fetchZenGoUsageAt(srv.URL, srv.Client(), "test-key")
+	if snap.Usage == nil || snap.Usage.Weekly == nil {
+		t.Fatalf("missing-field payload produced no row: %+v", snap)
+	}
+	if got := usagefmt.FormatProviderUsage(*snap.Usage); got != "[Zen wk 99%]" {
+		t.Fatalf("banner = %q, want %q", got, "[Zen wk 99%]")
+	}
+}
+
+// TestZenUsageBannerZeroEdge pins the zero edge: fresh 0% windows are real
+// values and render as such (an omitted window would wrongly claim data the
+// plan never gave, but a present 0% must show 0%).
+func TestZenUsageBannerZeroEdge(t *testing.T) {
+	srv := fakeZen(`{"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"2026-09-01T00:00:00.000Z"},"weekly":{"status":"ok","percent":0,"resetsAt":"2026-09-07T00:00:00.000Z"},"monthly":{"status":"ok","percent":0,"resetsAt":"2026-10-01T00:00:00.000Z"}}}`, http.StatusOK)
+	defer srv.Close()
+	snap := fetchZenGoUsageAt(srv.URL, srv.Client(), "test-key")
+	if snap.Usage == nil {
+		t.Fatalf("zero payload produced no row: %+v", snap)
+	}
+	if got := usagefmt.FormatProviderUsage(*snap.Usage); got != "[Zen 5h 0% · wk 0% · mo 0%]" {
+		t.Fatalf("banner = %q", got)
+	}
+}
+
+// TestZenUsageBannerRejectedKey pins the banner's rejected-key guard (it had
+// none — a 401 body parsed as an empty window set and rendered "[Zen —]"):
+// a non-200 must surface as an error line and the summary must not show the
+// dash token.
+func TestZenUsageBannerRejectedKey(t *testing.T) {
+	srv := fakeZen(`{"error":{"message":"invalid key"}}`, http.StatusUnauthorized)
+	defer srv.Close()
+	snap := fetchZenGoUsageAt(srv.URL, srv.Client(), "bad-key")
+	if snap.Usage != nil || snap.Ready {
+		t.Fatalf("row = %+v ready=%v, want unusable snapshot", snap.Usage, snap.Ready)
+	}
+	if !strings.Contains(snap.Line, "401") {
+		t.Fatalf("line = %q, want it to mention the status", snap.Line)
+	}
+	if summary := usageSummaryText(map[string]usageSnapshot{"opencode-go": snap}); strings.Contains(summary, "[Zen") {
+		t.Fatalf("rejected key rendered a Zen token: %q", summary)
+	}
+}
+
+// TestZenUsageBannerShapelessPayload pins the last defense: a 200 whose JSON
+// is valid but carries none of the known shapes (the envelope change that
+// once regressed the row to "[Zen —]") yields an error line, not an empty
+// window row.
+func TestZenUsageBannerShapelessPayload(t *testing.T) {
+	srv := fakeZen(`{"data":{"windows":[]}}`, http.StatusOK)
+	defer srv.Close()
+	snap := fetchZenGoUsageAt(srv.URL, srv.Client(), "test-key")
+	if snap.Usage != nil || snap.Ready {
+		t.Fatalf("shapeless payload produced a row: %+v", snap)
+	}
+	if snap.Line == "" {
+		t.Fatal("shapeless payload left no error line")
+	}
+}
+
+// TestZenUsageBannerBalancePresentsMoney pins the forward-compatible money
+// display: if opencode ever ships the console-balance proposal as a top-level
+// "balance" sibling of "usage" (issue anomalyco/opencode#44189), the banner
+// shows it beside the windows; until then the same parse yields no money.
+func TestZenUsageBannerBalancePresentsMoney(t *testing.T) {
+	withBal := zenUsageRaw[:len(zenUsageRaw)-1] + `,"balance":{"usd":4.10,"currency":"USD","asOf":"2026-08-29T00:00:00Z"}}`
+	srv := fakeZen(withBal, http.StatusOK)
+	defer srv.Close()
+	snap := fetchZenGoUsageAt(srv.URL, srv.Client(), "test-key")
+	if snap.Usage == nil || snap.Usage.Credits == nil || *snap.Usage.Credits != 4.10 {
+		t.Fatalf("balance sibling not parsed: %+v", snap.Usage)
+	}
+	if got := usagefmt.FormatProviderUsage(*snap.Usage); got != "[Zen $4.10 left · 5h 0% · wk 99% · mo 100%!]" {
+		t.Fatalf("banner = %q", got)
 	}
 }
 

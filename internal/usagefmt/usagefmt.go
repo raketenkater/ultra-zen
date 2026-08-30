@@ -66,6 +66,21 @@ func humanizeResetSeconds(v int64) string {
 	}
 }
 
+// zenWindowMark flags a Zen window the gateway says is unhealthy (any
+// status other than "ok"/empty — "rate-limited" is the value seen on a
+// spent-out window). It is deliberately one character: the statusline row
+// must stay short beside the [OR ...] token.
+func zenWindowMark(w *proxy.WindowStat) string {
+	if w == nil {
+		return ""
+	}
+	switch w.State {
+	case "", "ok":
+		return ""
+	}
+	return "!"
+}
+
 // FormatProviderUsage renders one ProviderUsage into a single compact bracketed
 // token. It is the single source of truth for both the statusline and the TUI
 // banner.
@@ -125,19 +140,32 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 				return fmt.Sprintf("[OR $%.3f left]", *u.Remaining)
 			}
 		case "opencode-go":
-			// Zen: surface the rolling/weekly/monthly windows.
+			// Zen: surface the rolling/weekly/monthly windows. The live
+			// /usage payload carries no money fields (the credit wallet is
+			// console-only), so a "$" figure appears only if opencode ever
+			// ships the requested top-level "balance" sibling, which
+			// proxy.BuildZenUsage already parses into Credits — unknown
+			// money is omitted, never rendered as $0.00. A window the
+			// gateway flags unhealthy (status "rate-limited") is marked "!"
+			// — the paid plan's only real exhaustion signal on this row.
 			var parts []string
 			if w := u.Rolling; w != nil {
-				parts = append(parts, fmt.Sprintf("5h %d%%", w.Percent))
+				parts = append(parts, fmt.Sprintf("5h %d%%%s", w.Percent, zenWindowMark(w)))
 			}
 			if w := u.Weekly; w != nil {
-				parts = append(parts, fmt.Sprintf("wk %d%%", w.Percent))
+				parts = append(parts, fmt.Sprintf("wk %d%%%s", w.Percent, zenWindowMark(w)))
 			}
 			if w := u.Monthly; w != nil {
-				parts = append(parts, fmt.Sprintf("mo %d%%", w.Percent))
+				parts = append(parts, fmt.Sprintf("mo %d%%%s", w.Percent, zenWindowMark(w)))
 			}
 			if len(parts) > 0 {
+				if u.Credits != nil {
+					return fmt.Sprintf("[Zen $%.2f left · %s]", *u.Credits, strings.Join(parts, " · "))
+				}
 				return fmt.Sprintf("[Zen %s]", strings.Join(parts, " · "))
+			}
+			if u.Credits != nil {
+				return fmt.Sprintf("[Zen $%.2f left]", *u.Credits)
 			}
 			if u.Remaining != nil {
 				return fmt.Sprintf("[Zen $%.3f left]", *u.Remaining)

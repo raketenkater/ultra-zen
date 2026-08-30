@@ -12,22 +12,22 @@ import (
 type UsageKind string
 
 const (
-	UsageCredits UsageKind = "credits" // metered in dollars / credits
+	UsageCredits  UsageKind = "credits"  // metered in dollars / credits
 	UsageRequests UsageKind = "requests" // metered in request count
-	UsageUnknown UsageKind = "unknown" // no live endpoint; requests are counted locally
+	UsageUnknown  UsageKind = "unknown"  // no live endpoint; requests are counted locally
 )
 
 // UsageWindow enumerates the reset cadence of a usage stat.
 type UsageWindow string
 
 const (
-	WindowNone     UsageWindow = "none"
-	WindowDaily    UsageWindow = "daily"
-	WindowWeekly   UsageWindow = "weekly"
-	WindowMonthly  UsageWindow = "monthly"
-	Window5h       UsageWindow = "5h"
-	WindowMinute   UsageWindow = "minute"
-	WindowRolling  UsageWindow = "rolling"
+	WindowNone    UsageWindow = "none"
+	WindowDaily   UsageWindow = "daily"
+	WindowWeekly  UsageWindow = "weekly"
+	WindowMonthly UsageWindow = "monthly"
+	Window5h      UsageWindow = "5h"
+	WindowMinute  UsageWindow = "minute"
+	WindowRolling UsageWindow = "rolling"
 )
 
 // WindowStat is one named usage window's live status.
@@ -35,30 +35,35 @@ type WindowStat struct {
 	Status   string `json:"status"`   // human-readable window label, e.g. "rolling"
 	Percent  int    `json:"percent"`  // consumed percentage 0-100
 	ResetsAt string `json:"resetsAt"` // ISO timestamp of the next reset
+	// State is the gateway's per-window health string ("ok",
+	// "rate-limited"). Only the Zen /usage endpoint reports it; empty means
+	// the endpoint did not send one. This is distinct from Status, which has
+	// always carried the window's own label.
+	State string `json:"state,omitempty"`
 }
 
 // ProviderUsage is the per-provider usage snapshot exposed at /v1/usage.
 type ProviderUsage struct {
-	Name        string      `json:"name"`        // provider name (e.g. "openrouter")
-	Kind        UsageKind   `json:"kind"`        // credits | requests | unknown
-	Window      UsageWindow `json:"window"`      // primary reset cadence (summary)
-	Used        *float64    `json:"used,omitempty"`
-	Limit       *float64    `json:"limit,omitempty"`
-	Remaining   *float64    `json:"remaining,omitempty"`
-	Percent     *int        `json:"percent,omitempty"`
-	RequestsUsed   *int64    `json:"requestsUsed,omitempty"`
-	RequestsLimit  *int64    `json:"requestsLimit,omitempty"`
-	RequestsReset  *int64    `json:"requestsReset,omitempty"`
-	Rolling    *WindowStat `json:"rolling,omitempty"`
-	Weekly     *WindowStat `json:"weekly,omitempty"`
-	Monthly    *WindowStat `json:"monthly,omitempty"`
+	Name          string      `json:"name"`   // provider name (e.g. "openrouter")
+	Kind          UsageKind   `json:"kind"`   // credits | requests | unknown
+	Window        UsageWindow `json:"window"` // primary reset cadence (summary)
+	Used          *float64    `json:"used,omitempty"`
+	Limit         *float64    `json:"limit,omitempty"`
+	Remaining     *float64    `json:"remaining,omitempty"`
+	Percent       *int        `json:"percent,omitempty"`
+	RequestsUsed  *int64      `json:"requestsUsed,omitempty"`
+	RequestsLimit *int64      `json:"requestsLimit,omitempty"`
+	RequestsReset *int64      `json:"requestsReset,omitempty"`
+	Rolling       *WindowStat `json:"rolling,omitempty"`
+	Weekly        *WindowStat `json:"weekly,omitempty"`
+	Monthly       *WindowStat `json:"monthly,omitempty"`
 	// FreeLimit is the periodic cap for a credits provider (e.g. OpenRouter's
 	// free-tier daily limit, captured from the /key `limit` field). It is set
 	// only when the provider exposes a finite periodic allowance.
-	FreeLimit  *float64    `json:"freeLimit,omitempty"`
+	FreeLimit *float64 `json:"freeLimit,omitempty"`
 	// Daily is a daily reset window (e.g. OpenRouter free-tier limit_reset),
 	// carrying the ISO timestamp of the next reset in ResetsAt.
-	Daily      *WindowStat `json:"daily,omitempty"`
+	Daily *WindowStat `json:"daily,omitempty"`
 	// Credits is the account balance (total purchased minus total spent),
 	// from /credits — distinct from Remaining, which /key reports as the
 	// per-key cap when the account has no credit data.
@@ -69,9 +74,9 @@ type ProviderUsage struct {
 	// ultra-zen are invisible).
 	FreeReqsUsed  *int64 `json:"freeReqsUsed,omitempty"`
 	FreeReqsLimit *int64 `json:"freeReqsLimit,omitempty"`
-	Exhausted  bool        `json:"exhausted"`
-	LastUpdated string     `json:"lastUpdated"` // ISO timestamp of the last good fetch
-	Detail     string      `json:"detail,omitempty"`
+	Exhausted     bool   `json:"exhausted"`
+	LastUpdated   string `json:"lastUpdated"` // ISO timestamp of the last good fetch
+	Detail        string `json:"detail,omitempty"`
 }
 
 // usageTracker is a concurrency-safe store of per-provider usage rows plus a

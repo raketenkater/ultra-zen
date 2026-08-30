@@ -153,6 +153,10 @@ func fetchZenGoUsage(client *http.Client, key string) usageSnapshot {
 }
 
 // fetchZenGoUsageAt is fetchZenGoUsage with an injectable base URL for tests.
+// The parse itself is shared with the in-session poller (proxy.BuildZenUsage)
+// so the banner and the statusline can never disagree about the same payload
+// — the envelope-shape change that once left the statusline showing
+// "[Zen —]" broke exactly one of the two duplicate parsers.
 func fetchZenGoUsageAt(base string, client *http.Client, key string) usageSnapshot {
 	req, err := http.NewRequest(http.MethodGet, base+"/usage", nil)
 	if err != nil {
@@ -164,47 +168,17 @@ func fetchZenGoUsageAt(base string, client *http.Client, key string) usageSnapsh
 		return usageSnapshot{Provider: "opencode-go", Line: "Zen: " + err.Error()}
 	}
 	defer resp.Body.Close()
+	// A rejected request must not render as an empty window row: keep the
+	// rejection as an error line (same guard the OpenRouter path has).
+	if resp.StatusCode != http.StatusOK {
+		return usageSnapshot{Provider: "opencode-go", Line: "Zen: /usage " + resp.Status}
+	}
 	body, _ := io.ReadAll(resp.Body)
-	// The gateway wraps the windows in a "usage" envelope; older shapes put
-	// them at the top level. Accept both: prefer the envelope when present.
-	var payload struct {
-		Usage *struct {
-			Rolling *windowPayloadTUI `json:"rolling"`
-			Weekly  *windowPayloadTUI `json:"weekly"`
-			Monthly *windowPayloadTUI `json:"monthly"`
-		} `json:"usage"`
-		Rolling *windowPayloadTUI `json:"rolling"`
-		Weekly  *windowPayloadTUI `json:"weekly"`
-		Monthly *windowPayloadTUI `json:"monthly"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return usageSnapshot{Provider: "opencode-go", Line: "Zen: parse error"}
-	}
-	rolling, weekly, monthly := payload.Rolling, payload.Weekly, payload.Monthly
-	if payload.Usage != nil {
-		rolling, weekly, monthly = payload.Usage.Rolling, payload.Usage.Weekly, payload.Usage.Monthly
-	}
-	row := &proxy.ProviderUsage{Name: "opencode-go", Kind: proxy.UsageCredits, Window: proxy.Window5h}
-	if rolling != nil {
-		w := rolling
-		row.Rolling = &proxy.WindowStat{Status: "rolling", Percent: w.Percent, ResetsAt: w.ResetsAt}
-	}
-	if weekly != nil {
-		w := weekly
-		row.Weekly = &proxy.WindowStat{Status: "weekly", Percent: w.Percent, ResetsAt: w.ResetsAt}
-	}
-	if monthly != nil {
-		w := monthly
-		row.Monthly = &proxy.WindowStat{Status: "monthly", Percent: w.Percent, ResetsAt: w.ResetsAt}
+	row, ok := proxy.BuildZenUsage(body)
+	if !ok {
+		return usageSnapshot{Provider: "opencode-go", Line: "Zen: unexpected /usage payload"}
 	}
 	return usageSnapshot{Provider: "opencode-go", Usage: row, Ready: true}
-}
-
-// windowPayloadTUI mirrors the opencode-go /usage window shape ({percent,...}).
-type windowPayloadTUI struct {
-	Status   string `json:"status"`
-	Percent  int    `json:"percent"`
-	ResetsAt string `json:"resetsAt"`
 }
 
 // usageSummaryText joins every provider's canonical usage row into one display
