@@ -314,8 +314,9 @@ func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, ap
 			return nil, "", fmt.Errorf("OpenRouter key is no longer available")
 		}
 		// Must match the primary fetch so a model picked in the picker (paid or
-		// ranked-top-100) is found here too — otherwise models.Find returns nil
-		// and the launch fails. Default = ranked top 100; --all-models = full.
+		// ranked) is found here too — otherwise models.Find returns nil and the
+		// launch fails. Default = ranked with the free tier uncapped and the
+		// paid weekly top capped; --all-models = full.
 		if allModels {
 			list, err := models.ListOpenRouterAll(client, key)
 			return list, key, err
@@ -324,7 +325,7 @@ func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, ap
 		if err != nil {
 			return nil, "", err
 		}
-		return models.TopN(ranked, 100), key, nil
+		return models.CapOpenRouterPicker(ranked), key, nil
 	case provider == "opencode-go":
 		key := keys.Load("opencode-go")
 		if key == "" {
@@ -380,9 +381,10 @@ func main() {
 		cmdUsage()
 		return
 	}
-	// `setup` installs the binary + `uz` symlink system-wide and initialises the
-	// shared key store at /etc/ultra-zen/keys so any user on the machine can
-	// launch ultra-zen. See setup.go.
+	// `setup` installs the binary + `uz` symlink system-wide, verifies PATH,
+	// and initialises the shared key store at /etc/ultra-zen/keys;
+	// `setup providers` shows the per-provider key status table and adds
+	// missing keys. See setup.go and setup_providers.go.
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
 		cmdSetup(os.Args[2:])
 		return
@@ -416,7 +418,7 @@ func main() {
 		openRouterRPM = flag.Int("openrouter-rpm", 20, "pace OpenRouter free requests per minute (0 disables pacing)")
 		port          = flag.Int("port", 0, "local proxy listen port (0 = pick a free port per instance)")
 		listOnly      = flag.Bool("list", false, "list available models and exit")
-		allModels     = flag.Bool("all-models", false, "expose EVERY model (paid+free) from every provider; default shows the top 100 most-used OpenRouter models (by real usage) for a usable picker")
+		allModels     = flag.Bool("all-models", false, "expose EVERY model (paid+free) from every provider; default shows every free OpenRouter model plus the top 100 most-used paid ones (by real usage)")
 		proxyOnly     = flag.Bool("proxy-only", false, "start the proxy and block (for testing)")
 		showVer       = flag.Bool("version", false, "print version and exit")
 		resumeSession = flag.String("resume-session", "", "reopen a recorded ultra-zen session (session-id or \"latest\"); see `ultra-zen resume`")
@@ -653,12 +655,13 @@ func main() {
 		if *allModels {
 			list, err = models.ListOpenRouterAll(httpClient, key)
 		} else {
-			// Default: the most-used OpenRouter models (real usage ranking),
-			// capped at the top 100 so the picker stays usable.
+			// Default: the usage-ranked catalog (free block first, ordered by
+			// the weekly rankings) with the paid "most used" block capped so the
+			// picker stays usable — every :free model is kept.
 			var ranked []models.Model
 			ranked, err = models.ListOpenRouterRanked(httpClient, key)
 			if err == nil {
-				list = models.TopN(ranked, 100)
+				list = models.CapOpenRouterPicker(ranked)
 			}
 		}
 		if err != nil {

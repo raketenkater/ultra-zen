@@ -3,6 +3,7 @@ package main
 import (
 	"testing"
 
+	"github.com/raketenkater/ultra-zen/internal/claude"
 	"github.com/raketenkater/ultra-zen/internal/models"
 	"github.com/raketenkater/ultra-zen/internal/proxy"
 )
@@ -219,5 +220,64 @@ func TestBuildAdvertisedCatalog_DedupByOOverlap(t *testing.T) {
 	}
 	if len(selectable) != 1 || selectable[0].Model != "ms-1" {
 		t.Fatalf("expected a single selectable ms-1 upstream, got %+v", selectable)
+	}
+}
+
+// TestBuildAdvertisedCatalog_FreeMarkersSurviveMerge pins requirement 4: the
+// Free flag — the sole input to the " (free)" display marker and the free/paid
+// tier grouping at /v1/models — must survive the merge for every provider
+// (openrouter :free, zen *-free, BYO free tier), and the gateway-cache
+// display names built from modelInfos must keep the free marker exactly once.
+func TestBuildAdvertisedCatalog_FreeMarkersSurviveMerge(t *testing.T) {
+	orFree := models.Model{ID: "vendor/small:free", Name: "Small", Base: models.OpenRouterBase, Free: true, ContextLength: 100000}
+	orPaid := models.Model{ID: "vendor/big", Name: "Big", Base: models.OpenRouterBase, Free: false}
+	zenFree := models.Model{ID: "glm-5.2-free", Name: "GLM 5.2 Free", Base: models.MainBase, Free: true}
+	msFree := models.Model{ID: "Qwen/Qwen3", Name: "Qwen3", Base: models.ModelScopeBase, Free: true}
+
+	infos, _ := buildAdvertisedCatalog(
+		"opencode-go", "glm-5.2",
+		[]models.Model{zenFree},
+		nil, // zenList nil: opencode-go is primary, merged via primaryList
+		[]models.Model{orFree, orPaid},
+		map[string][]models.Model{"modelscope": {msFree}},
+		[]string{"modelscope"},
+		"key", "zenKey", "orKey",
+		map[string]string{"modelscope": "key-ms"},
+		"openai", "",
+	)
+
+	freeOf := func(provider, id string) *bool {
+		for _, m := range infos {
+			if m.Provider == provider && m.ID == id {
+				return &m.Free
+			}
+		}
+		return nil
+	}
+	check := func(provider, id string, want bool) {
+		t.Helper()
+		got := freeOf(provider, id)
+		if got == nil {
+			t.Fatalf("%s/%s missing from merged catalog", provider, id)
+		}
+		if *got != want {
+			t.Fatalf("%s/%s Free = %v, want %v", provider, id, *got, want)
+		}
+	}
+	check("openrouter", "vendor/small:free", true)
+	check("openrouter", "vendor/big", false)
+	check("opencode-go", "glm-5.2-free", true)
+	check("modelscope", "Qwen/Qwen3", true)
+
+	// Mirror main.go's gateway-cache rendering: the OpenRouter free marker is
+	// applied from m.Free (never from the id), WithFreeMarker stays idempotent,
+	// and non-openrouter free models keep their own free tag.
+	display := proxy.ModelDisplayName("Small", "openrouter")
+	marked := claude.WithFreeMarker(display)
+	if marked != "Small — OpenRouter (free)" {
+		t.Fatalf("openrouter free display = %q", marked)
+	}
+	if again := claude.WithFreeMarker(marked); again != marked {
+		t.Fatalf("free marker not idempotent: %q -> %q", marked, again)
 	}
 }

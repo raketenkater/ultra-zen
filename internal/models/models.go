@@ -198,7 +198,6 @@ func normalizeSlug(s string) string {
 	return s
 }
 
-
 // knownContextWindows supplies the real context window for models whose
 // gateway's /models endpoint does NOT report one. Verified live: the opencode
 // Zen gateway (go + main tiers) returns entries with only id/object/created/
@@ -528,15 +527,27 @@ func ListOpenRouterAll(httpClient *http.Client, apiKey string) ([]Model, error) 
 // current usage (total tokens over the last 7 days) using the OpenRouter
 // rankings-daily dataset. Free models form the first block (usage-descending
 // within the block), paid models follow (usage-descending), so the top of a
-// caller's TopN cap is always the free tier — raw token counts alone left free
-// models scattered mid-list or cut off entirely behind paid volume. Models
-// absent from the rankings fall to the end of their block, alphabetically.
-// The returned slice is the full catalog in that order. Requires an API key.
+// capped picker view (CapOpenRouterPicker) is always the free tier — raw token
+// counts alone left free models scattered mid-list or cut off entirely behind
+// paid volume. Models absent from the rankings fall to the end of their block,
+// alphabetically. The returned slice is the full catalog in that order.
+// Requires an API key.
 func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, error) {
+	out, err := listOpenRouterRankedAt(OpenRouterBase, httpClient, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	return FilterUnavailable("openrouter", out), nil
+}
+
+// listOpenRouterRankedAt is ListOpenRouterRanked against an injectable base
+// URL (tests drive it with an httptest server; the public function passes
+// OpenRouterBase — same seam as recheckProvider).
+func listOpenRouterRankedAt(base string, httpClient *http.Client, apiKey string) ([]Model, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
 	}
-	entries, err := fetchEntries(httpClient, OpenRouterBase, apiKey)
+	entries, err := fetchEntries(httpClient, base, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("openrouter: %w", err)
 	}
@@ -546,15 +557,15 @@ func ListOpenRouterRanked(httpClient *http.Client, apiKey string) ([]Model, erro
 		out = append(out, Model{
 			ID:            e.ID,
 			Name:          pretty(e.ID),
-			Base:          OpenRouterBase,
+			Base:          base,
 			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
 			ContextLength: e.ContextLength,
 			CanonicalSlug: e.CanonicalSlug,
 		})
 	}
-	rank := fetchOpenRouterRanking(httpClient, apiKey)
+	rank := fetchOpenRouterRankingAt(base, httpClient, apiKey)
 	orderOpenRouterRanked(out, rank)
-	return FilterUnavailable("openrouter", out), nil
+	return out, nil
 }
 
 // orderOpenRouterRanked sorts out in place: free block first, paid second,
@@ -607,17 +618,132 @@ type rankingEntry struct {
 // but deprecated models don't accumulate to the top. Transport errors or an
 // empty dataset return an empty map, leaving models unranked (alpha order).
 //
+// The fetch is memoized on disk with a 24h TTL (openRouterRankingTTL): the
+// ranking only shifts day-to-day, and re-fetching the dataset on every picker
+// open (main launch path, TUI switch, fallback screen) wastes the request
+// budget for no ordering change. A fresh successful fetch overwrites the
+// cache; on fetch failure the last snapshot is served until it ages past the
+// TTL, so a transient rankings outage degrades to a slightly stale order
+// instead of no order at all. Cache style follows recent.go /
+// openrouterquota.go: best-effort, corrupt file means re-fetch, never a launch
+// blocker. Tests isolate it via openRouterRankingCachePath (XDG_CACHE_HOME)
+// and the orRankingClock seam.
+//
 // The ranking rows are keyed by model_permaslug, which uses dated
 // canonical_slugs for some models (e.g. "deepseek/deepseek-v4-flash-20260731")
 // and the bare id for others. We normalize each permaslug by stripping the
 // trailing -YYYYMMDD date so the resulting map keys align with the /models ids
 // and canonical_slugs used by ListOpenRouterRanked.
 func fetchOpenRouterRanking(httpClient *http.Client, apiKey string) map[string]rankingEntry {
+	return fetchOpenRouterRankingAt(OpenRouterBase, httpClient, apiKey)
+}
+
+// fetchOpenRouterRankingAt is fetchOpenRouterRanking against an injectable
+// base URL (tests pass an httptest server; production passes OpenRouterBase).
+func fetchOpenRouterRankingAt(base string, httpClient *http.Client, apiKey string) map[string]rankingEntry {
+	path := openRouterRankingCachePath()
+	now := orRankingClock()
+	if path != "" {
+		if rank, ok := readOpenRouterRankingCache(path, now); ok {
+			return rank
+		}
+	}
+	rank := fetchOpenRouterRankingLive(base, httpClient, apiKey)
+	if path != "" && len(rank) > 0 {
+		writeOpenRouterRankingCache(path, rank, now)
+	}
+	return rank
+}
+
+// openRouterRankingTTL is how long a fetched usage ranking stays authoritative.
+// The dataset aggregates daily usage, so a day-old snapshot still reflects the
+// current week's ordering; 24h matches the unavailable-models TTL.
+const openRouterRankingTTL = 24 * time.Hour
+
+// orRankingClock is the time seam for the ranking cache TTL (tests replace it).
+var orRankingClock = func() time.Time { return time.Now() }
+
+// openRouterRankingCachePath returns the memo file for the aggregated weekly
+// ranking, or "" when no home directory is resolvable (cache disabled).
+func openRouterRankingCachePath() string {
+	base := os.Getenv("XDG_CACHE_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		base = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(base, "ultra-zen", "openrouter-ranking.json")
+}
+
+// orRankingCache is the persisted ranking snapshot: normalized permaslug ->
+// total tokens over the fetch's trailing window, plus the fetch time.
+type orRankingCache struct {
+	FetchedAt time.Time                  `json:"fetched_at"`
+	Rank      map[string]rankingEntryDTO `json:"rank"`
+}
+
+// rankingEntryDTO is the JSON form of rankingEntry (rankingEntry itself has
+// unexported fields and must not leak into cache files).
+type rankingEntryDTO struct {
+	Tokens int64 `json:"tokens"`
+}
+
+// readOpenRouterRankingCache returns the cached ranking when it exists, parses,
+// and is younger than openRouterRankingTTL; ok=false means re-fetch.
+func readOpenRouterRankingCache(path string, now time.Time) (map[string]rankingEntry, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var rec orRankingCache
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, false
+	}
+	if rec.FetchedAt.IsZero() || now.Sub(rec.FetchedAt) > openRouterRankingTTL {
+		return nil, false
+	}
+	out := make(map[string]rankingEntry, len(rec.Rank))
+	for k, v := range rec.Rank {
+		out[k] = rankingEntry{tokens: v.Tokens}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// writeOpenRouterRankingCache persists a fresh ranking snapshot atomically
+// (tmp + rename, 0600 like the other ultra-zen cache files). Best-effort.
+func writeOpenRouterRankingCache(path string, rank map[string]rankingEntry, now time.Time) {
+	rec := orRankingCache{FetchedAt: now, Rank: make(map[string]rankingEntryDTO, len(rank))}
+	for k, v := range rank {
+		rec.Rank[k] = rankingEntryDTO{Tokens: v.tokens}
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+// fetchOpenRouterRankingLive performs the actual rankings-daily request and
+// aggregation (the old fetchOpenRouterRanking body, extracted so the cache
+// wrapper stays testable).
+func fetchOpenRouterRankingLive(base string, httpClient *http.Client, apiKey string) map[string]rankingEntry {
 	out := map[string]rankingEntry{}
 	now := time.Now()
 	start := now.AddDate(0, 0, -7).UTC().Format("2006-01-02")
 	end := now.UTC().Format("2006-01-02")
-	url := fmt.Sprintf("%s/datasets/rankings-daily?start_date=%s&end_date=%s", OpenRouterBase, start, end)
+	url := fmt.Sprintf("%s/datasets/rankings-daily?start_date=%s&end_date=%s", base, start, end)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return out
@@ -660,13 +786,47 @@ func fetchOpenRouterRanking(httpClient *http.Client, apiKey string) map[string]r
 	return out
 }
 
-// TopN returns at most the first n models from a list. Used to cap the default
-// OpenRouter picker view to the most-used models.
+// TopN returns at most the first n models from a list. Generic slice helper;
+// picker views should prefer CapOpenRouterPicker, which caps only the paid
+// block and keeps the free tier whole.
 func TopN(ms []Model, n int) []Model {
 	if n <= 0 || len(ms) <= n {
 		return ms
 	}
 	return ms[:n]
+}
+
+// openRouterPickerCap bounds the paid ("most used this week") block of the
+// default OpenRouter picker view so the list stays scrollable despite
+// OpenRouter's several-hundred-model catalog. The free block is never capped
+// by this number (see CapOpenRouterPicker).
+const openRouterPickerCap = 100
+
+// CapOpenRouterPicker caps a usage-ranked OpenRouter catalog for the default
+// picker view WITHOUT truncating the free tier. The input must already be in
+// orderOpenRouterRanked order (free block first, then paid, each
+// usage-descending): every free model is kept — OpenRouter's free set has
+// grown past the old flat top-100 cap, and cutting it hid free variants from
+// the picker — while the paid block (the "most used this week" ranking) is
+// capped at openRouterPickerCap entries. Paid models absent from the rankings
+// sort alphabetically at the end of the paid block, so the cap may drop
+// unranked paid tail models; that is the intended narrowing of a very long
+// paid catalog. Nothing to do when the input is already within the cap.
+func CapOpenRouterPicker(ranked []Model) []Model {
+	free := 0
+	for _, m := range ranked {
+		if !m.Free {
+			break
+		}
+		free++
+	}
+	paid := len(ranked) - free
+	if paid <= openRouterPickerCap {
+		return ranked
+	}
+	out := make([]Model, 0, free+openRouterPickerCap)
+	out = append(out, ranked[:free+openRouterPickerCap]...)
+	return out
 }
 
 // ListZenAll fetches BOTH the opencode-go (paid) tier and the main tier

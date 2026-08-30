@@ -96,12 +96,12 @@ type fallbackManager struct {
 	// providers (openrouter, opencode-go, BYO free tiers) load their full
 	// paid+free catalog (ListOpenRouterAll etc.) instead of the free-only list,
 	// so the picker surfaces every model — matching `uz --list`.
-	showAll bool
-	listReady         bool
-	editor            *inlineKeyEditor
-	editing           string
-	done              bool
-	quit              bool
+	showAll   bool
+	listReady bool
+	editor    *inlineKeyEditor
+	editing   string
+	done      bool
+	quit      bool
 }
 
 // fallbackLoaded is sent when a provider's model fetch (or key resolution)
@@ -338,12 +338,13 @@ func loadProvider(provider string, showAll bool) fallbackLoaded {
 		if showAll {
 			list, err = models.ListOpenRouterAll(client, key)
 		} else {
-			// Default: most-used OpenRouter models (real usage ranking), capped
-			// at the top 100 so the picker stays usable.
+			// Default: usage-ranked catalog (free block first by the weekly
+			// rankings), paid block capped so the picker stays usable — every
+			// :free model is kept.
 			var ranked []models.Model
 			ranked, err = models.ListOpenRouterRanked(client, key)
 			if err == nil {
-				list = models.TopN(ranked, 100)
+				list = models.CapOpenRouterPicker(ranked)
 			}
 		}
 	case "opencode-go":
@@ -700,7 +701,7 @@ func (m *fallbackManager) View() string {
 	var body string
 	body += m.list.View() + "\n"
 	if len(m.order) > 0 {
-		body += mutedStyle.Render("pool  " + strings.Join(m.orderKeys(), " "+gArrow+" ")) + "\n"
+		body += mutedStyle.Render("pool  "+strings.Join(m.orderKeys(), " "+gArrow+" ")) + "\n"
 	}
 	footer := mutedStyle.Render("enter toggle  r reset  esc save  ctrl+c quit")
 	return frame("pool", "", body, footer, "", m.list.Width()+4)
