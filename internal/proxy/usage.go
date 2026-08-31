@@ -166,6 +166,27 @@ func (t *usageTracker) recordRateLimit(provider string, hdr map[string][]string)
 		reset = get("X-RateLimit-Reset")
 	}
 
+	// Windowed quota families: SAIA's Kong gateway exposes
+	// x-ratelimit-{limit,remaining}-{minute,hour,day,month}, and ModelScope
+	// documents modelscope-ratelimit-requests-{limit,remaining} (account-wide)
+	// plus modelscope-ratelimit-model-requests-{limit,remaining} (per model).
+	// The day window is the headline for free tiers, so it wins over the
+	// single-window fields above when present.
+	if d := get("X-RateLimit-Remaining-Day"); d != "" {
+		if _, err := parseInt64(d); err == nil {
+			remaining = d
+			if lv, err := parseInt64(get("X-RateLimit-Limit-Day")); err == nil {
+				limit = fmt.Sprintf("%d", lv)
+			}
+		}
+	}
+	if r := get("Modelscope-Ratelimit-Requests-Remaining"); r != "" && remaining == "" {
+		remaining = r
+		if lv, err := parseInt64(get("Modelscope-Ratelimit-Requests-Limit")); err == nil {
+			limit = fmt.Sprintf("%d", lv)
+		}
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	row := t.rows[provider]

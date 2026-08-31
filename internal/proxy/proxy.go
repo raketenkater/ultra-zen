@@ -1403,7 +1403,13 @@ func isFreeUsageLimit(body []byte) bool {
 		strings.Contains(msg, "free allocation") ||
 		strings.Contains(msg, "gousagelimiterror") ||
 		strings.Contains(msg, "insufficient_quota") ||
-		strings.Contains(msg, "exceeded your current quota")
+		strings.Contains(msg, "exceeded your current quota") ||
+		// ModelScope's daily free-tier cap words its 429s this way
+		// ("...is temporarily rate-limited upstream" for soft throttles vs
+		// the account-daily exhaustion below).
+		strings.Contains(msg, "daily limit") ||
+		strings.Contains(msg, "daily quota") ||
+		strings.Contains(msg, "requests limit reached")
 }
 
 // isTransientUpstreamFailure reports a 400 body that is really an availability
