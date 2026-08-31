@@ -44,8 +44,11 @@ var Version = "dev"
 // automatic free pool. A daily free allocation is account-wide (the proxy
 // retires a provider's routes together on exhaustion), so sibling models only
 // help against per-model failures; an uncapped catalog would bury the
-// cross-provider routes that actually survive an exhausted account.
-const autoSourceMaxRoutes = 3
+// cross-provider routes that actually survive an exhausted account. The cap
+// applies AFTER intelligence ranking, so these are the provider's smartest
+// free models; 5 keeps breadth (per-model 429s vary) without letting a huge
+// catalog bury other providers.
+const autoSourceMaxRoutes = 5
 
 // autoSourceOrder is the display order for probing other BYO free-tier
 // providers during automatic pool discovery (after the active provider, Zen,
