@@ -169,6 +169,23 @@ func splitFreeModelSpec(value string) (provider, model string, err error) {
 	return provider, model, nil
 }
 
+// freeTierModelsFor lists a provider's free models ordered for rotation:
+// smartest-first when an Artificial Analysis score matches (ggrun's published
+// catalog, refreshed daily), recency-first for models no score covers. The
+// ranking feeds the automatic pool's per-source cap, so the smartest free
+// models are the ones that make it into rotation.
+func freeTierModelsFor(list []models.Model, provider string) []models.Model {
+	free := make([]models.Model, 0, len(list))
+	for _, model := range list {
+		if model.Free {
+			free = append(free, model)
+		}
+	}
+	return models.SortFreeByIntelligence(models.SortByRecent(free, models.LoadRecent()), provider)
+}
+
+// freeTierModels keeps the provider-agnostic ordering (recency) for callers
+// that are not building the rotation pool.
 func freeTierModels(list []models.Model) []models.Model {
 	free := make([]models.Model, 0, len(list))
 	for _, model := range list {
@@ -1039,7 +1056,7 @@ func main() {
 
 		// 1. The active provider's own free catalog (BYO free tiers mark every
 		// model Free). The primary is excluded from its own provider's siblings.
-		own := freeTierModels(list)
+		own := freeTierModelsFor(list, *provider)
 		for i := range own {
 			if i >= autoSourceMaxRoutes {
 				break
@@ -1052,7 +1069,7 @@ func main() {
 		// 2. opencode Zen free tier (if not the active provider).
 		if *provider != "opencode-go" {
 			if err := ensureZen(); err == nil {
-				free := freeTierModels(zenList)
+				free := freeTierModelsFor(zenList, "opencode-go")
 				for i := range free {
 					if i >= autoSourceMaxRoutes {
 						break
@@ -1081,7 +1098,7 @@ func main() {
 				skipped = append(skipped, p+": "+err.Error())
 				continue
 			}
-			free := freeTierModels(freeTierLists[p])
+			free := freeTierModelsFor(freeTierLists[p], p)
 			for i := range free {
 				if i >= autoSourceMaxRoutes {
 					break
@@ -1354,6 +1371,11 @@ func main() {
 		<-sigCh
 		cancel()
 	}()
+
+	// Best-effort background refresh of the AA intelligence table (ggrun's
+	// published catalog, 24h TTL). Feeds the NEXT launch's free-pool ranking;
+	// never blocks or fails the launch.
+	go models.RefreshIntelligenceMaybe(nil)
 
 	env := claude.Env(srv.BaseURL(), selected.ID, fast, selected.ContextLength)
 
