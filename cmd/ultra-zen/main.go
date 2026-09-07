@@ -409,6 +409,11 @@ func main() {
 		cmdSetup(os.Args[2:])
 		return
 	}
+	// `update` upgrades the running binary to the latest release from GitHub.
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		cmdUpdate(os.Args[2:])
+		return
+	}
 
 	// Self-heal: make sure a `uz` symlink exists next to the running binary so
 	// the launcher is on PATH after any install path (go install, make install,
