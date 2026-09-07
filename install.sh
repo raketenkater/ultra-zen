@@ -3,6 +3,7 @@
 # Usage:  curl -fsSL https://raw.githubusercontent.com/raketenkater/ultra-zen/master/install.sh | sh
 # Args:   sh -s -- --system        install system-wide to /usr/local/bin via sudo
 #         sh -s -- --dir=<dir>     install into <dir>
+#         sh -s -- --update        upgrade existing ultra-zen (runs `uz update`)
 # Env:    ULTRA_ZEN_VERSION=v0.2.1 pin a version (default: latest release)
 #         ULTRA_ZEN_BINDIR=<dir>   install target (default ~/.local/bin)
 #         ULTRA_ZEN_SYSTEM=1       same as --system
@@ -17,6 +18,7 @@ BINDIR="${ULTRA_ZEN_BINDIR:-}"
 VERSION="${ULTRA_ZEN_VERSION:-}"
 SYSTEM="${ULTRA_ZEN_SYSTEM:-}"
 ADD_PATH="${ULTRA_ZEN_ADD_PATH:-}"
+DO_UPDATE=""
 
 log()  { printf '→ %s\n' "$1"; }
 warn() { printf '! %s\n' "$1"; }
@@ -28,9 +30,47 @@ for arg in ${1+"$@"}; do
     --system)   SYSTEM=1 ;;
     --dir=*)    BINDIR="${arg#--dir=}" ;;
     --add-path) ADD_PATH=1 ;;
-    *) die "unknown option: $arg (supported: --system, --dir=<dir>, --add-path)" ;;
+    --update)   DO_UPDATE=1 ;;
+    *) die "unknown option: $arg (supported: --system, --dir=<dir>, --add-path, --update)" ;;
   esac
 done
+
+# If --update requested and uz/ultra-zen is on PATH, run built-in updater.
+if [ "$DO_UPDATE" = "1" ]; then
+  if command -v uz >/dev/null 2>&1; then
+    log "updating via built-in updater…"
+    exec uz update
+  elif command -v ultra-zen >/dev/null 2>&1; then
+    log "updating via built-in updater…"
+    exec ultra-zen update
+  else
+    die "ultra-zen not found on PATH; run without --update to install"
+  fi
+fi
+
+# Resolve version (latest release if not pinned).
+if [ -z "$VERSION" ]; then
+  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)
+  [ -n "$VERSION" ] || die "could not resolve the latest release; pin one: ULTRA_ZEN_VERSION=v0.2.1 curl ... | sh"
+fi
+
+# If ultra-zen already installed, check if an update is available.
+if command -v ultra-zen >/dev/null 2>&1; then
+  CURRENT=$(ultra-zen --version 2>/dev/null | sed 's/.* //')
+  if [ -n "$CURRENT" ] && [ "$CURRENT" != "$VERSION" ] && [ "v$CURRENT" != "$VERSION" ]; then
+    log "update available: $CURRENT → $VERSION"
+    # Non-interactive default: just install the new version.
+    # Interactive: ask.
+    if [ -t 0 ] && [ "$ADD_PATH" != "1" ]; then
+      if confirm "upgrade now? [y/N] "; then
+        exec ultra-zen update
+      fi
+    else
+      exec ultra-zen update
+    fi
+  fi
+fi
 
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64|Linux-amd64)   platform=linux_amd64 ;;
@@ -39,12 +79,6 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)               platform=darwin_arm64 ;;
   *) die "unsupported platform $(uname -s)-$(uname -m); build from source: go install github.com/$REPO/cmd/ultra-zen@latest" ;;
 esac
-
-if [ -z "$VERSION" ]; then
-  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1 || true)
-  [ -n "$VERSION" ] || die "could not resolve the latest release; pin one: ULTRA_ZEN_VERSION=v0.2.1 curl ... | sh"
-fi
 
 if [ -z "$BINDIR" ]; then
   if [ "$SYSTEM" = "1" ]; then BINDIR=/usr/local/bin; else BINDIR="$HOME/.local/bin"; fi
@@ -100,7 +134,7 @@ case ":$PATH:" in *":$BINDIR:"*) : ;; *)
   printf '  add it:  %s\n' "$line"
   # Only write shell config with consent: an interactive y, or the explicit
   # ULTRA_ZEN_ADD_PATH=1 for piped runs. Never silently.
-  if [ "$ADD_PATH" = 1 ] || { [ -t 0 ] && confirm "write this line into your shell config now? [y/N] "; }; then
+  if [ "$ADD_PATH" = "1" ] || { [ -t 0 ] && confirm "write this line into your shell config now? [y/N] "; }; then
     rc="$HOME/.profile"
     case "${SHELL##*/}" in zsh) rc="$HOME/.zshrc" ;; esac
     [ -f "$rc" ] || rc="$HOME/.bashrc"
@@ -119,4 +153,3 @@ esac
 log "done. next steps:"
 echo "  uz setup providers   # store provider API keys (opencode Zen, OpenRouter, ...)"
 echo "  uz                   # pick a model and launch Claude Code"
-
