@@ -75,12 +75,25 @@ func (s *Server) fetchProviderUsage(httpClient *http.Client, provider, key strin
 		if row := s.usage.getRowSnapshot(provider); row == nil {
 			s.usage.setRow(provider, &ProviderUsage{Name: provider, Kind: UsageRequests, Window: WindowMinute})
 		}
-	case "cerebras", "cohere", "modelscope", "huggingface", "codex":
+	case "cerebras", "cohere", "huggingface", "codex":
 		s.usage.setRow(provider, &ProviderUsage{
 			Name:   provider,
 			Kind:   UsageUnknown,
 			Window: WindowNone,
 			Detail: "no live usage endpoint; counting requests",
+		})
+	case "modelscope":
+		// ModelScope exposes quota as response headers (modelscope-ratelimit-
+		// requests-* / -model-requests-*) on some deployments (CN-verified
+		// .cn accounts; some .ai too). This account's .ai endpoint emits no
+		// quota headers on either empty probes or real completions — confirmed
+		// live 2026-09-02. No readable endpoint exists, so we fall back to a
+		// request counter with an honest Detail.
+		s.usage.setRow(provider, &ProviderUsage{
+			Name:   provider,
+			Kind:   UsageUnknown,
+			Window: WindowNone,
+			Detail: "no quota headers on this deployment; counting requests",
 		})
 	default:
 		// Unknown BYO provider: count requests only.
