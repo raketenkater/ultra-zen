@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/raketenkater/ultra-zen/internal/models"
+	"github.com/raketenkater/ultra-zen/internal/session"
 )
 
 // Config holds the gateway target and credentials for the proxy.
@@ -43,6 +44,13 @@ type Config struct {
 	AllModels     bool
 	ContextLength int            // primary model's context window in tokens (0 = unknown); used to truncate over-limit requests
 	OnUnavailable func(Upstream) // called after an explicit per-model access denial
+	// SessionID is the stable per-conversation id forwarded to opencode Zen
+	// gateways as x-opencode-session. Zen rejects requests without it (400
+	// MissingSessionID) because it uses the id to pin a conversation to one
+	// routing bucket for prompt-cache efficiency. Empty means "mint a fresh
+	// UUID at New": one proxy instance serves exactly one Claude Code
+	// conversation, so a per-instance id is stable for that conversation.
+	SessionID string
 }
 
 // primaryUpstream returns the canonical Upstream for the primary route,
@@ -150,6 +158,18 @@ const (
 // A Port of 0 lets the OS assign a free port, which allows many ultra-zen
 // instances to run concurrently without port collisions.
 func New(cfg Config) *Server {
+	if cfg.SessionID == "" {
+		// Mint once per proxy instance: the instance maps 1:1 to a Claude Code
+		// conversation, so every request of that conversation presents the
+		// same id to Zen's router. Fall back to a timestamp id on the
+		// (practically impossible) entropy failure rather than sending no
+		// header at all, which Zen hard-rejects.
+		id, err := session.NewSessionID()
+		if err != nil {
+			id = fmt.Sprintf("uz-%d", time.Now().UnixNano())
+		}
+		cfg.SessionID = id
+	}
 	s := &Server{
 		cfg:            cfg,
 		exhaustedRoute: make([]bool, 1+len(cfg.Fallbacks)),
@@ -1347,6 +1367,15 @@ func providerFamily(upstream Upstream) string {
 	}
 }
 
+// isZenUpstream reports whether a route is served by an opencode Zen gateway
+// (go tier or free tier). Zen is the only gateway that requires the
+// x-opencode-session routing header; sending it elsewhere is pointless and
+// could confuse stricter proxies, so the header is gated on this.
+func isZenUpstream(upstream Upstream) bool {
+	return strings.Contains(upstream.Provider, "opencode") ||
+		strings.Contains(strings.ToLower(upstream.BaseURL), "opencode.ai/zen")
+}
+
 // siteOf normalizes the upstream's base URL to its site, so a daily-limit
 // exhaust on one provider site (e.g. api-inference.modelscope.ai) does not
 // retire a healthy sibling site's route (e.g. api-inference.modelscope.cn),
@@ -1629,6 +1658,12 @@ func (s *Server) forwardTo(ctx context.Context, upstream Upstream, oreq *openAIR
 	}
 	upstreamReq.Header.Set("Authorization", "Bearer "+upstream.APIKey)
 	upstreamReq.Header.Set("Content-Type", "application/json")
+	if isZenUpstream(upstream) && s.cfg.SessionID != "" {
+		// Zen routes a conversation to one backend bucket by this id
+		// (prompt-cache affinity). Without it the gateway rejects the
+		// request with 400 MissingSessionID and nothing is served.
+		upstreamReq.Header.Set("x-opencode-session", s.cfg.SessionID)
+	}
 	resp, err = httpClient().Do(upstreamReq)
 	return payload, resp, err
 }
