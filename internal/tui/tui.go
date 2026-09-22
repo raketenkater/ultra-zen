@@ -75,6 +75,20 @@ type tailer interface {
 	tailParts() []string
 }
 
+// inert marks a row the cursor must skip: a label, a sub-detail, anything
+// Enter cannot act on. Section headers were the only such rows for a long
+// time and the navigation tested for their concrete type; the search screen
+// adds two more (a result's heading and its per-upstream cost lines), so the
+// property is named instead of enumerated. A row that renders but cannot be
+// chosen must implement this, or Enter on it silently does nothing.
+type inert interface{ inertRow() }
+
+// isInert reports whether the cursor must skip this row.
+func isInert(item list.Item) bool {
+	_, ok := item.(inert)
+	return ok
+}
+
 // columnDelegate renders every item as exactly one physical line:
 // [gutter][name left-aligned][tail right-aligned]. Height()==1 for all rows,
 // headers included, which is what keeps the list's pagination arithmetic
@@ -189,7 +203,10 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	if !ok {
 		return
 	}
-	isSelected := index == m.Index()
+	// An inert row can still be the list's index while the cursor travels
+	// over it, so selection is denied here as well as in the navigation —
+	// otherwise a heading briefly renders as though Enter would launch it.
+	isSelected := index == m.Index() && !isInert(item)
 	emptyFilter := m.FilterState() == list.Filtering && m.FilterValue() == ""
 	_, isStatus := item.(providerStatusItem)
 	_, isFallbackStatus := item.(fallbackRow)
@@ -224,6 +241,8 @@ func (d columnDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	// tier word individually (free = accent cyan, everything else muted).
 	nameStyle := fgStyle
 	switch {
+	case isInert(item):
+		nameStyle = mutedStyle
 	case isStatus:
 		nameStyle = mutedStyle
 		if st := item.(providerStatusItem); st.kind == "error" {
@@ -308,16 +327,35 @@ var (
 	baseCohere      = "https://api.cohere.ai/compatibility/v1"
 )
 
-// tailParts renders the tier word first (it is never dropped), then context,
-// then recency (shed first under width pressure).
+// tierParts renders the two leading tail fields every model row shares: the
+// tier word (never dropped) and the price.
+//
+// The price is deliberately absent on a free row rather than rendered as a
+// dash: the tail is a right-aligned blob whose parts shed from the end, not a
+// fixed column grid, so a placeholder buys no alignment and only repeats what
+// the tier word already said. A paid model whose gateway publishes no rate
+// reads "credits" — the Zen tiers bill against a balance, and printing
+// "$0.00/M" there would be a cost ultra-zen invented.
+func tierParts(m models.Model) []string {
+	if m.Free || m.Price.Free() {
+		return []string{"free"}
+	}
+	return []string{"paid", m.Price.Short("credits")}
+}
+
+// ctxPart renders a context window in the picker's k-suffixed shorthand.
+func ctxPart(tokens int) []string {
+	if tokens <= 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("%dk", tokens/1024)}
+}
+
+// tailParts renders the tier word first (it is never dropped), then price,
+// then context, then recency (shed first under width pressure).
 func (i modelItem) tailParts() []string {
-	parts := []string{"paid"}
-	if i.m.Free {
-		parts[0] = "free"
-	}
-	if i.m.ContextLength > 0 {
-		parts = append(parts, fmt.Sprintf("%dk", i.m.ContextLength/1024))
-	}
+	parts := tierParts(i.m)
+	parts = append(parts, ctxPart(i.m.ContextLength)...)
 	if i.recent {
 		parts = append(parts, "recent")
 	}
@@ -376,18 +414,11 @@ func (i providerModelItem) Title() string {
 	return i.model.ID
 }
 
-// tailParts mirrors modelItem: tier first, then ctx. The provider never
+// tailParts mirrors modelItem: tier, price, then ctx. The provider never
 // appears in the tail on the start screen — the section header above already
 // names it (grafted rule: names are stated once).
 func (i providerModelItem) tailParts() []string {
-	parts := []string{"paid"}
-	if i.model.Free {
-		parts[0] = "free"
-	}
-	if i.model.ContextLength > 0 {
-		parts = append(parts, fmt.Sprintf("%dk", i.model.ContextLength/1024))
-	}
-	return parts
+	return append(tierParts(i.model), ctxPart(i.model.ContextLength)...)
 }
 func (i providerModelItem) FilterValue() string {
 	return i.provider + " " + i.model.ID
@@ -449,6 +480,7 @@ func (i groupHeaderItem) line() string {
 }
 func (i groupHeaderItem) Title() string       { return i.line() }
 func (i groupHeaderItem) FilterValue() string { return "" }
+func (groupHeaderItem) inertRow()             {}
 
 func (i comboItem) Title() string {
 	if i.manual {
@@ -471,11 +503,13 @@ func (i comboItem) FilterValue() string {
 
 // ResumeOption describes a recorded, resumable Claude Code session for the
 // current directory, so the picker's opening screen can offer to reopen it
-// instead of starting a fresh one.
+// instead of starting a fresh one. Several are shown at once (newest first):
+// picking up yesterday's work is a different job from picking up the last
+// thing you ran, and only the session's own model tells them apart.
 type ResumeOption struct {
 	SessionID   string // session id to resume
-	Label       string // e.g. the model it was recorded under
-	Description string // e.g. recorded time and cached-agent count
+	Label       string // the model the session was recorded under
+	Description string // e.g. relative age and cached-agent count
 }
 
 // resumeItem is the picker row for a ResumeOption. It only ever appears on
@@ -504,6 +538,7 @@ const (
 	stepFast
 	stepKeys
 	stepFallbacks
+	stepSearch
 )
 
 // providerFilter is the 'p'-cycled filter over the one-screen list. all is the
@@ -533,12 +568,13 @@ type model struct {
 	subtitle    string
 	step        step
 	keys        *keyManager      // non-nil while the key manager screen is open
+	search      *searchManager   // non-nil while the model search screen is open
 	fallbacks   *fallbackManager // non-nil while the fallback pool screen is open
 	catalog     *fallbackManager // background free-provider discovery
 	freePool    []FreeRoute      // configured rotation pool (nil = auto-discover)
 	poolTouched bool             // true once the user engages the pool (free cycle / f editor)
 	prevStep    step             // step to restore when a sub-screen closes
-	resume      *ResumeOption
+	resumes     []ResumeOption
 	poolErr     string
 	usage       map[string]usageSnapshot // launch-time per-provider usage (set when usageLoaded arrives)
 	allModels   bool                     // --all-models: show paid+free, grouped by tier
@@ -570,6 +606,76 @@ func (m *model) openFallbacks() tea.Cmd {
 	m.prevStep = m.step
 	m.step = stepFallbacks
 	return m.fallbacks.Init()
+}
+
+// openSearch opens the cross-provider model search over everything discovered
+// so far. It searches a snapshot rather than live state: the screen is a
+// question about what exists, and a result list reshuffling underneath a
+// moving cursor because a background catalog landed is worse than a result
+// list that is a few seconds old. Reopening the screen takes a fresh one.
+func (m *model) openSearch() tea.Cmd {
+	partial := m.catalog == nil || m.catalog.loading()
+	sm := newSearchManager(m.searchRoutes(), providerKey("openrouter"), partial)
+	m.search = &sm
+	m.prevStep = m.step
+	m.step = stepSearch
+	return m.search.Init()
+}
+
+// searchRoutes flattens every provider catalog the picker knows about into
+// the distinct (provider, model) pairs the search matches against: the
+// primary provider's own list plus every background-discovered provider.
+//
+// Distinct is by provider and model id, because that pair is the whole of
+// what a pick carries back (Result has a Choice and a Provider, no base URL).
+// The Zen catalog in particular lists the same id under both its go and main
+// tiers, which the main screen can show as two rows because it keys them by
+// base — but here they would be two rows that launch the identical thing,
+// which is not a choice, just noise in a list whose job is to make the real
+// choices visible.
+func (m *model) searchRoutes() []models.Route {
+	var out []models.Route
+	seen := make(map[string]int, len(m.all))
+	add := func(provider string, mdl models.Model) {
+		key := provider + "\x00" + mdl.ID
+		if i, dup := seen[key]; dup {
+			// Keep whichever copy carries more: a published price and a
+			// context window are what the row renders, and the tiers do not
+			// always report both.
+			if routeDetail(mdl) > routeDetail(out[i].Model) {
+				out[i].Model = mdl
+			}
+			return
+		}
+		seen[key] = len(out)
+		out = append(out, models.Route{Provider: provider, Model: mdl})
+	}
+	for _, mdl := range m.all {
+		add(m.provider, mdl)
+	}
+	if m.catalog == nil {
+		return out
+	}
+	for _, option := range m.catalog.availableModels() {
+		add(option.Provider, option.Model)
+	}
+	return out
+}
+
+// routeDetail scores how much a catalog entry tells the user, so deduplication
+// keeps the more informative of two otherwise identical records.
+func routeDetail(m models.Model) int {
+	n := 0
+	if m.Price.Known {
+		n += 2
+	}
+	if m.ContextLength > 0 {
+		n++
+	}
+	if m.Name != "" && m.Name != m.ID {
+		n++
+	}
+	return n
 }
 
 // providerHealth renders the compact health token shown in a provider group
@@ -627,10 +733,16 @@ func (m *model) startItems() []list.Item {
 		cycle.first = m.freePool[0].String()
 	}
 	var items []list.Item
-	// The resume row is the pinned top row: resuming the recorded session is
-	// the one job a model list cannot serve, and it never moves.
-	if m.resume != nil {
-		items = append(items, resumeItem{opt: *m.resume})
+	// The resume rows are pinned on top: reopening recorded work is the one
+	// job a model list cannot serve, and it never moves. A single session
+	// stands alone the way it always did; two or more get a section header,
+	// because an unlabelled run of near-identical rows reads as noise above
+	// the catalog rather than as a list of choices.
+	if len(m.resumes) > 1 {
+		items = append(items, groupHeaderItem{label: "Recent sessions", count: len(m.resumes)})
+	}
+	for _, opt := range m.resumes {
+		items = append(items, resumeItem{opt: opt})
 	}
 	// Every model from the initially selected provider is directly launchable;
 	// the manual row remains for the legacy orchestrator/worker flow. The free
@@ -857,21 +969,22 @@ func (m *model) nextSelectable(from, dir int) int {
 		if i < 0 || i >= n {
 			continue
 		}
-		if _, ok := items[i].(groupHeaderItem); !ok {
+		if !isInert(items[i]) {
 			return i
 		}
 	}
 	return -1
 }
 
-// ensureSelectable nudges the cursor off a group header if one is currently
-// selected, preferring the next row downward, then upward.
+// ensureSelectable nudges the cursor off an inert row (a section header, a
+// search result heading) if one is currently selected, preferring the next
+// row downward, then upward.
 func (m *model) ensureSelectable() {
 	items := m.list.Items()
 	if len(items) == 0 {
 		return
 	}
-	if _, ok := items[m.list.Index()].(groupHeaderItem); !ok {
+	if !isInert(items[m.list.Index()]) {
 		return
 	}
 	if i := m.nextSelectable(m.list.Index(), 1); i >= 0 {
@@ -1089,6 +1202,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.usage = ul.rows
 		return m, m.rebuildStart()
 	}
+	// While the search screen is open, it owns all input — every printable
+	// key is query text there, so none of the picker's letter bindings may
+	// see it.
+	if m.search != nil {
+		sm, cmd := m.search.Update(msg)
+		m.search = sm.(*searchManager)
+		if m.search.done {
+			choice, provider := m.search.choice, m.search.provider
+			quit := m.search.quit
+			m.search = nil
+			m.step = m.prevStep
+			m.quit = m.quit || quit
+			if quit {
+				return m, tea.Quit
+			}
+			if choice != "" {
+				// A searched model is a concrete, deliberate pick, exactly
+				// like Enter on a catalog row: it must not silently inherit
+				// the saved free pool as fallbacks.
+				m.freePool = nil
+				m.choice = choice
+				m.choiceVia = provider
+				m.worker = ""
+				return m, tea.Quit
+			}
+			return m, tea.Batch(cmd, m.rebuildStart())
+		}
+		return m, cmd
+	}
 	// While the key manager is open, it owns all input.
 	if m.keys != nil {
 		km, cmd := m.keys.Update(msg)
@@ -1153,6 +1295,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			if !filtering && m.step == stepCombo {
 				return m, m.cycleProviderFilter()
+			}
+		case "s":
+			if !filtering && m.step == stepCombo {
+				return m, m.openSearch()
 			}
 		case "ctrl+c":
 			m.quit = true
@@ -1318,7 +1464,7 @@ func frame(ctx, usage, body, footer, errLine string, termWidth int) string {
 func stepFooter(step step) string {
 	var parts []string
 	if step == stepCombo {
-		parts = []string{"/ filter", "enter launch", "p provider"}
+		parts = []string{"/ filter", "s search", "enter launch", "p provider"}
 	} else {
 		parts = []string{"/ filter", "enter select"}
 	}
@@ -1342,6 +1488,8 @@ func (m model) frameContext() string {
 			return m.provider
 		}
 		return m.provider + " " + gDot + " p:" + m.filter.provider
+	case stepSearch:
+		return "search"
 	case stepOrchestrator:
 		return "orchestrator"
 	case stepWorker:
@@ -1365,6 +1513,11 @@ func (m model) View() string {
 	switch m.step {
 	case stepCombo, stepOrchestrator, stepWorker, stepFast:
 		return frame(m.frameContext(), usage, m.list.View(), stepFooter(m.step), m.poolErr, width)
+	case stepSearch:
+		if m.search != nil {
+			return m.search.View()
+		}
+		return frame(m.frameContext(), "", m.list.View(), stepFooter(m.step), "", width)
 	case stepKeys:
 		if m.keys != nil {
 			return m.keys.View()
@@ -1474,14 +1627,15 @@ type Result struct {
 // preset walks orchestrator → optional worker → fast. The 'f' screen
 // configures the free-model rotation pool, 'p' cycles the provider filter.
 //
-// If resume is non-nil, it is shown as the pinned top row; choosing it sets
-// ResumeSessionID and returns immediately with an empty Choice, so the caller
-// can reopen that session instead of launching a fresh one.
+// resumes are the recent recorded sessions, newest first, shown as the pinned
+// top rows; choosing one sets ResumeSessionID and returns immediately with an
+// empty Choice, so the caller can reopen that session instead of launching a
+// fresh one.
 //
 // allModels gates the --all-models catalog: when true every model (paid+free)
 // from the primary provider is shown, grouped into free/paid sub-sections with
 // tier tags, matching the /model picker. When false only free models show.
-func Run(ms []models.Model, provider string, resume *ResumeOption, allModels bool) Result {
+func Run(ms []models.Model, provider string, resumes []ResumeOption, allModels bool) Result {
 	savedPool := LoadFreePool()
 	catalog := newFallbackManager("", savedPool)
 	catalog.allModelsProvider = provider
@@ -1495,7 +1649,7 @@ func Run(ms []models.Model, provider string, resume *ResumeOption, allModels boo
 		subtitle:  providerSubtitle(provider),
 		step:      stepCombo,
 		catalog:   &catalog,
-		resume:    resume,
+		resumes:   resumes,
 		freePool:  savedPool,
 		allModels: allModels,
 	}

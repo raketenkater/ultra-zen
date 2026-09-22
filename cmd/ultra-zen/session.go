@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/raketenkater/ultra-zen/internal/session"
 	"github.com/raketenkater/ultra-zen/internal/tui"
@@ -81,38 +82,78 @@ func resolveSessionTarget(cacheDir, workDir, value string) (session.Record, erro
 	return rec, nil
 }
 
-// buildResumeOption checks for a resumable session recorded for the current
-// directory and, if one exists, describes it for the TUI's opening screen.
-// Only sessions whose Claude Code transcript still exists are offered, and
-// when none is, it returns nil so the picker shows no resume row at all.
-// The label names the model and the recorded time, because the newest record
-// is the last launch — after a mid-session /model switch that is not
-// necessarily the session the user was just in; the timestamp is what lets
-// them tell which conversation the row reopens.
-func buildResumeOption() *tui.ResumeOption {
+// maxResumeOptions caps how many recorded sessions the picker offers. The
+// list is pinned above the whole model catalog, so it is spending the most
+// valuable rows on screen; five reaches back through a normal day's work
+// without pushing the models themselves below the fold.
+const maxResumeOptions = 5
+
+// buildResumeOptions describes the most recent resumable sessions recorded for
+// the current directory, newest first, for the TUI's opening screen. Only
+// sessions whose Claude Code transcript still exists are offered; with none,
+// it returns nil and the picker shows no resume rows at all.
+//
+// Each row is labelled with the model the session ran under, because that is
+// the only thing distinguishing one recorded conversation from another — and
+// after a mid-session /model switch the newest record is the last launch, not
+// necessarily the session the user was last in. The relative age disambiguates
+// two runs of the same model.
+func buildResumeOptions() []tui.ResumeOption {
 	workDir, err := os.Getwd()
 	if err != nil {
 		return nil
 	}
-	rec, err := session.Latest(sessionCacheDir(), workDir, claudeProjectsDir())
+	records, err := session.List(sessionCacheDir(), workDir, claudeProjectsDir())
 	if err != nil {
 		return nil
 	}
+	var out []tui.ResumeOption
+	for _, rec := range records {
+		if !rec.Resumable {
+			// List returns dead records too (it only prunes the old ones);
+			// offering a session whose transcript is gone hands the user a
+			// row that cannot open.
+			continue
+		}
+		out = append(out, resumeOptionFor(rec))
+		if len(out) == maxResumeOptions {
+			break
+		}
+	}
+	return out
+}
+
+// resumeOptionFor renders one record as a picker row: the model it ran under,
+// then its age and any recoverable workflow state.
+func resumeOptionFor(rec session.Record) tui.ResumeOption {
 	label := rec.Model
 	if label == "" {
 		label = rec.SessionID
 	}
-	label = fmt.Sprintf("%s · %s", label, rec.Recorded.Local().Format("2006-01-02 15:04"))
-	desc := rec.Recorded.Local().Format("2006-01-02 15:04")
-	if !rec.Resumable {
-		// Only reachable when no projects dir was resolvable; Latest would
-		// otherwise have skipped this record. Say so rather than offer a corpse.
-		desc = "no transcript · " + desc
-	}
+	desc := humanAge(time.Since(rec.Recorded))
 	if wf, cached := session.LatestRun(claudeProjectsDir(), rec.WorkDir, rec.SessionID); wf != nil {
-		desc = fmt.Sprintf("%s · workflow %s: %d agents cached", desc, wf.RunID, cached)
+		desc = fmt.Sprintf("%s · %d agents cached", desc, cached)
 	}
-	return &tui.ResumeOption{SessionID: rec.SessionID, Label: label, Description: desc}
+	return tui.ResumeOption{SessionID: rec.SessionID, Label: label, Description: desc}
+}
+
+// humanAge renders how long ago a session ran, at the coarsest unit that still
+// separates it from its neighbours. An absolute timestamp forces the reader to
+// do the subtraction themselves, and in a list of five same-day sessions the
+// date half of it is identical noise on every row.
+func humanAge(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	default:
+		return fmt.Sprintf("%dw ago", int(d.Hours()/(24*7)))
+	}
 }
 
 // sessionSpecFromRecord turns a recorded session into a launch spec,

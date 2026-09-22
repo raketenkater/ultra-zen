@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,20 +156,20 @@ func TestReplayLegacyTUISessionRestoresProvider(t *testing.T) {
 	}
 }
 
-func TestBuildResumeOptionNilWithoutARecordedSession(t *testing.T) {
+func TestBuildResumeOptionsEmptyWithoutARecordedSession(t *testing.T) {
 	restoreHome := setTempHome(t)
 	defer restoreHome()
 	restoreWD := setTempWorkDir(t)
 	defer restoreWD()
 
-	if opt := buildResumeOption(); opt != nil {
-		t.Errorf("buildResumeOption = %+v, want nil with nothing recorded", opt)
+	if opts := buildResumeOptions(); len(opts) != 0 {
+		t.Errorf("buildResumeOptions = %+v, want none with nothing recorded", opts)
 	}
 }
 
 // A record whose launch never produced a Claude Code transcript must not be
 // offered for resume: the picker would show a row that starts fresh or errors.
-func TestBuildResumeOptionNilWhenOnlyDeadRecordExists(t *testing.T) {
+func TestBuildResumeOptionsEmptyWhenOnlyDeadRecordExists(t *testing.T) {
 	restoreHome := setTempHome(t)
 	defer restoreHome()
 	workDir := setTempWorkDir(t)
@@ -187,12 +188,12 @@ func TestBuildResumeOptionNilWhenOnlyDeadRecordExists(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	if opt := buildResumeOption(); opt != nil {
-		t.Errorf("buildResumeOption = %+v, want nil with no transcript behind the record", opt)
+	if opts := buildResumeOptions(); len(opts) != 0 {
+		t.Errorf("buildResumeOptions = %+v, want none with no transcript behind the record", opts)
 	}
 }
 
-func TestBuildResumeOptionDescribesARecordedSession(t *testing.T) {
+func TestBuildResumeOptionsDescribesARecordedSession(t *testing.T) {
 	restoreHome := setTempHome(t)
 	defer restoreHome()
 	workDir := setTempWorkDir(t)
@@ -221,23 +222,28 @@ func TestBuildResumeOptionDescribesARecordedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	opt := buildResumeOption()
-	if opt == nil {
-		t.Fatal("buildResumeOption = nil, want a resume option")
+	opts := buildResumeOptions()
+	if len(opts) != 1 {
+		t.Fatalf("buildResumeOptions = %d rows, want 1", len(opts))
 	}
-	if opt.SessionID != rec.SessionID {
-		t.Errorf("SessionID = %s, want %s", opt.SessionID, rec.SessionID)
+	if opts[0].SessionID != rec.SessionID {
+		t.Errorf("SessionID = %s, want %s", opts[0].SessionID, rec.SessionID)
 	}
-	// The label carries model AND recorded time, so the user can tell which
-	// session the row points at after a mid-session /model switch.
-	if opt.Label != "glm-5.1 · 2026-08-30 14:07" {
-		t.Errorf("Label = %q, want model and time", opt.Label)
+	// The label is the model the session ran under — the only thing that
+	// distinguishes one recorded conversation from another in the list.
+	if opts[0].Label != "glm-5.1" {
+		t.Errorf("Label = %q, want the recorded model", opts[0].Label)
+	}
+	// The age lives in the description, not the label: in a list of same-day
+	// sessions an absolute date is identical noise on every row.
+	if opts[0].Description == "" {
+		t.Error("Description is empty, want the session's relative age")
 	}
 }
 
-// buildResumeOption must still offer the newest live record when newer dead
+// buildResumeOptions must still offer the newest live record when newer dead
 // records sit on top of it.
-func TestBuildResumeOptionSkipsDeadRecords(t *testing.T) {
+func TestBuildResumeOptionsSkipsDeadRecords(t *testing.T) {
 	restoreHome := setTempHome(t)
 	defer restoreHome()
 	workDir := setTempWorkDir(t)
@@ -271,13 +277,83 @@ func TestBuildResumeOptionSkipsDeadRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	opt := buildResumeOption()
-	if opt == nil {
-		t.Fatal("buildResumeOption = nil, want the live record behind the dead one")
+	opts := buildResumeOptions()
+	if len(opts) != 1 {
+		t.Fatalf("buildResumeOptions = %d rows, want only the live record", len(opts))
 	}
-	if opt.SessionID != live.SessionID {
+	if opts[0].SessionID != live.SessionID {
 		t.Errorf("resume target = %s, want the live %s (not the newer dead %s)",
-			opt.SessionID, live.SessionID, dead.SessionID)
+			opts[0].SessionID, live.SessionID, dead.SessionID)
+	}
+}
+
+// TestBuildResumeOptionsReturnsNewestFirstCapped covers the picker's recent-
+// sessions block: the most recent resumable sessions, newest first, each
+// labelled with its own model, capped so the list cannot push the model
+// catalog below the fold.
+func TestBuildResumeOptionsReturnsNewestFirstCapped(t *testing.T) {
+	restoreHome := setTempHome(t)
+	defer restoreHome()
+	workDir := setTempWorkDir(t)
+	defer workDir()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projects := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
+	// Seven live sessions, one per hour into the past, each on its own model.
+	wantModels := []string{"glm-5.2", "kimi-k2.6", "deepseek-v4-flash", "claude-opus-5", "grok-4.5", "hy3-free", "qwen3.5-max"}
+	for i, mdl := range wantModels {
+		rec := session.Record{
+			SessionID: fmt.Sprintf("%08d-1111-4111-8111-111111111111", i),
+			WorkDir:   cwd,
+			Model:     mdl,
+			Recorded:  time.Now().Add(-time.Duration(i+1) * time.Hour),
+		}
+		if err := session.Save(sessionCacheDir(), rec); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+		path := filepath.Join(projects, session.ProjectKey(cwd), rec.SessionID+".jsonl")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	opts := buildResumeOptions()
+	if len(opts) != maxResumeOptions {
+		t.Fatalf("buildResumeOptions = %d rows, want the %d-row cap", len(opts), maxResumeOptions)
+	}
+	for i, opt := range opts {
+		if opt.Label != wantModels[i] {
+			t.Errorf("row %d label = %q, want %q (newest first)", i, opt.Label, wantModels[i])
+		}
+		if opt.Description == "" {
+			t.Errorf("row %d has no age description", i)
+		}
+	}
+}
+
+// TestHumanAgeUsesCoarsestSeparatingUnit pins the relative-age rendering the
+// rows depend on to stay distinguishable.
+func TestHumanAgeUsesCoarsestSeparatingUnit(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "just now"},
+		{5 * time.Minute, "5m ago"},
+		{3 * time.Hour, "3h ago"},
+		{50 * time.Hour, "2d ago"},
+		{20 * 24 * time.Hour, "2w ago"},
+	}
+	for _, c := range cases {
+		if got := humanAge(c.d); got != c.want {
+			t.Errorf("humanAge(%v) = %q, want %q", c.d, got, c.want)
+		}
 	}
 }
 

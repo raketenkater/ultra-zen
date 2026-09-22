@@ -109,6 +109,13 @@ type Model struct {
 	// some models and dated for others; use normalizeSlug to match it against
 	// ranking permaslugs. Empty when the gateway does not report it.
 	CanonicalSlug string
+	// Price is the model's published per-token cost, normalised to $/M. Only
+	// OpenRouter publishes one; every other gateway ultra-zen speaks to
+	// (Zen go/main, Groq, Cerebras, ModelScope, SAIA, Cohere, HuggingFace)
+	// returns a catalog with no pricing at all, so Price.Known is false there
+	// and the picker must say "credits"/"free" rather than print a number it
+	// does not have.
+	Price Price
 }
 
 // List fetches all usable models for the given API key: every model on the
@@ -169,9 +176,10 @@ func ListZenFree(httpClient *http.Client, apiKey string) ([]Model, error) {
 // We read context_length from the metadata so autocompaction can be set from
 // the model's real context window instead of a hardcoded guess.
 type apiModelEntry struct {
-	ID            string `json:"id"`
-	ContextLength int    `json:"context_length"`
-	CanonicalSlug string `json:"canonical_slug"`
+	ID            string      `json:"id"`
+	ContextLength int         `json:"context_length"`
+	CanonicalSlug string      `json:"canonical_slug"`
+	Pricing       *apiPricing `json:"pricing"`
 }
 
 // normalizeSlug strips a trailing -YYYYMMDD date suffix from a model slug so
@@ -484,6 +492,7 @@ func ListOpenRouter(httpClient *http.Client, apiKey string) ([]Model, error) {
 				Base:          OpenRouterBase,
 				Free:          true,
 				ContextLength: e.ContextLength,
+				Price:         e.Pricing.price(),
 			})
 		}
 	}
@@ -515,6 +524,7 @@ func ListOpenRouterAll(httpClient *http.Client, apiKey string) ([]Model, error) 
 			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
 			ContextLength: e.ContextLength,
 			CanonicalSlug: e.CanonicalSlug,
+			Price:         e.Pricing.price(),
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -561,6 +571,7 @@ func listOpenRouterRankedAt(base string, httpClient *http.Client, apiKey string)
 			Free:          strings.Contains(e.ID, ":free") || e.ID == "openrouter/free",
 			ContextLength: e.ContextLength,
 			CanonicalSlug: e.CanonicalSlug,
+			Price:         e.Pricing.price(),
 		})
 	}
 	rank := fetchOpenRouterRankingAt(base, httpClient, apiKey)

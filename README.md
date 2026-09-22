@@ -227,6 +227,49 @@ stored at `~/.config/ultra-zen/free-pool.json`, restored after a restart, and
 also applies to direct `ultra-zen <model>` launches. An explicit
 `--free-model` or `--worker` flag overrides the saved cycle.
 
+The five most recent resumable sessions for the current directory are pinned
+above the catalog, each labelled with the model it ran under and how long ago
+it was — Enter reopens one instead of starting fresh.
+
+### Model search (`s`)
+
+Press `s` in the selector to search every provider at once. Type a model name
+and each match is listed with every route that reaches it, with what each one
+costs:
+
+```
+search · glm5
+
+  GLM 5                              2 routes  from $0.600/M
+❯   openrouter · z-ai/glm-5             paid  $0.600/M  200k
+      8 providers                                1.7x spread
+      → GMICloud       $0.600/M  out $1.92/M  198k  fp8  99%
+      → StreamLake    $0.600/M  out $1.92/M  193k  fp8  100%
+      → Baidu         $0.700/M  out $2.24/M  198k  fp8  100%
+      → SiliconFlow   $0.950/M  out $2.55/M  200k  fp8  100%
+      → Z.AI           $1.00/M  out $3.20/M  198k  fp8  100%
+    opencode-go · glm-5                  paid  credits  195k
+  GLM 5.2                           6 routes  free available
+    openrouter · z-ai/glm-5.2:free                 free  32k
+    openrouter · z-ai/glm-5.2          paid  $0.650/M  1024k
+```
+
+Matching is fuzzy, so `glm5`, `glm 5` and `v4-flash` all find what you mean.
+Routes are ordered free first, then cheapest published input rate. Enter
+launches the route under the cursor.
+
+Under an OpenRouter route the indented `→` rows break out the upstream
+providers actually serving that model, cheapest first, with input and output
+rates, context window, quantization and 30-minute uptime. This is usually the
+most useful part: the same weights routinely differ by **5x** between
+upstreams (DeepSeek V4 Flash ranges from $0.04/M to $0.21/M across 15
+providers). ultra-zen sends its traffic to OpenRouter and OpenRouter chooses
+the upstream, so these rows inform rather than pin — they are not selectable.
+
+Prices come from the provider catalogs themselves and are never estimated. A
+gateway that publishes no per-token rate — the Zen tiers bill against a
+balance — reads `credits`, not a made-up number.
+
 ### Backends
 
 **opencode Zen** (default, `--provider opencode-go`): reads your opencode API

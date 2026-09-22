@@ -809,7 +809,7 @@ func main() {
 	if modelID == "" {
 		var workerPick, fastPick, resumeID, tuiProvider string
 		var quit bool
-		res := tui.Run(list, *provider, buildResumeOption(), *allModels)
+		res := tui.Run(list, *provider, buildResumeOptions(), *allModels)
 		modelID, tuiProvider, workerPick, fastPick, resumeID, quit = res.Choice, res.Provider, res.Worker, res.Fast, res.ResumeSessionID, res.Quit
 		tuiFreePool = res.FreePool
 		if resumeID != "" {

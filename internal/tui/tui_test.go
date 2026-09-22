@@ -1035,7 +1035,7 @@ func TestDefaultSelectionFallsBackToFirstModel(t *testing.T) {
 // with ResumeSessionID set and no model choice.
 func TestEnterOnResumeRowQuitsWithSessionID(t *testing.T) {
 	m := newCatalogTestModel()
-	m.resume = &ResumeOption{SessionID: "abc-123", Label: "glm-5.2", Description: "2026-08-30 10:00"}
+	m.resumes = []ResumeOption{{SessionID: "abc-123", Label: "glm-5.2", Description: "2h ago"}}
 	l := list.New(m.startItems(), columnDelegate{}, 80, 30)
 	configureList(&l)
 	m.list = l
@@ -1241,7 +1241,7 @@ func TestOneScreenRenderShape(t *testing.T) {
 	}})
 	m := model{
 		all: ms, provider: "opencode-go", subtitle: "opencode Zen", step: stepCombo, catalog: &catalog,
-		resume: &ResumeOption{SessionID: "abc", Label: "zen-paid", Description: "2026-08-30 09:12"},
+		resumes: []ResumeOption{{SessionID: "abc", Label: "zen-paid", Description: "3h ago"}},
 		usage: map[string]usageSnapshot{
 			"openrouter": {Provider: "openrouter", Usage: &proxy.ProviderUsage{
 				Name: "openrouter", Kind: proxy.UsageCredits, Exhausted: true,
