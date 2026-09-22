@@ -36,6 +36,21 @@ func typeQuery(t *testing.T, m *searchManager, q string) {
 	}
 }
 
+// settleCatalogs delivers every provider's full catalog, putting the screen
+// in the state it reaches once the network has answered. Providers absent
+// from the fixture report an empty catalog, which is what a real install with
+// no key for them produces.
+func settleCatalogs(m *searchManager, extra ...models.Route) {
+	byProvider := map[string][]models.Model{}
+	for _, r := range append(append([]models.Route{}, searchTestRoutes()...), extra...) {
+		byProvider[r.Provider] = append(byProvider[r.Provider], r.Model)
+	}
+	for _, p := range poolProviders {
+		updated, _ := m.Update(searchCatalogLoaded{provider: p, models: byProvider[p]})
+		*m = *(updated.(*searchManager))
+	}
+}
+
 func rowTitles(m *searchManager) []string {
 	var out []string
 	for _, item := range m.list.Items() {
@@ -47,7 +62,7 @@ func rowTitles(m *searchManager) []string {
 // TestSearchListsEveryProviderForATypedModel is the headline behaviour: type
 // a name, get every route to it, grouped under one heading.
 func TestSearchListsEveryProviderForATypedModel(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "glm5")
 
 	var heads, routes int
@@ -78,7 +93,7 @@ func TestSearchListsEveryProviderForATypedModel(t *testing.T) {
 // published rate for a priced route and the credits word for a gateway that
 // publishes none — never a number ultra-zen made up.
 func TestSearchRouteRowsShowRealCosts(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "glm5")
 
 	tails := map[string]string{}
@@ -104,7 +119,7 @@ func TestSearchRouteRowsShowRealCosts(t *testing.T) {
 // TestSearchEnterLaunchesTheSelectedRoute covers the launchable criterion:
 // Enter returns the exact provider and model id under the cursor.
 func TestSearchEnterLaunchesTheSelectedRoute(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "deepseek")
 
 	row, ok := m.selectedRoute()
@@ -127,7 +142,7 @@ func TestSearchEnterLaunchesTheSelectedRoute(t *testing.T) {
 // TestSearchCursorStartsAndStaysOnLaunchableRows proves headings and cost
 // lines cannot be selected: Enter must never land on a row it cannot act on.
 func TestSearchCursorStartsAndStaysOnLaunchableRows(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "glm")
 
 	if _, ok := m.selectedRoute(); !ok {
@@ -146,7 +161,7 @@ func TestSearchCursorStartsAndStaysOnLaunchableRows(t *testing.T) {
 // TestSearchEnterOnHeadingDoesNothing is the other half: if the cursor is
 // forced onto an inert row, Enter must not invent a choice.
 func TestSearchEnterOnHeadingDoesNothing(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "glm")
 
 	idx := -1
@@ -174,7 +189,7 @@ func TestSearchEnterOnHeadingDoesNothing(t *testing.T) {
 // once the fetch lands, every upstream is listed under the OpenRouter route,
 // cheapest first, with a summary naming the spread.
 func TestSearchShowsUpstreamCostsCheapestFirst(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "deepseek")
 	m.syncExpansion()
 	if m.expanded != "deepseek/deepseek-v4-flash" {
@@ -224,7 +239,7 @@ func TestSearchShowsUpstreamCostsCheapestFirst(t *testing.T) {
 // dropping the breakdown would read as "this model has one provider", which
 // is a claim about price the screen has not earned.
 func TestSearchStatesAFailedCostLookup(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "deepseek")
 	m.syncExpansion()
 
@@ -251,7 +266,7 @@ func TestSearchStatesAFailedCostLookup(t *testing.T) {
 // move re-enters syncExpansion, and without them a five-letter query would
 // fire five identical requests at the endpoints API.
 func TestSearchFetchesEachModelOnce(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "deepseek")
 
 	const id = "deepseek/deepseek-v4-flash"
@@ -283,7 +298,7 @@ func TestSearchFetchesEachModelOnce(t *testing.T) {
 // down from turning the screen into a retry loop: the failure is remembered,
 // stated once, and not re-requested while the query stands.
 func TestSearchFailedFetchIsNotRetriedOnEveryKeystroke(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "deepseek")
 	updated, _ := m.Update(searchEndpointsLoaded{
 		modelID: "deepseek/deepseek-v4-flash",
@@ -300,7 +315,8 @@ func TestSearchFailedFetchIsNotRetriedOnEveryKeystroke(t *testing.T) {
 // the empty state: with catalogs still arriving, ultra-zen has not
 // established that nothing matches and must not say so.
 func TestSearchNoMatchWhileLoadingDoesNotClaimAbsence(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", true)
+	m := newSearchManager(searchTestRoutes(), "")
+	// Deliberately do NOT settle: catalogs are still in flight.
 	typeQuery(t, &m, "mistral")
 
 	if hasNoteContaining(&m, "no model matches") {
@@ -311,9 +327,11 @@ func TestSearchNoMatchWhileLoadingDoesNotClaimAbsence(t *testing.T) {
 	}
 }
 
-// TestSearchNoMatchSaysSo keeps an empty result explicit rather than blank.
+// TestSearchNoMatchSaysSo keeps an empty result explicit rather than blank —
+// but only once every catalog has answered, so the claim is earned.
 func TestSearchNoMatchSaysSo(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
+	settleCatalogs(&m)
 	typeQuery(t, &m, "mistral")
 
 	for _, item := range m.list.Items() {
@@ -328,7 +346,7 @@ func TestSearchNoMatchSaysSo(t *testing.T) {
 
 // TestSearchEscReturnsWithoutAChoice covers backing out.
 func TestSearchEscReturnsWithoutAChoice(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "glm")
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	sm := updated.(*searchManager)
@@ -344,7 +362,7 @@ func TestSearchEscReturnsWithoutAChoice(t *testing.T) {
 // input: "s", "k", "f" and "p" are picker bindings on the main screen and
 // must be plain text here.
 func TestSearchTypingLettersIsQueryNotBindings(t *testing.T) {
-	m := newSearchManager(searchTestRoutes(), "", false)
+	m := newSearchManager(searchTestRoutes(), "")
 	typeQuery(t, &m, "kfps")
 	if got := m.input.Value(); got != "kfps" {
 		t.Fatalf("input = %q, want \"kfps\" — a binding swallowed a keystroke", got)
@@ -433,5 +451,109 @@ func TestPickerSearchEscReturnsToTheCatalog(t *testing.T) {
 	}
 	if m.choice != "" {
 		t.Errorf("esc produced a choice %q", m.choice)
+	}
+}
+
+// TestSearchFindsModelsOutsideThePickersNarrowedList is the regression test
+// for the bug that prompted the full-catalog load: a paid OpenRouter model
+// outside the picker's top-hundred cap (xiaomi/mimo-v2.6-pro was the reported
+// case) was unfindable, because the search reused the list the picker had
+// already truncated for display. A search that answers "no model matches" for
+// a model the provider plainly serves is worse than no search.
+func TestSearchFindsModelsOutsideThePickersNarrowedList(t *testing.T) {
+	// The seed is the picker's narrowed view: it does NOT contain mimo.
+	m := newSearchManager(searchTestRoutes(), "")
+	typeQuery(t, &m, "mimo")
+	for _, item := range m.list.Items() {
+		if _, ok := item.(searchRouteRow); ok {
+			t.Fatal("fixture is wrong: mimo must not be in the seeded list")
+		}
+	}
+
+	// The full catalog lands, carrying the model the picker had capped away.
+	mimo := models.Route{Provider: "openrouter", Model: models.Model{
+		ID: "xiaomi/mimo-v2.6-pro", Name: "Xiaomi: MiMo-V2.6-Pro", ContextLength: 262144,
+		Price: models.Price{PromptUSD: 0.435, CompletionUSD: 1.3, Known: true}}}
+	settleCatalogs(&m, mimo)
+
+	var found *searchRouteRow
+	for _, item := range m.list.Items() {
+		if row, ok := item.(searchRouteRow); ok && row.model.ID == mimo.Model.ID {
+			r := row
+			found = &r
+		}
+	}
+	if found == nil {
+		t.Fatalf("mimo still not found after the full catalog landed: %v", rowTitles(&m))
+	}
+	if found.provider != "openrouter" {
+		t.Errorf("found via %q, want openrouter", found.provider)
+	}
+}
+
+// TestSearchFullCatalogReplacesTheSeed checks the merge rule: once a provider
+// reports its real catalog, that catalog is authoritative. Keeping the seeded
+// rows as well would resurrect models the full fetch deliberately dropped.
+func TestSearchFullCatalogReplacesTheSeed(t *testing.T) {
+	m := newSearchManager(searchTestRoutes(), "")
+	// groq reports a catalog that no longer carries llama-4-70b.
+	updated, _ := m.Update(searchCatalogLoaded{provider: "groq", models: []models.Model{
+		{ID: "llama-5-8b", Name: "Llama 5 8B", Free: true},
+	}})
+	m = *(updated.(*searchManager))
+
+	for _, r := range m.routes {
+		if r.Provider == "groq" && r.Model.ID == "llama-4-70b" {
+			t.Fatal("a seeded groq model survived its provider's full catalog")
+		}
+	}
+	var haveNew bool
+	for _, r := range m.routes {
+		if r.Provider == "groq" && r.Model.ID == "llama-5-8b" {
+			haveNew = true
+		}
+	}
+	if !haveNew {
+		t.Error("the freshly loaded groq model is missing from the routes")
+	}
+	// Providers that have not reported still contribute their seeded rows.
+	var haveSeeded bool
+	for _, r := range m.routes {
+		if r.Provider == "openrouter" && r.Model.ID == "z-ai/glm-5.2" {
+			haveSeeded = true
+		}
+	}
+	if !haveSeeded {
+		t.Error("an unreported provider lost its seeded rows")
+	}
+}
+
+// TestSearchScopeLineStatesWhatWasNotSearched keeps the screen honest about
+// its own coverage: a provider with no key or a failed fetch is named, so a
+// missing model never silently reads as "not available anywhere".
+func TestSearchScopeLineStatesWhatWasNotSearched(t *testing.T) {
+	m := newSearchManager(searchTestRoutes(), "")
+	if got := m.scopeLine(); !strings.Contains(got, "loading") {
+		t.Errorf("scope line before any catalog = %q, want a loading state", got)
+	}
+	for _, p := range poolProviders {
+		msg := searchCatalogLoaded{provider: p, models: nil}
+		if p == "cohere" {
+			msg.keyless = true
+		}
+		if p == "saia" {
+			msg.err = errors.New("dial tcp: no route to host")
+		}
+		updated, _ := m.Update(msg)
+		m = *(updated.(*searchManager))
+	}
+	got := m.scopeLine()
+	if !strings.Contains(got, "not searched") {
+		t.Fatalf("scope line = %q, want it to name the unsearched providers", got)
+	}
+	for _, want := range []string{"cohere", "saia"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("scope line = %q, missing %q", got, want)
+		}
 	}
 }

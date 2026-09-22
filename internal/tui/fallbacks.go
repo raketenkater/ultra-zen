@@ -304,6 +304,29 @@ func fetchProviderWithAll(provider string, showAll bool) tea.Cmd {
 	}
 }
 
+// fetchFullCatalog loads a provider's COMPLETE catalog for the search screen.
+//
+// The picker deliberately shows less than it knows: without --all-models the
+// Zen and BYO providers fetch only their free tiers, and OpenRouter's paid
+// block is capped to the hundred most-used models of four hundred-odd. Those
+// are display decisions — a list you scroll has to end somewhere — but a
+// search is the opposite kind of thing. Searching a truncated catalog reports
+// "no model matches" for models the provider plainly serves, which is worse
+// than no search at all, because it answers a question it did not actually
+// ask. So the search loads the full catalog itself and never reuses the
+// display list's limits.
+func fetchFullCatalog(provider string) tea.Cmd {
+	return func() tea.Msg {
+		loaded := loadProvider(provider, true)
+		return searchCatalogLoaded{
+			provider: loaded.provider,
+			models:   loaded.models,
+			keyless:  loaded.key == "" && loaded.err == nil,
+			err:      loaded.err,
+		}
+	}
+}
+
 func loadProvider(provider string, showAll bool) fallbackLoaded {
 	client := &http.Client{Timeout: 4 * time.Second}
 	var (

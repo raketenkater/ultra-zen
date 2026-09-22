@@ -614,8 +614,7 @@ func (m *model) openFallbacks() tea.Cmd {
 // moving cursor because a background catalog landed is worse than a result
 // list that is a few seconds old. Reopening the screen takes a fresh one.
 func (m *model) openSearch() tea.Cmd {
-	partial := m.catalog == nil || m.catalog.loading()
-	sm := newSearchManager(m.searchRoutes(), providerKey("openrouter"), partial)
+	sm := newSearchManager(m.searchRoutes(), providerKey("openrouter"))
 	m.search = &sm
 	m.prevStep = m.step
 	m.step = stepSearch

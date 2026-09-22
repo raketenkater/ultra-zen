@@ -132,6 +132,16 @@ func (i searchNoteRow) tailParts() []string {
 	return []string{i.tail}
 }
 
+// searchCatalogLoaded reports a finished full-catalog load for one provider.
+// keyless distinguishes "this provider has no credential" from "the fetch
+// failed", because only the first is the user's to fix.
+type searchCatalogLoaded struct {
+	provider string
+	models   []models.Model
+	keyless  bool
+	err      error
+}
+
 // searchEndpointsLoaded reports a finished per-upstream cost fetch.
 type searchEndpointsLoaded struct {
 	modelID string
@@ -161,11 +171,20 @@ type searchManager struct {
 	// expanding them all would bury the results they belong to.
 	expanded string
 
-	// partial records that some provider catalogs had not finished loading
-	// when the screen opened. Without it an empty result says "no model
-	// matches", which is a claim about the whole catalog that a half-loaded
-	// snapshot has not earned.
-	partial bool
+	// catalogs tracks the full per-provider catalogs the screen loads for
+	// itself, keyed by provider. The picker's own lists are narrowed for
+	// display (free-only tiers, OpenRouter capped to the top hundred paid),
+	// so searching them silently misses models the provider serves; these
+	// replace them as they arrive.
+	catalogs    map[string][]models.Model
+	loadingFull map[string]bool
+	catalogErrs map[string]string
+
+	// seed is the picker's already-discovered list, kept so the screen is
+	// usable on the first keystroke instead of blank until the network
+	// answers. A provider's full catalog replaces its seeded rows entirely
+	// once it lands.
+	seed []models.Route
 
 	choice   string // chosen model id ("" until Enter on a route)
 	provider string // provider the chosen model is reached through
@@ -173,7 +192,7 @@ type searchManager struct {
 	quit     bool
 }
 
-func newSearchManager(routes []models.Route, apiKey string, partial bool) searchManager {
+func newSearchManager(routes []models.Route, apiKey string) searchManager {
 	in := textinput.New()
 	in.Prompt = "search " + gDot + " "
 	in.PromptStyle = accentStyle
@@ -181,14 +200,24 @@ func newSearchManager(routes []models.Route, apiKey string, partial bool) search
 	in.CharLimit = 64
 	in.Focus()
 
+	// Every provider starts marked loading, before Init has even fired, so
+	// the first frame cannot claim a model is missing from a catalog the
+	// screen has not read yet.
+	loading := make(map[string]bool, len(poolProviders))
+	for _, p := range poolProviders {
+		loading[p] = true
+	}
 	m := searchManager{
-		input:     in,
-		routes:    routes,
-		endpoints: map[string][]models.Endpoint{},
-		pending:   map[string]bool{},
-		failed:    map[string]string{},
-		apiKey:    apiKey,
-		partial:   partial,
+		input:       in,
+		routes:      routes,
+		seed:        routes,
+		endpoints:   map[string][]models.Endpoint{},
+		pending:     map[string]bool{},
+		failed:      map[string]string{},
+		catalogs:    map[string][]models.Model{},
+		loadingFull: loading,
+		catalogErrs: map[string]string{},
+		apiKey:      apiKey,
 	}
 	l := list.New(nil, columnDelegate{}, 60, 20)
 	configureList(&l)
@@ -200,7 +229,51 @@ func newSearchManager(routes []models.Route, apiKey string, partial bool) search
 	return m
 }
 
-func (m *searchManager) Init() tea.Cmd { return textinput.Blink }
+// Init starts the full-catalog load for every provider. The screen is
+// already usable from the seeded list while these run.
+func (m *searchManager) Init() tea.Cmd {
+	cmds := make([]tea.Cmd, 0, len(poolProviders)+1)
+	cmds = append(cmds, textinput.Blink)
+	for _, p := range poolProviders {
+		cmds = append(cmds, fetchFullCatalog(p))
+	}
+	return tea.Batch(cmds...)
+}
+
+// mergeRoutes rebuilds the searchable set: every provider that has reported a
+// full catalog contributes that, and the picker's seeded rows stand in for the
+// providers still loading. Distinct by provider and model id, which is the
+// whole of what a pick carries back.
+func (m *searchManager) mergeRoutes() {
+	var out []models.Route
+	seen := map[string]bool{}
+	add := func(provider string, mdl models.Model) {
+		key := provider + "\x00" + mdl.ID
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, models.Route{Provider: provider, Model: mdl})
+	}
+	for _, p := range poolProviders {
+		for _, mdl := range m.catalogs[p] {
+			add(p, mdl)
+		}
+	}
+	for _, r := range m.seed {
+		// A provider whose full catalog arrived is authoritative; its seeded
+		// rows are a strict subset and must not resurrect a model the full
+		// fetch dropped (an unavailable route, say).
+		if _, done := m.catalogs[r.Provider]; done {
+			continue
+		}
+		add(r.Provider, r.Model)
+	}
+	m.routes = out
+}
+
+// stillLoading reports how many provider catalogs have yet to answer.
+func (m *searchManager) stillLoading() int { return len(m.loadingFull) }
 
 // rebuild re-runs the query and regenerates the rows. It preserves nothing
 // across queries by design: a result list that kept stale rows from a
@@ -265,8 +338,8 @@ func (m *searchManager) noResultsText() string {
 		return "no provider catalogs loaded yet" + gEll
 	case query == "":
 		return "type a model name"
-	case m.partial:
-		return "no match yet " + gDot + " some catalogs still loading" + gEll
+	case m.stillLoading() > 0:
+		return fmt.Sprintf("no match yet %s %d catalogs still loading%s", gDot, m.stillLoading(), gEll)
 	}
 	return "no model matches " + strconv.Quote(query)
 }
@@ -348,6 +421,13 @@ func (m *searchManager) rebuildKeepingCursor() {
 	if !had {
 		return
 	}
+	m.restoreCursor(row)
+}
+
+// restoreCursor puts the cursor back on the same route by identity, so rows
+// appearing above it (an expanded breakdown, a catalog that just landed)
+// never drag the selection somewhere the user did not put it.
+func (m *searchManager) restoreCursor(row searchRouteRow) {
 	for i, item := range m.list.Items() {
 		if r, ok := item.(searchRouteRow); ok && r.provider == row.provider && r.model.ID == row.model.ID {
 			m.list.Select(i)
@@ -390,6 +470,29 @@ func (m *searchManager) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetWidth(msg.Width - 4)
 		m.list.SetHeight(msg.Height - 8)
 		return m, nil
+	case searchCatalogLoaded:
+		delete(m.loadingFull, msg.provider)
+		switch {
+		case msg.err != nil:
+			m.catalogErrs[msg.provider] = shortErr(msg.err.Error())
+		case msg.keyless:
+			// No credential: not an error, just a provider this install
+			// cannot see into. Recorded so the footer can say the search is
+			// narrower than "everywhere" rather than implying it is complete.
+			m.catalogErrs[msg.provider] = "no key"
+		default:
+			m.catalogs[msg.provider] = msg.models
+		}
+		m.mergeRoutes()
+		row, had := m.selectedRoute()
+		m.groups = models.Search(m.input.Value(), m.routes, searchResultLimit)
+		m.setItemsFromGroups()
+		if had {
+			m.restoreCursor(row)
+		} else {
+			m.selectFirstRoute()
+		}
+		return m, m.syncExpansion()
 	case searchEndpointsLoaded:
 		delete(m.pending, msg.modelID)
 		if msg.err != nil {
@@ -465,5 +568,27 @@ func (m searchManager) View() string {
 	footer := mutedStyle.Render(strings.Join([]string{
 		"type to search", "enter launch", "esc back", "ctrl+c quit",
 	}, "  "))
-	return frame("search", "", body, footer, "", m.list.Width()+4)
+	return frame("search", m.scopeLine(), body, footer, "", m.list.Width()+4)
+}
+
+// scopeLine states what the search actually covered, next to the wordmark.
+// A search is a claim about absence as much as presence, so the screen says
+// how many models it read and names the providers it could not reach —
+// otherwise a missing model reads as "not available anywhere" when it really
+// means "that provider needs a key" or "that catalog failed to load".
+func (m searchManager) scopeLine() string {
+	if n := m.stillLoading(); n > 0 {
+		return fmt.Sprintf("loading %d catalogs%s", n, gEll)
+	}
+	line := fmt.Sprintf("%d models", len(m.routes))
+	if len(m.catalogErrs) == 0 {
+		return line
+	}
+	missing := make([]string, 0, len(m.catalogErrs))
+	for _, p := range poolProviders {
+		if _, bad := m.catalogErrs[p]; bad {
+			missing = append(missing, p)
+		}
+	}
+	return line + " " + gDot + " not searched: " + strings.Join(missing, ", ")
 }
