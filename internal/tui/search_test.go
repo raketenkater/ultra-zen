@@ -725,3 +725,115 @@ func TestRecentSectionCapsRows(t *testing.T) {
 		t.Errorf("section rendered %d rows, want at most %d", n, maxRecentModelRows)
 	}
 }
+
+// TestCursorClimbsPastSectionHeaders is the regression test for a one-way
+// wall in the picker: moving up onto a section header put the cursor back on
+// the row below it, so every press of Up was undone and nothing above the
+// first header could be reached. With the recently-used and recent-sessions
+// sections that made both of them unreachable by keyboard.
+func TestCursorClimbsPastSectionHeaders(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecentRoute("opencode-go", "zen-paid")
+	models.RecordRecentRoute("openrouter", "vendor/router-model:free")
+
+	m := newCatalogTestModel()
+	m.list.SetItems(m.startItems())
+
+	// Start on the first row below the first header that follows the recents.
+	start := -1
+	seenRecent := false
+	for i, item := range m.list.Items() {
+		if _, ok := item.(recentModelItem); ok {
+			seenRecent = true
+			continue
+		}
+		if !seenRecent {
+			continue
+		}
+		if _, ok := item.(groupHeaderItem); ok {
+			start = i + 1
+			break
+		}
+	}
+	if start < 0 || start >= len(m.list.Items()) {
+		t.Fatalf("no catalog row below a header to start from (items=%d)", len(m.list.Items()))
+	}
+	m.list.Select(start)
+
+	// Walk up far enough to cross every header above.
+	for i := 0; i < len(m.list.Items()); i++ {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+		m = updated.(model)
+		if isInert(m.list.SelectedItem()) {
+			t.Fatalf("cursor came to rest on an inert %T", m.list.SelectedItem())
+		}
+		if m.list.Index() == 0 {
+			break
+		}
+	}
+
+	if _, ok := m.list.SelectedItem().(recentModelItem); !ok {
+		t.Fatalf("after walking up the cursor is on %T at index %d, want a recently-used row",
+			m.list.SelectedItem(), m.list.Index())
+	}
+}
+
+// TestCursorUpIsNeverUndone is the tight form of the same bug: a single Up
+// from the row under a header must not leave the cursor where it started.
+func TestCursorUpIsNeverUndone(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecentRoute("opencode-go", "zen-paid")
+
+	m := newCatalogTestModel()
+	m.list.SetItems(m.startItems())
+	for i, item := range m.list.Items() {
+		if _, ok := item.(groupHeaderItem); !ok || i+1 >= len(m.list.Items()) {
+			continue
+		}
+		if isInert(m.list.Items()[i+1]) {
+			continue
+		}
+		// Only meaningful when something selectable exists above the header;
+		// the header at index 0 has nothing to climb to, and staying put
+		// there is correct rather than a regression.
+		above := false
+		for j := 0; j < i; j++ {
+			if !isInert(m.list.Items()[j]) {
+				above = true
+				break
+			}
+		}
+		if !above {
+			continue
+		}
+		m.list.Select(i + 1)
+		before := m.list.Index()
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+		m = updated.(model)
+		if m.list.Index() >= before {
+			t.Errorf("Up under the header at %d left the cursor at %d (was %d)", i, m.list.Index(), before)
+		}
+	}
+}
+
+// TestNavDirectionCoversPagingKeys keeps the header-skipping direction right
+// for the other bindings bubbles' list maps upward, not just the arrow.
+func TestNavDirectionCoversPagingKeys(t *testing.T) {
+	up := []tea.KeyMsg{
+		{Type: tea.KeyUp},
+		{Type: tea.KeyPgUp},
+		{Type: tea.KeyShiftTab},
+		{Type: tea.KeyCtrlU},
+	}
+	for _, k := range up {
+		if got := navDirection(k); got != -1 {
+			t.Errorf("navDirection(%v) = %d, want -1", k.String(), got)
+		}
+	}
+	down := []tea.KeyMsg{{Type: tea.KeyDown}, {Type: tea.KeyPgDown}, {Type: tea.KeyEnter}}
+	for _, k := range down {
+		if got := navDirection(k); got != 1 {
+			t.Errorf("navDirection(%v) = %d, want 1", k.String(), got)
+		}
+	}
+}

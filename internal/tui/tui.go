@@ -1000,7 +1000,7 @@ func (m *model) cycleProviderFilter() tea.Cmd {
 		for i, item := range m.list.Items() {
 			if startItemKey(item) == keep {
 				m.list.Select(i)
-				m.ensureSelectable()
+				m.ensureSelectable(1)
 				found = true
 				break
 			}
@@ -1086,7 +1086,7 @@ func (m *model) nextSelectable(from, dir int) int {
 // ensureSelectable nudges the cursor off an inert row (a section header, a
 // search result heading) if one is currently selected, preferring the next
 // row downward, then upward.
-func (m *model) ensureSelectable() {
+func (m *model) ensureSelectable(dir int) {
 	items := m.list.Items()
 	if len(items) == 0 {
 		return
@@ -1094,13 +1094,37 @@ func (m *model) ensureSelectable() {
 	if !isInert(items[m.list.Index()]) {
 		return
 	}
-	if i := m.nextSelectable(m.list.Index(), 1); i >= 0 {
+	if dir == 0 {
+		dir = 1
+	}
+	// Step over the header the way the cursor was already travelling. Always
+	// resolving downward is what made a section header a one-way wall: moving
+	// up onto it put the cursor back on the row below, so every press of Up
+	// was undone and nothing above the first header was reachable. The second
+	// pass is the end-of-list case, where continuing is impossible and going
+	// back is the only option.
+	if i := m.nextSelectable(m.list.Index(), dir); i >= 0 {
 		m.list.Select(i)
 		return
 	}
-	if i := m.nextSelectable(m.list.Index(), -1); i >= 0 {
+	if i := m.nextSelectable(m.list.Index(), -dir); i >= 0 {
 		m.list.Select(i)
 	}
+}
+
+// navDirection reports which way a key moves the list cursor: -1 for the
+// upward keys, +1 for everything else. It covers the bindings bubbles' list
+// actually maps, so paging up over a header behaves like arrowing up over it.
+func navDirection(msg tea.Msg) int {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return 1
+	}
+	switch key.String() {
+	case "up", "ctrl+p", "shift+tab", "pgup", "ctrl+u", "b", "home", "g":
+		return -1
+	}
+	return 1
 }
 
 func (m *model) rebuildStart() tea.Cmd {
@@ -1114,7 +1138,7 @@ func (m *model) rebuildStart() tea.Cmd {
 		for i, item := range m.list.Items() {
 			if startItemKey(item) == want {
 				m.list.Select(i)
-				m.ensureSelectable()
+				m.ensureSelectable(1)
 				return cmd
 			}
 		}
@@ -1122,7 +1146,7 @@ func (m *model) rebuildStart() tea.Cmd {
 	if count := len(m.list.Items()); count > 0 {
 		m.list.Select(min(index, count-1))
 	}
-	m.ensureSelectable()
+	m.ensureSelectable(1)
 	return cmd
 }
 
@@ -1136,7 +1160,7 @@ func (m *model) selectDefault() {
 		for i, item := range m.list.Items() {
 			if startItemKey(item) == want {
 				m.list.Select(i)
-				m.ensureSelectable()
+				m.ensureSelectable(1)
 				return
 			}
 		}
@@ -1539,12 +1563,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	var cmd tea.Cmd
+	dir := navDirection(msg)
 	m.list, cmd = m.list.Update(msg)
 	// Keep the cursor off non-selectable group headers: after the list has moved
 	// the cursor, nudge it past any header it landed on so a section banner is
-	// never shown as the "current" row. Runs after the list update, not before.
+	// never shown as the "current" row. Runs after the list update, not before,
+	// and continues in the direction the key was moving — see ensureSelectable.
 	if m.step == stepCombo {
-		m.ensureSelectable()
+		m.ensureSelectable(dir)
 	}
 	return m, cmd
 }
