@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -182,5 +183,86 @@ func TestLoadTUIProviderOpenRouter(t *testing.T) {
 func TestLoadTUIProviderRejectsUnknown(t *testing.T) {
 	if _, _, err := loadTUIProvider(http.DefaultClient, "unknown", "", "", "", false); err == nil {
 		t.Fatal("unknown TUI provider was accepted")
+	}
+}
+
+// TestResolveAgainstFullCatalogFindsCappedModel is the regression test for
+// the launch failure that followed the search screen reading full catalogs:
+// selecting xiaomi/mimo-v2.6-pro — real, priced, and shown by the search —
+// died with `model "xiaomi/mimo-v2.6-pro" not found`, because the launch
+// resolved it against the picker's display list, where OpenRouter's paid
+// block is capped to the hundred most-used models.
+func TestResolveAgainstFullCatalogFindsCappedModel(t *testing.T) {
+	narrow := []models.Model{{ID: "z-ai/glm-5.2", Base: models.OpenRouterBase}}
+	full := append(append([]models.Model{}, narrow...),
+		models.Model{ID: "xiaomi/mimo-v2.6-pro", Base: models.OpenRouterBase, ContextLength: 262144})
+
+	calls := 0
+	got, list, key := resolveAgainstFullCatalog(narrow, "old-key", "xiaomi/mimo-v2.6-pro",
+		func() ([]models.Model, string, error) { calls++; return full, "full-key", nil })
+
+	if got == nil {
+		t.Fatal("model absent from the narrowed list was not found in the full catalog")
+	}
+	if got.ID != "xiaomi/mimo-v2.6-pro" {
+		t.Errorf("resolved %q, want xiaomi/mimo-v2.6-pro", got.ID)
+	}
+	if calls != 1 {
+		t.Errorf("reload called %d times, want exactly 1", calls)
+	}
+	// The caller must switch to the full catalog and its key, or everything
+	// downstream (advertising, fallbacks) still works off the capped list.
+	if len(list) != len(full) {
+		t.Errorf("list has %d models, want the full %d", len(list), len(full))
+	}
+	if key != "full-key" {
+		t.Errorf("key = %q, want the reloaded full-key", key)
+	}
+}
+
+// TestResolveAgainstFullCatalogSkipsReloadOnHit keeps the common path free of
+// a second catalog fetch: almost every launch names a model that is already
+// in the list.
+func TestResolveAgainstFullCatalogSkipsReloadOnHit(t *testing.T) {
+	narrow := []models.Model{{ID: "z-ai/glm-5.2", Base: models.OpenRouterBase}}
+	got, list, key := resolveAgainstFullCatalog(narrow, "k", "z-ai/glm-5.2",
+		func() ([]models.Model, string, error) {
+			t.Fatal("reload called for a model already in the list")
+			return nil, "", nil
+		})
+	if got == nil || got.ID != "z-ai/glm-5.2" {
+		t.Fatalf("resolved %v, want the model from the narrowed list", got)
+	}
+	if len(list) != 1 || key != "k" {
+		t.Errorf("a hit must not disturb the list or key; got %d models, key %q", len(list), key)
+	}
+}
+
+// TestResolveAgainstFullCatalogKeepsListWhenReloadFails checks that a
+// transient catalog failure does not also destroy the list the caller
+// already had — the launch should fall through to its normal handling with
+// its original state intact.
+func TestResolveAgainstFullCatalogKeepsListWhenReloadFails(t *testing.T) {
+	narrow := []models.Model{{ID: "z-ai/glm-5.2", Base: models.OpenRouterBase}}
+	got, list, key := resolveAgainstFullCatalog(narrow, "k", "nope/missing",
+		func() ([]models.Model, string, error) { return nil, "", errors.New("dial tcp: refused") })
+	if got != nil {
+		t.Errorf("resolved %v for a model nothing serves, want nil", got)
+	}
+	if len(list) != 1 || key != "k" {
+		t.Errorf("a failed reload disturbed the caller's state: %d models, key %q", len(list), key)
+	}
+}
+
+// TestResolveAgainstFullCatalogGenuinelyMissing keeps the honest negative:
+// a model no provider serves must still resolve to nil after the full
+// catalog has been consulted.
+func TestResolveAgainstFullCatalogGenuinelyMissing(t *testing.T) {
+	narrow := []models.Model{{ID: "z-ai/glm-5.2"}}
+	full := []models.Model{{ID: "z-ai/glm-5.2"}, {ID: "xiaomi/mimo-v2.6-pro"}}
+	got, _, _ := resolveAgainstFullCatalog(narrow, "k", "acme/not-a-model",
+		func() ([]models.Model, string, error) { return full, "k2", nil })
+	if got != nil {
+		t.Errorf("resolved %v for a model that does not exist, want nil", got)
 	}
 }

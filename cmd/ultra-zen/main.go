@@ -302,6 +302,42 @@ func buildAdvertisedCatalog(
 // only offers providers whose credentials were discovered, so this path never
 // opens another prompt; it resolves the same flag/env/store/auth precedence as
 // the normal startup path and verifies the model list again before launch.
+// resolveAgainstFullCatalog finds modelID in the already-loaded list and, on
+// a miss, retries against the provider's COMPLETE catalog before giving up.
+//
+// list is narrowed, and not only for the TUI: without --all-models every
+// entry point loads the Zen and BYO free tiers only, and caps OpenRouter's
+// paid block to the most-used hundred of four hundred odd. So a perfectly
+// real model — one the search screen just showed priced and listed, or one
+// typed straight onto the command line — is routinely absent from it.
+//
+// Getting this wrong is worse than a bad error message. main's pool-promotion
+// branch treats a missing primary as a dead route and silently launches
+// something else, so a user who asked for xiaomi/mimo-v2.6-pro got a session
+// on GLM-5.2 without being told. Only a model that is genuinely not served
+// should ever reach that fallback.
+//
+// reload is called at most once, and only on a miss; a reload error leaves
+// the original list and key untouched, because a transient catalog failure
+// must not also destroy the list the caller already had.
+func resolveAgainstFullCatalog(list []models.Model, key, modelID string, reload func() ([]models.Model, string, error)) (*models.Model, []models.Model, string) {
+	if found := models.Find(list, modelID); found != nil {
+		return found, list, key
+	}
+	if reload == nil {
+		return nil, list, key
+	}
+	full, fullKey, err := reload()
+	if err != nil {
+		return nil, list, key
+	}
+	found := models.Find(full, modelID)
+	if found == nil {
+		return nil, list, key
+	}
+	return found, full, fullKey
+}
+
 func loadTUIProvider(client *http.Client, provider, authPath, openRouterFlag, apiFlag string, allModels bool) ([]models.Model, string, error) {
 	switch {
 	case provider == "codex-sub":
@@ -849,7 +885,10 @@ func main() {
 		// A combo selected after configuring the pool must not re-enable both.
 		*workerModel = ""
 	}
-	selected := models.Find(list, modelID)
+	var selected *models.Model
+	selected, list, key = resolveAgainstFullCatalog(list, key, modelID, func() ([]models.Model, string, error) {
+		return loadTUIProvider(httpClient, *provider, *authPath, *openRouterKey, *apiKey, true)
+	})
 	if selected == nil && len(freeModels) > 0 {
 		// The configured primary is no longer served by its provider (e.g. a
 		// stale saved pool route). Promote the first still-available route
