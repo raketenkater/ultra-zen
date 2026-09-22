@@ -1,7 +1,7 @@
 BINARY := ultra-zen
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: all build test lint vet clean install system providers release
+.PHONY: all build test lint vet clean install system providers release e2e
 
 all: vet build
 
@@ -30,6 +30,12 @@ system:
 
 test:
 	go test ./... -count=1 -race
+
+# End-to-end: build the binary and drive it as a subprocess the way a user
+# does. Hermetic — local fakes for every network call, temp dirs for every
+# path it writes, no keys and no root.
+e2e:
+	go test ./e2e/ -count=1 -v
 
 # providers prints the per-provider key status table (and, on a terminal,
 # offers to add missing keys). Convenience alias for `ultra-zen setup providers`.

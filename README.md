@@ -605,6 +605,29 @@ alias `statusline` prints `[OR $0.013 left] [Zen 5h 42% · wk 10%] …`-style
 tokens and degrades to "no running ultra-zen proxy" so it never error-spams a
 statusline hook.
 
+## Testing
+
+```bash
+make test          # unit tests, race detector
+make e2e           # end-to-end: drives the built binary as a subprocess
+go test ./... -short   # everything except e2e
+```
+
+The `e2e/` package installs and runs ultra-zen the way a user does —
+`install.sh`, `uz setup`, `uz keys set`, `--list`, a real launch, `uz sessions`,
+`uz usage` — and asserts on what the binary printed and wrote. It owns no
+internals: no package under test is imported.
+
+It is hermetic. Every network call goes to a local fake (`--codex-url` for the
+provider catalog, a `curl` shim on PATH for the release tarball), every path it
+would write outside the checkout is redirected into a temp dir, `claude` on PATH
+is a recorder script, and provider key environment variables are blanked. No
+API keys, no network, no root, nothing left behind.
+
+CI runs it as its own step. Everything else in CI builds the binary and throws
+it away, so this is the only thing that checks the parts between the packages —
+which is where the bugs have been.
+
 ## Project layout
 
 ```

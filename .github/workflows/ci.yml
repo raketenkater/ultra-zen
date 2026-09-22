@@ -21,10 +21,21 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ./... -count=1
+        # -short skips the e2e package, which builds and execs the binary;
+        # it gets its own step below so a failure there is legible on its own.
+        run: go test ./... -count=1 -short
 
       - name: Build
         run: go build ./cmd/ultra-zen/
+
+      - name: End-to-end
+        # Drives the built binary as a subprocess the way a user does:
+        # install.sh, setup, keys, list, launch, resume. Everything it would
+        # reach over the network is a local fake and everything it would write
+        # outside the checkout is redirected, so this needs no keys, no network
+        # and no root. Nothing else in CI ever executes the binary — without
+        # this step it is built and thrown away.
+        run: go test ./e2e/ -count=1 -v
 
       - name: Gofmt
         # Gofmt must pass on everything except a fixed set of pre-existing
