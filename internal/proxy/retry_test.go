@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -793,5 +794,59 @@ func TestTransportErrorRotatesToFallback(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "fallback-ok") {
 		t.Fatalf("expected fallback response, got %s", rec.Body.String())
+	}
+}
+
+// TestFreeTierErrorRetiresRoute covers the September 2026 Zen change: the free
+// tier (zen/v1) answers 403 FreeTierError for every caller that is not the
+// OpenCode client itself. That denial is permanent, so the route must retire on
+// the first hit and never be selected again — before this, the body matched no
+// access-denied signature, the route stayed eligible, and rotation kept feeding
+// requests to a model that could only ever 403.
+func TestFreeTierErrorRetiresRoute(t *testing.T) {
+	var freeCalls, fallbackCalls int
+	free := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		freeCalls++
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode"}}`))
+	}))
+	defer free.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer fallback.Close()
+
+	srv := New(Config{
+		BaseURL:   free.URL,
+		APIKey:    "zen-key",
+		Model:     "ling-3.0-flash-fin-free",
+		Fallbacks: []Upstream{{BaseURL: fallback.URL, APIKey: "or-key", Model: "openrouter/free"}},
+		Port:      0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200 (should have rotated to the fallback)", i, resp.StatusCode)
+		}
+	}
+	// The retired free route is tried once, then never again.
+	if freeCalls != 1 {
+		t.Errorf("free route called %d times, want 1 (403 FreeTierError must retire it permanently)", freeCalls)
+	}
+	if fallbackCalls != 3 {
+		t.Errorf("fallback served %d requests, want 3", fallbackCalls)
 	}
 }

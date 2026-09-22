@@ -1609,7 +1609,14 @@ func isModelAccessDenied(body []byte) bool {
 		// opencode Zen gates some models by region/account opt-in; the gateway
 		// answers 403 with a RegionError body.
 		strings.Contains(msg, "requires explicit opt in") ||
-		strings.Contains(msg, "only available hosted in")
+		strings.Contains(msg, "only available hosted in") ||
+		// Zen's free tier (zen/v1) is gated to the OpenCode client itself: every
+		// free model answers 403 FreeTierError for any other caller, forever.
+		// Without this the route never retires, so rotation keeps handing
+		// requests to a model that can only ever 403 — one such route served
+		// nothing but 403s for hours while staying eligible in the pool.
+		strings.Contains(msg, "freetiererror") ||
+		strings.Contains(msg, "free tier can only be used from within")
 }
 
 func isOpenRouterDailyLimit(body []byte) bool {
