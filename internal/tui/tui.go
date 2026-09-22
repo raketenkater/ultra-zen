@@ -501,6 +501,47 @@ func (i comboItem) FilterValue() string {
 	return i.combo.Orchestrator + " " + i.combo.Worker
 }
 
+// recentModelItem is a row in the "recently used" section: a model you
+// launched before, together with the provider you reached it through.
+//
+// The model is carried when the picker can resolve it against a loaded
+// catalog, which is what supplies the price and context window. When it
+// cannot — the MRU remembers a model whose catalog is still loading, or one
+// outside the provider's narrowed display list — the row still appears and
+// still launches, because the launch resolves against the provider's full
+// catalog. Hiding a model the user demonstrably ran would be the wrong
+// failure: the section's whole job is to put it one keypress away.
+type recentModelItem struct {
+	provider string
+	id       string
+	model    *models.Model // nil when not resolvable from the loaded catalogs
+}
+
+func (i recentModelItem) Title() string {
+	if i.model != nil && i.model.Name != "" && i.model.Name != i.model.ID {
+		return i.model.Name
+	}
+	return i.id
+}
+
+// tailParts names the provider first — it is what distinguishes two rows for
+// the same model, and the section spans every gateway, so unlike the provider
+// groups below there is no header above stating it. Price and context follow
+// when the model resolved.
+func (i recentModelItem) tailParts() []string {
+	parts := []string{i.provider}
+	if i.provider == "" {
+		parts = []string{"?"}
+	}
+	if i.model == nil {
+		return parts
+	}
+	parts = append(parts, tierParts(*i.model)...)
+	return append(parts, ctxPart(i.model.ContextLength)...)
+}
+
+func (i recentModelItem) FilterValue() string { return i.provider + " " + i.id }
+
 // ResumeOption describes a recorded, resumable Claude Code session for the
 // current directory, so the picker's opening screen can offer to reopen it
 // instead of starting a fresh one. Several are shown at once (newest first):
@@ -606,6 +647,63 @@ func (m *model) openFallbacks() tea.Cmd {
 	m.prevStep = m.step
 	m.step = stepFallbacks
 	return m.fallbacks.Init()
+}
+
+// maxRecentModelRows caps the recently-used section. The MRU store keeps ten,
+// but this section sits above the whole catalog alongside the resume rows,
+// and the two together are already spending the most valuable rows on screen
+// before a single model from the catalog appears.
+const maxRecentModelRows = 5
+
+// recentModelItems builds the cross-provider "recently used" rows, newest
+// first. Each entry is resolved against the loaded catalogs to pick up its
+// price and context window; one that cannot be resolved is still shown, since
+// the launch path resolves against the provider's full catalog anyway.
+//
+// Entries recorded before the provider was stored carry an empty provider.
+// Those are matched by id against the loaded catalogs to recover one; if that
+// fails the row is dropped, because a launch needs a provider and a row that
+// cannot say where it goes is not a choice.
+func (m *model) recentModelItems() []list.Item {
+	recents := models.LoadRecentRoutes()
+	if len(recents) == 0 {
+		return nil
+	}
+	catalog := m.catalogModels()
+	var out []list.Item
+	for _, r := range recents {
+		if len(out) == maxRecentModelRows {
+			break
+		}
+		provider, found := r.Provider, (*models.Model)(nil)
+		if provider == m.provider || provider == "" {
+			for i := range m.all {
+				if m.all[i].ID == r.Model {
+					found, provider = &m.all[i], m.provider
+					break
+				}
+			}
+		}
+		if found == nil {
+			for i := range catalog {
+				if catalog[i].Model.ID != r.Model {
+					continue
+				}
+				if provider != "" && catalog[i].Provider != provider {
+					continue
+				}
+				found, provider = &catalog[i].Model, catalog[i].Provider
+				break
+			}
+		}
+		if provider == "" {
+			// A legacy entry whose model is in no loaded catalog: nothing
+			// here can say which gateway to launch it on.
+			continue
+		}
+		out = append(out, recentModelItem{provider: provider, id: r.Model, model: found})
+	}
+	return out
 }
 
 // openSearch opens the cross-provider model search over everything discovered
@@ -742,6 +840,16 @@ func (m *model) startItems() []list.Item {
 	}
 	for _, opt := range m.resumes {
 		items = append(items, resumeItem{opt: opt})
+	}
+	// Recently used models, newest first, above the catalog. The provider
+	// groups below already sort their own recents to the top and tag them,
+	// but that only helps inside one group: the models you actually alternate
+	// between usually live on different gateways, so the one you want can sit
+	// two hundred rows down in a section you have to scroll to. This is the
+	// cross-provider view of the same MRU store.
+	if recents := m.recentModelItems(); len(recents) > 0 {
+		items = append(items, groupHeaderItem{label: "Recently used", count: len(recents)})
+		items = append(items, recents...)
 	}
 	// Every model from the initially selected provider is directly launchable;
 	// the manual row remains for the legacy orchestrator/worker flow. The free
@@ -1044,6 +1152,14 @@ func (m *model) selectDefault() {
 // to the primary provider's first model, then "" (cursor lands wherever the
 // list opens).
 func (m *model) defaultItemKey() string {
+	// The recently-used section, when there is one, holds the last-used model
+	// as its first row — so the cursor belongs there rather than on the same
+	// model's copy further down in a provider group. Landing in the section
+	// is what makes relaunching the last model a single Enter, which is the
+	// reason the section exists.
+	if rows := m.recentModelItems(); len(rows) > 0 {
+		return startItemKey(rows[0])
+	}
 	recent := models.LoadRecent()
 	if len(recent) > 0 {
 		want := recent[0]
@@ -1081,6 +1197,8 @@ func startItemKey(item list.Item) string {
 		return "cycle"
 	case resumeItem:
 		return "resume\x00" + item.opt.SessionID
+	case recentModelItem:
+		return "recent\x00" + item.provider + "\x00" + item.id
 	case comboItem:
 		if item.manual {
 			return "manual"
@@ -1330,6 +1448,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			switch m.step {
 			case stepCombo:
+				if item, ok := m.list.SelectedItem().(recentModelItem); ok {
+					// Same contract as any concrete model pick: a deliberate
+					// choice must not silently inherit the saved free pool as
+					// fallbacks and get promoted off it on the first hiccup.
+					m.freePool = nil
+					m.choice = item.id
+					m.choiceVia = item.provider
+					m.worker = ""
+					return m, tea.Quit
+				}
 				if item, ok := m.list.SelectedItem().(cycleItem); ok {
 					if item.selected > 0 && len(m.freePool) > 0 {
 						// Launching the Free cycle is an explicit engagement of the

@@ -23,31 +23,85 @@ func recentPath() string {
 	return filepath.Join(base, "ultra-zen", "recent-models.json")
 }
 
-// LoadRecent returns the recorded model ids, most recently used first.
-// Missing/corrupt file yields an empty slice.
-func LoadRecent() []string {
+// Recent is one recorded launch: the model, and the provider it was reached
+// through. The provider is what makes a cross-provider "recently used" list
+// possible — a bare id cannot be relaunched, because the same name is served
+// by more than one gateway at different prices, and some ids exist on only
+// one of them. Provider is empty for entries written before it was recorded.
+type Recent struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model"`
+}
+
+// LoadRecentRoutes returns the recorded launches, most recent first.
+//
+// It reads both the current object form and the original bare-string form
+// ("glm-5.2"), because the file on disk predates the provider field and
+// dropping those entries would silently empty every existing user's recents
+// on upgrade. Legacy entries come back with an empty Provider.
+func LoadRecentRoutes() []Recent {
 	b, err := os.ReadFile(recentPath())
 	if err != nil {
 		return nil
 	}
-	var ids []string
-	if err := json.Unmarshal(b, &ids); err != nil {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
 		return nil
 	}
-	return ids
+	out := make([]Recent, 0, len(raw))
+	for _, item := range raw {
+		var id string
+		if err := json.Unmarshal(item, &id); err == nil {
+			if id != "" {
+				out = append(out, Recent{Model: id})
+			}
+			continue
+		}
+		var r Recent
+		if err := json.Unmarshal(item, &r); err == nil && r.Model != "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// LoadRecent returns the recorded model ids, most recently used first. It is
+// the id-only view of LoadRecentRoutes, kept because the ordering helpers
+// (SortByRecent and its callers) rank on ids alone.
+func LoadRecent() []string {
+	routes := LoadRecentRoutes()
+	out := make([]string, 0, len(routes))
+	for _, r := range routes {
+		out = append(out, r.Model)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // RecordRecent moves id to the front of the MRU list (deduped) and persists
-// it. Errors are swallowed: failing to remember a pick must not stop a launch.
-func RecordRecent(id string) {
-	if id == "" {
+// it, without a provider. Prefer RecordRecentRoute, which records where the
+// model was reached.
+func RecordRecent(id string) { RecordRecentRoute("", id) }
+
+// RecordRecentRoute moves a (provider, model) launch to the front of the MRU
+// list and persists it. Errors are swallowed: failing to remember a pick must
+// not stop a launch.
+//
+// Deduplication is by model id, not by the pair. The list answers "what did I
+// run recently", and the same model reached two ways is one answer to that —
+// keeping both would spend the section's few rows restating one model. The
+// newest entry wins, so the provider shown is the one most recently used.
+func RecordRecentRoute(provider, model string) {
+	if model == "" {
 		return
 	}
-	ids := LoadRecent()
-	out := make([]string, 0, len(ids)+1)
-	out = append(out, id)
-	for _, r := range ids {
-		if r != id {
+	existing := LoadRecentRoutes()
+	out := make([]Recent, 0, len(existing)+1)
+	out = append(out, Recent{Provider: provider, Model: model})
+	for _, r := range existing {
+		if r.Model != model {
 			out = append(out, r)
 		}
 	}

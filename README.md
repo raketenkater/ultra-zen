@@ -231,6 +231,26 @@ The five most recent resumable sessions for the current directory are pinned
 above the catalog, each labelled with the model it ran under and how long ago
 it was — Enter reopens one instead of starting fresh.
 
+Below them sits **recently used**: the last models you launched, newest first,
+across every provider. The catalog groups below already sort their own recents
+to the top, but that only helps inside one group — the models you alternate
+between usually live on different gateways. The cursor opens on the top row,
+so relaunching the last model is a single Enter.
+
+```
+recently used · 5
+❯ xiaomi/mimo-v2.6-pro                                          openrouter
+  GLM 5.2                                                 modelscope  free
+  GLM 5.3 Flash                                                 saia  free
+  GLM 5.3 Flash                          openrouter  paid  $0.150/M  1280k
+```
+
+Each row names the provider it was reached through, since the same model is
+served by several at different prices. A row shows no price or context window
+when the model is outside that provider's displayed catalog (OpenRouter caps
+its paid block) — it still launches, because the launch resolves against the
+provider's full catalog.
+
 ### Model search (`s`)
 
 Press `s` in the selector to search every provider at once. Type a model name

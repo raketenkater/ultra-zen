@@ -921,7 +921,7 @@ func main() {
 	if selected == nil {
 		die(fmt.Errorf("model %q not found; run `ultra-zen --list` to see available models", modelID))
 	}
-	models.RecordRecent(selected.ID)
+	models.RecordRecentRoute(*provider, selected.ID)
 	models.RecordCombo(selected.ID, *workerModel)
 
 	// Build a provider-aware free pool. Permanent daily/free-allocation limits

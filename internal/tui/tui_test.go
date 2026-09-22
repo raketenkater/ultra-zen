@@ -982,6 +982,12 @@ func TestFastStepExplicitModel(t *testing.T) {
 // cursor opens on the last-used model (the MRU store's newest id), so the
 // common path is open → Enter. The default is resolved at Run time; the test
 // drives the same selectDefault the real program runs.
+//
+// The assertion is on which MODEL the cursor is on, not which row type. The
+// last-used model appears twice on the screen — once in the recently-used
+// section and once in its provider group — and which of the two the cursor
+// prefers is a layout decision, while "the cursor is on the last-used model"
+// is the actual contract.
 func TestDefaultSelectionIsLastUsed(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	models.RecordRecent("second-choice")
@@ -996,12 +1002,18 @@ func TestDefaultSelectionIsLastUsed(t *testing.T) {
 	configureList(&l)
 	m.list = l
 	m.selectDefault()
-	mi, ok := m.list.SelectedItem().(modelItem)
-	if !ok {
-		t.Fatalf("default selection = %T, want a modelItem", m.list.SelectedItem())
+
+	var got string
+	switch row := m.list.SelectedItem().(type) {
+	case modelItem:
+		got = row.m.ID
+	case recentModelItem:
+		got = row.id
+	default:
+		t.Fatalf("default selection = %T, want a launchable model row", m.list.SelectedItem())
 	}
-	if mi.m.ID != "first-choice" {
-		t.Fatalf("default selection = %q, want the last-used model first-choice", mi.m.ID)
+	if got != "first-choice" {
+		t.Fatalf("default selection = %q, want the last-used model first-choice", got)
 	}
 }
 

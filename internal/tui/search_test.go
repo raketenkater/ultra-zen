@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -555,5 +556,172 @@ func TestSearchScopeLineStatesWhatWasNotSearched(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("scope line = %q, missing %q", got, want)
 		}
+	}
+}
+
+// --- Recently used section -------------------------------------------------
+
+// TestRecentSectionSpansProviders is the point of the section: the models you
+// alternate between usually live on different gateways, and the provider
+// groups below can only sort recents to the top of their own group.
+func TestRecentSectionSpansProviders(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecentRoute("opencode-go", "zen-paid")
+	models.RecordRecentRoute("openrouter", "vendor/router-model:free") // newest
+
+	m := newCatalogTestModel()
+	m.list.SetItems(m.startItems())
+
+	var rows []recentModelItem
+	for _, item := range m.list.Items() {
+		if row, ok := item.(recentModelItem); ok {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d recent rows, want 2 across both providers", len(rows))
+	}
+	if rows[0].provider != "openrouter" || rows[0].id != "vendor/router-model:free" {
+		t.Errorf("first row = %+v, want the newest (openrouter) launch", rows[0])
+	}
+	if rows[1].provider != "opencode-go" || rows[1].id != "zen-paid" {
+		t.Errorf("second row = %+v, want the older opencode-go launch", rows[1])
+	}
+	// A resolved row carries its catalog entry, which is what supplies the
+	// price and context columns.
+	if rows[0].model == nil {
+		t.Error("a row resolved from a loaded catalog carries no model")
+	}
+}
+
+// TestRecentSectionSitsAboveTheCatalog pins the placement the section exists
+// for: one keypress away, not two hundred rows down.
+func TestRecentSectionSitsAboveTheCatalog(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecentRoute("opencode-go", "zen-paid")
+
+	m := newCatalogTestModel()
+	items := m.startItems()
+	firstRecent, firstGroupModel := -1, -1
+	for i, item := range items {
+		switch item.(type) {
+		case recentModelItem:
+			if firstRecent < 0 {
+				firstRecent = i
+			}
+		case modelItem, providerModelItem:
+			if firstGroupModel < 0 {
+				firstGroupModel = i
+			}
+		}
+	}
+	if firstRecent < 0 {
+		t.Fatal("no recently-used row was built")
+	}
+	if firstGroupModel >= 0 && firstRecent > firstGroupModel {
+		t.Errorf("recent row at %d sits below the catalog's first model at %d", firstRecent, firstGroupModel)
+	}
+	if h, ok := items[firstRecent-1].(groupHeaderItem); !ok || h.label != "Recently used" {
+		t.Errorf("row above the recents is %#v, want the section header", items[firstRecent-1])
+	}
+}
+
+// TestRecentSectionEnterLaunchesThatRoute covers the whole reason the store
+// now records a provider: the row has to relaunch the exact route.
+func TestRecentSectionEnterLaunchesThatRoute(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecentRoute("openrouter", "vendor/router-model:free")
+
+	m := newCatalogTestModel()
+	m.freePool = []FreeRoute{{Provider: "openrouter", Model: "vendor/router-model:free"}}
+	m.list.SetItems(m.startItems())
+	idx := -1
+	for i, item := range m.list.Items() {
+		if _, ok := item.(recentModelItem); ok {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("no recent row to select")
+	}
+	m.list.Select(idx)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(model)
+
+	if mm.choice != "vendor/router-model:free" || mm.choiceVia != "openrouter" {
+		t.Fatalf("launched %q via %q, want vendor/router-model:free via openrouter", mm.choice, mm.choiceVia)
+	}
+	if cmd == nil {
+		t.Error("Enter on a recent row did not quit the picker")
+	}
+	if mm.freePool != nil {
+		t.Error("a recent pick inherited the saved free pool as fallbacks")
+	}
+}
+
+// TestRecentSectionKeepsUnresolvedRows checks the section does not hide a
+// model the user demonstrably ran. A recent model can be outside the
+// provider's narrowed display list (OpenRouter caps its paid block); the
+// launch resolves against the full catalog, so the row must still be offered.
+func TestRecentSectionKeepsUnresolvedRows(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecentRoute("openrouter", "xiaomi/mimo-v2.6-pro") // not in any test catalog
+
+	m := newCatalogTestModel()
+	m.list.SetItems(m.startItems())
+	var found *recentModelItem
+	for _, item := range m.list.Items() {
+		if row, ok := item.(recentModelItem); ok && row.id == "xiaomi/mimo-v2.6-pro" {
+			r := row
+			found = &r
+		}
+	}
+	if found == nil {
+		t.Fatal("a recent model absent from the loaded catalogs was dropped from the section")
+	}
+	if found.model != nil {
+		t.Error("an unresolved row invented a catalog entry")
+	}
+	if found.provider != "openrouter" {
+		t.Errorf("unresolved row provider = %q, want the recorded openrouter", found.provider)
+	}
+	// It must still say something useful in the tail.
+	if tail := strings.Join(found.tailParts(), " "); !strings.Contains(tail, "openrouter") {
+		t.Errorf("unresolved row tail = %q, want it to name the provider", tail)
+	}
+}
+
+// TestRecentSectionDropsLegacyEntriesWithNoResolvableProvider keeps the
+// section launchable: an entry written before providers were recorded, whose
+// model is in no loaded catalog, cannot say where it would go.
+func TestRecentSectionDropsLegacyEntriesWithNoResolvableProvider(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	models.RecordRecent("some/model-nobody-serves") // legacy: no provider
+
+	m := newCatalogTestModel()
+	for _, item := range m.startItems() {
+		if row, ok := item.(recentModelItem); ok && row.id == "some/model-nobody-serves" {
+			t.Fatalf("offered a row with no provider to launch on: %+v", row)
+		}
+	}
+}
+
+// TestRecentSectionCapsRows keeps the section from pushing the catalog off
+// screen: the MRU store keeps ten, the section shows a few.
+func TestRecentSectionCapsRows(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	for i := 0; i < 9; i++ {
+		models.RecordRecentRoute("openrouter", fmt.Sprintf("vendor/model-%d", i))
+	}
+	m := newCatalogTestModel()
+	n := 0
+	for _, item := range m.startItems() {
+		if _, ok := item.(recentModelItem); ok {
+			n++
+		}
+	}
+	if n > maxRecentModelRows {
+		t.Errorf("section rendered %d rows, want at most %d", n, maxRecentModelRows)
 	}
 }
