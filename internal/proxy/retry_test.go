@@ -850,3 +850,63 @@ func TestFreeTierErrorRetiresRoute(t *testing.T) {
 		t.Errorf("fallback served %d requests, want 3", fallbackCalls)
 	}
 }
+
+// TestAgenticHarnessGateRetiresRoute covers OpenRouter's sibling gate: some
+// :free endpoints answer 403 "is only available on agentic harnesses" for any
+// caller it has not registered as one. Like the Zen FreeTierError above it is
+// permanent — no request header satisfies it (verified live: HTTP-Referer and
+// X-Title still answer 403, with failed_routing_step "Gate Free Endpoints by
+// Agentic Harness") — so the route must retire on first sight.
+//
+// This is the regression that shipped: the body matched no access-denied
+// signature, so the route stayed eligible and rotation re-offered it on every
+// throttle. One install logged 120 denials of
+// thinkingmachines/inkling-small:free with zero retirements, and the 403 —
+// not the fallback it should have rotated into — reached Claude Code.
+func TestAgenticHarnessGateRetiresRoute(t *testing.T) {
+	var gatedCalls, fallbackCalls int
+	gated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gatedCalls++
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":{"message":"thinkingmachines/inkling-small:free is only available on agentic harnesses. Try plugging it into a coding agent or productivity app listed on https://openrouter.ai/apps","code":403,"metadata":{"failed_routing_step":"Gate Free Endpoints by Agentic Harness"}}}`))
+	}))
+	defer gated.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls++
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer fallback.Close()
+
+	srv := New(Config{
+		BaseURL:   gated.URL,
+		APIKey:    "or-key",
+		Model:     "thinkingmachines/inkling-small:free",
+		Fallbacks: []Upstream{{BaseURL: fallback.URL, APIKey: "or-key", Model: "openrouter/free"}},
+		Port:      0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+			`{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want 200 (should have rotated to the fallback)", i, resp.StatusCode)
+		}
+	}
+	// The gated route is tried once, then never again.
+	if gatedCalls != 1 {
+		t.Errorf("harness-gated route called %d times, want 1 (must retire permanently)", gatedCalls)
+	}
+	if fallbackCalls != 3 {
+		t.Errorf("fallback served %d requests, want 3", fallbackCalls)
+	}
+}

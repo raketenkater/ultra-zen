@@ -1616,7 +1616,19 @@ func isModelAccessDenied(body []byte) bool {
 		// requests to a model that can only ever 403 — one such route served
 		// nothing but 403s for hours while staying eligible in the pool.
 		strings.Contains(msg, "freetiererror") ||
-		strings.Contains(msg, "free tier can only be used from within")
+		strings.Contains(msg, "free tier can only be used from within") ||
+		// OpenRouter routes some :free endpoints only to callers it has
+		// registered as agentic harnesses. The gate is explicit in the payload
+		// ("failed_routing_step":"Gate Free Endpoints by Agentic Harness") and
+		// no request header satisfies it — sending HTTP-Referer/X-Title still
+		// answers 403 — so the deny is permanent for this account and the route
+		// must retire. Without this the body matched no signature above, the
+		// route stayed eligible, and every rotation re-offered it: one install
+		// logged 120 denials of thinkingmachines/inkling-small:free with zero
+		// retirements, surfacing the 403 to Claude Code instead of failing over.
+		// Match the stable tail (not the model name, which varies) so other
+		// harness-gated models retire the same way.
+		strings.Contains(msg, "is only available on agentic harnesses")
 }
 
 func isOpenRouterDailyLimit(body []byte) bool {
