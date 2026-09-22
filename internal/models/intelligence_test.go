@@ -52,6 +52,13 @@ func TestIntelligenceForFieldIDs(t *testing.T) {
 }
 
 func TestSortFreeByIntelligenceRanksSmartestFirst(t *testing.T) {
+	// Rank against the embedded snapshot, not whatever the 24h refresh last
+	// wrote to the user's cache: SortFreeByIntelligence reads the disk cache
+	// first, so without this the assertion tracks live Artificial Analysis
+	// scores and goes red whenever upstream re-ranks or drops a slug — which
+	// is exactly how this test failed once ggrun's catalog lost glm-5-3-flash.
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
 	// Construct a catalog-shaped list; recency order is newest-last in
 	// SortByRecent semantics, but here we build the post-SortByRecent input
 	// directly: [unknown, glm-5.2 (52.64), unknown2, glm-5.3-flash (57.46)].
