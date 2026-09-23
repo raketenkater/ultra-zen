@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -83,22 +84,91 @@ func (s *Server) fetchProviderUsage(httpClient *http.Client, provider, key strin
 			Detail: "no live usage endpoint; counting requests",
 		})
 	case "modelscope":
-		// ModelScope exposes quota as response headers (modelscope-ratelimit-
-		// requests-* / -model-requests-*) on some deployments (CN-verified
-		// .cn accounts; some .ai too). This account's .ai endpoint emits no
-		// quota headers on either empty probes or real completions — confirmed
-		// live 2026-09-02. No readable endpoint exists, so we fall back to a
-		// request counter with an honest Detail.
-		s.usage.setRow(provider, &ProviderUsage{
-			Name:   provider,
-			Kind:   UsageUnknown,
-			Window: WindowNone,
-			Detail: "no quota headers on this deployment; counting requests",
-		})
+		// Magicube points, not quota headers. The .ai inference endpoint emits
+		// no modelscope-ratelimit-* headers on this deployment (confirmed live
+		// 2026-09-02 and again 2026-09-23), so the header path can never fire
+		// here; the web API answers instead. See fetchModelScopeUsage.
+		s.fetchModelScopeUsageAt(models.ModelScopeWebBase, httpClient, key)
 	default:
 		// Unknown BYO provider: count requests only.
 		s.usage.setRow(provider, &ProviderUsage{Name: provider, Kind: UsageUnknown, Window: WindowNone})
 	}
+}
+
+// fetchModelScopeUsage GETs the Magicube points balance for the account.
+func (s *Server) fetchModelScopeUsage(httpClient *http.Client, key string) {
+	s.fetchModelScopeUsageAt(models.ModelScopeWebBase, httpClient, key)
+}
+
+// fetchModelScopeUsageAt is fetchModelScopeUsage with an injectable base URL so
+// tests can drive it against an httptest server.
+//
+// Magicube is a separate, points-based meter on the web host rather than a
+// per-request quota on the inference host. The inference endpoint
+// (api-inference.modelscope.ai) sends no modelscope-ratelimit-* headers for this
+// account — verified live 2026-09-02 and 2026-09-23 — so no header-driven path
+// can populate this row; the balance is read from the web API instead. The same
+// stored ModelScope key authenticates both hosts, so no second credential is
+// needed. Points are granted daily (200 for daily login, plus 50 when an
+// Alibaba Cloud account is bound) and expire, so the balance is a spendable
+// pool rather than a lifetime tally.
+//
+// The response envelope is {"success":bool,"data":{...}}; anything that is not
+// a success envelope with a balance leaves the last good row untouched.
+func (s *Server) fetchModelScopeUsageAt(base string, httpClient *http.Client, key string) {
+	req, err := http.NewRequest(http.MethodGet, base+"/openapi/v1/magicubes/balance", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		s.usage.setRow("modelscope", providerOrKeep(s, "modelscope", "live fetch failed: "+err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+	rawBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		s.usage.setRow("modelscope", providerOrKeep(s, "modelscope", "live fetch failed: "+readErr.Error()))
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		s.usage.setRow("modelscope", providerOrKeep(s, "modelscope",
+			fmt.Sprintf("live fetch failed: HTTP %d", resp.StatusCode)))
+		return
+	}
+
+	var payload struct {
+		Success bool `json:"success"`
+		Data    *struct {
+			AvailableBalance *int64 `json:"available_balance"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		s.usage.setRow("modelscope", providerOrKeep(s, "modelscope", "unreadable balance payload"))
+		return
+	}
+	if !payload.Success || payload.Data == nil || payload.Data.AvailableBalance == nil {
+		// A well-formed refusal (e.g. an invalid key) is not a transport
+		// failure, but it still means we have no number to show.
+		s.usage.setRow("modelscope", providerOrKeep(s, "modelscope", "no balance in response"))
+		return
+	}
+
+	points := *payload.Data.AvailableBalance
+	row := ProviderUsage{
+		Name:   "modelscope",
+		Kind:   UsagePoints,
+		Window: WindowNone,
+		Points: &points,
+	}
+	// A balance of zero is the actionable state: inference will be refused
+	// until the daily grant lands. Say so rather than leaving a bare 0.
+	if points <= 0 {
+		row.Exhausted = true
+		row.Detail = "no Magicube points left; inference will be refused"
+	}
+	s.usage.setRow("modelscope", &row)
 }
 
 // fetchOpenRouterUsage GETs {OpenRouterBase}/key for the per-key cap and the

@@ -15,6 +15,7 @@ type UsageKind string
 const (
 	UsageCredits  UsageKind = "credits"  // metered in dollars / credits
 	UsageRequests UsageKind = "requests" // metered in request count
+	UsagePoints   UsageKind = "points"   // metered in a non-monetary integer allowance (Magicubes)
 	UsageUnknown  UsageKind = "unknown"  // no live endpoint; requests are counted locally
 )
 
@@ -69,6 +70,14 @@ type ProviderUsage struct {
 	// from /credits — distinct from Remaining, which /key reports as the
 	// per-key cap when the account has no credit data.
 	Credits *float64 `json:"credits,omitempty"`
+	// Points is a non-monetary, integer allowance: ModelScope's Magicubes,
+	// granted daily and spent on inference. Kept separate from Credits
+	// because a point is not a dollar and the units must never be summed or
+	// compared with one — rendering it through the Credits path would label
+	// 94 points "$94.00". No window: the daily grant rolls over at the
+	// provider's own boundary and the live endpoint reports a spendable
+	// balance, not a reset schedule.
+	Points *int64 `json:"points,omitempty"`
 	// FreeReqsUsed/FreeReqsLimit are OpenRouter's :free request tally against
 	// the daily cap. No public API exposes this, so the tally is ultra-zen's
 	// own persisted per-UTC-day counter (a floor: requests made outside

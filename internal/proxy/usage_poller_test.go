@@ -493,3 +493,103 @@ func TestRetryServedAppliesBodyGate(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchModelScopeUsageReadsPoints covers the Magicube balance row. The
+// endpoint is on the web host rather than the inference host, and authenticates
+// with the same stored ModelScope key — both facts pinned here, because the
+// documented modelscope-ratelimit-* header path never fires on this deployment
+// and the row was previously a permanent "[modelscope —]".
+func TestFetchModelScopeUsageReadsPoints(t *testing.T) {
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success":true,"request_id":"abc","data":{"total_balance":114,"available_balance":112,"frozen_amount":2}}`))
+	}))
+	defer srv.Close()
+
+	s := New(Config{})
+	s.fetchModelScopeUsageAt(srv.URL, srv.Client(), "ms-key")
+
+	if gotPath != "/openapi/v1/magicubes/balance" {
+		t.Errorf("fetched %q, want the magicubes balance path", gotPath)
+	}
+	if gotAuth != "Bearer ms-key" {
+		t.Errorf("auth = %q, want the stored key as a Bearer token", gotAuth)
+	}
+	row := s.usage.getRowSnapshot("modelscope")
+	if row == nil {
+		t.Fatal("no modelscope row stored")
+	}
+	if row.Kind != UsagePoints {
+		t.Errorf("kind = %q, want %q", row.Kind, UsagePoints)
+	}
+	if row.Points == nil || *row.Points != 112 {
+		t.Fatalf("Points = %v, want 112 (available_balance)", row.Points)
+	}
+	if row.Exhausted {
+		t.Error("a funded account was marked exhausted")
+	}
+}
+
+// TestFetchModelScopeUsageZeroIsExhausted: an empty balance is the actionable
+// state — inference will be refused until the daily grant lands — and must be
+// marked so, while still carrying the honest 0 rather than being blanked.
+func TestFetchModelScopeUsageZeroIsExhausted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"success":true,"data":{"total_balance":0,"available_balance":0,"frozen_amount":0}}`))
+	}))
+	defer srv.Close()
+
+	s := New(Config{})
+	s.fetchModelScopeUsageAt(srv.URL, srv.Client(), "ms-key")
+	row := s.usage.getRowSnapshot("modelscope")
+	if row == nil || row.Points == nil || *row.Points != 0 {
+		t.Fatalf("Points = %+v, want a stored 0", row)
+	}
+	if !row.Exhausted {
+		t.Error("a zero balance was not marked exhausted")
+	}
+}
+
+// TestFetchModelScopeUsageKeepsLastGoodRowOnFailure: a bad key or a transport
+// error must not invent a balance. The previously-read number stays, because a
+// stale-but-real figure is more useful than a fabricated one.
+func TestFetchModelScopeUsageKeepsLastGoodRowOnFailure(t *testing.T) {
+	s := New(Config{})
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"success":true,"data":{"available_balance":77}}`))
+	}))
+	defer good.Close()
+	s.fetchModelScopeUsageAt(good.URL, good.Client(), "ms-key")
+
+	for _, tc := range []struct {
+		name string
+		hdr  func(http.ResponseWriter)
+	}{
+		{"invalid key", func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"success":false,"code":"InvalidAuthentication","message":"Invalid authentication"}`))
+		}},
+		{"success false", func(w http.ResponseWriter) {
+			w.Write([]byte(`{"success":false,"code":"SomethingElse"}`))
+		}},
+		{"no data", func(w http.ResponseWriter) {
+			w.Write([]byte(`{"success":true}`))
+		}},
+		{"not json", func(w http.ResponseWriter) { w.Write([]byte(`<!doctype html>`)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { tc.hdr(w) }))
+			defer bad.Close()
+			s.fetchModelScopeUsageAt(bad.URL, bad.Client(), "ms-key")
+			row := s.usage.getRowSnapshot("modelscope")
+			if row == nil || row.Points == nil {
+				t.Fatalf("row lost its number entirely: %+v", row)
+			}
+			if *row.Points == 0 {
+				t.Fatalf("failure produced an invented zero balance: %+v", row)
+			}
+		})
+	}
+}

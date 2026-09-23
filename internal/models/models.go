@@ -29,6 +29,12 @@ const (
 	CohereBase       = "https://api.cohere.ai/compatibility/v1"
 	ModelScopeBase   = "https://api-inference.modelscope.ai/v1"
 	ModelScopeCNBase = "https://api-inference.modelscope.cn/v1"
+	// ModelScopeWebBase hosts the web API that serves the account's Magicube
+	// points balance (/openapi/v1/magicubes/balance). It is a different host
+	// from the inference endpoint above but accepts the same API key as a
+	// Bearer token. The .cn host rejects the .ai key (401) and exposes no
+	// equivalent endpoint we can read.
+	ModelScopeWebBase = "https://www.modelscope.ai"
 	SAIABase         = "https://chat-ai.academiccloud.de/v1"
 	// CodexSubBase is the ChatGPT subscription backend the codex CLI talks to.
 	// It serves the OpenAI Responses API (POST /responses) and a model catalog

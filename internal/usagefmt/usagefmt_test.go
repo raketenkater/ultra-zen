@@ -1,6 +1,7 @@
 package usagefmt
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/raketenkater/ultra-zen/internal/proxy"
@@ -140,5 +141,55 @@ func TestFormatZenMoneyPrecedence(t *testing.T) {
 	unknown := proxy.ProviderUsage{Name: "opencode-go", Kind: proxy.UsageCredits}
 	if got := FormatProviderUsage(unknown); got != "[opencode-go —]" {
 		t.Fatalf("unknown money must stay a dash row, got %q", got)
+	}
+}
+
+// TestFormatModelScopePoints pins the Magicube row. The "★" is load-bearing:
+// the statusline puts this token next to dollar-denominated ones ("[OR $4.12
+// credits]"), and a bare "[MS 94]" there reads as money. Points are a
+// non-monetary integer allowance, so the unit marker must always be present.
+func TestFormatModelScopePoints(t *testing.T) {
+	got := FormatProviderUsage(proxy.ProviderUsage{
+		Name: "modelscope", Kind: proxy.UsagePoints, Window: proxy.WindowNone,
+		Points: i(94),
+	})
+	if got != "[MS 94★]" {
+		t.Errorf("points row = %q, want \"[MS 94★]\"", got)
+	}
+
+	// Unlike every other row, this one has a number to show, so it must not
+	// fall through to the ambiguous em-dash placeholder.
+	if got := FormatProviderUsage(proxy.ProviderUsage{
+		Name: "modelscope", Kind: proxy.UsagePoints, Detail: "no quota headers on this deployment",
+		Points: i(250),
+	}); got != "[MS 250★]" {
+		t.Errorf("points row with Detail = %q, want \"[MS 250★]\"", got)
+	}
+}
+
+// TestFormatModelScopePointsExhausted: a zero balance is a real reading, not a
+// missing one — "0★" says "your daily grant is spent", which is actionable,
+// where the generic drained wording ("drained") would hide the number and
+// imply a hard failure.
+func TestFormatModelScopePointsExhausted(t *testing.T) {
+	got := FormatProviderUsage(proxy.ProviderUsage{
+		Name: "modelscope", Kind: proxy.UsagePoints, Window: proxy.WindowNone,
+		Points: i(0), Exhausted: true,
+		Detail: "no Magicube points left; inference will be refused",
+	})
+	if got != "[MS 0★]" {
+		t.Errorf("exhausted points row = %q, want \"[MS 0★]\"", got)
+	}
+}
+
+// TestFormatPointsNeverRendersAsDollars guards the unit confusion the ★ exists
+// to prevent: an integer allowance must never be formatted through the credits
+// path, which would print "94" as a currency figure.
+func TestFormatPointsNeverRendersAsDollars(t *testing.T) {
+	got := FormatProviderUsage(proxy.ProviderUsage{
+		Name: "modelscope", Kind: proxy.UsagePoints, Points: i(94),
+	})
+	if strings.Contains(got, "$") {
+		t.Errorf("points row rendered a dollar sign: %q", got)
 	}
 }

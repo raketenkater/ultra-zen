@@ -90,6 +90,15 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 		title = "?"
 	}
 	if u.Exhausted {
+		// A points meter that has hit zero is still worth a number: unlike the
+		// credits providers below, the balance is a plain integer the endpoint
+		// reports honestly, so "0★" is a fact rather than an invented figure.
+		// Render it before the generic drained branch, which would otherwise
+		// print the word "drained" for what is really "your daily grant is
+		// spent".
+		if u.Kind == proxy.UsagePoints && u.Points != nil {
+			return fmt.Sprintf("[%s %d★]", shortPointsTitle(title), *u.Points)
+		}
 		// Drained state: the live signal is "requests will fail" — say that,
 		// not "hit". The Detail carries the upstream's own message (set by
 		// proxy.MarkExhaustedFromBody), so the statusline shows the same
@@ -203,6 +212,14 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 		if u.Remaining != nil {
 			return fmt.Sprintf("[%s $%.3f left]", title, *u.Remaining)
 		}
+	case proxy.UsagePoints:
+		// A non-monetary integer allowance (ModelScope Magicubes). The "★"
+		// marks it as points so it is never mistaken for the dollar figures on
+		// neighbouring rows — a bare "[modelscope 94]" beside "[OR $4.12
+		// credits]" invites reading one as the other.
+		if u.Points != nil {
+			return fmt.Sprintf("[%s %d★]", shortPointsTitle(title), *u.Points)
+		}
 	case proxy.UsageRequests:
 		// Request-metered providers: remaining/limit + reset window.
 		if u.RequestsLimit != nil && u.RequestsUsed != nil {
@@ -228,6 +245,17 @@ func FormatProviderUsage(u proxy.ProviderUsage) string {
 		return fmt.Sprintf("[%s —]", title)
 	}
 	return fmt.Sprintf("[%s —]", title)
+}
+
+// shortPointsTitle shortens a points provider's name for the statusline, which
+// shares one line with every other provider. "modelscope" is the longest name
+// in the default set, and the row carries a number now, so the full word costs
+// eight columns that the others do not.
+func shortPointsTitle(title string) string {
+	if title == "modelscope" {
+		return "MS"
+	}
+	return title
 }
 
 // resetOf returns the ResetsAt of a window or "".
