@@ -1511,8 +1511,19 @@ func isTransientUpstreamFailure(body []byte) bool {
 		// TestRetryServedAppliesBodyGate). "upstream request failed" therefore
 		// rotates only when a server_error type confirms it, via the branch
 		// above.
+		//
+		// "has no provider supported" is ModelScope's wording for a catalog
+		// entry that no backend serves at all. It arrives as a 400 with no type
+		// field, so the typ gate above does not catch it, and without this it
+		// falls to the halving retry on a permanently dead route — the halving
+		// cannot help because the request was never the problem. The phrase is
+		// specific to this condition and has no request-shaped reading, so it is
+		// safe to rotate on. It is not a permanent access denial for the account
+		// (other accounts may be served), so the route is rotated past without
+		// being retired.
 		lower := strings.ToLower(strings.TrimSpace(msg))
-		return strings.Contains(lower, "model is unavailable")
+		return strings.Contains(lower, "model is unavailable") ||
+			strings.Contains(lower, "has no provider supported")
 	}
 	// Non-JSON fallback: keep the old lowercased substring scan. Here
 	// "upstream request failed" is a generic wrapper, so it must co-occur with

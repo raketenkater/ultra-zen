@@ -66,6 +66,12 @@ func TestIsTransientUpstreamFailure(t *testing.T) {
 		// still NOT rotate (halving owns it) once the type is recognized.
 		{"invalid_request wraps upstream note", `{"error":{"message":"Error from backend: Upstream request failed: invalid value","type":"invalid_request_error"}}`, false},
 		{"context length nested", `{"error":{"message":"maximum context length is 8192 tokens","type":"invalid_request_error"}}`, false},
+		// ModelScope reports a catalog entry no backend serves as a 400 with no
+		// type field. It is a dead route, not a request bug: halving cannot fix
+		// it, so it must rotate. Captured live 2026-09-23 for MiniMax/MiniMax-M3,
+		// which is present in the catalog but served by no provider.
+		{"modelscope no provider supported", `{"error":{"message":"Model id : MiniMax/MiniMax-M3 , has no provider supported","request_id":"d84285c4"}}`, true},
+		{"no provider supported mixed case", `{"error":{"message":"MODEL ID : X , HAS NO PROVIDER SUPPORTED"}}`, true},
 		{"empty", ``, false},
 	}
 	for _, tc := range cases {
@@ -832,5 +838,62 @@ func TestDumpFailingRequestStampsUsedRoute(t *testing.T) {
 	}
 	if dump.Upstream != failed.URL {
 		t.Fatalf("dump upstream = %q, want the actually-used base %q", dump.Upstream, failed.URL)
+	}
+}
+
+// TestNoProviderSupported400Rotates covers ModelScope's dead-catalog-entry 400:
+// a model the catalog advertises but no backend serves. It is an availability
+// failure, not a request bug, so the pool must rotate past it rather than
+// handing the 400 to the user after two pointless halving retries. Captured
+// live 2026-09-23 against MiniMax/MiniMax-M3.
+//
+// The route is rotated past but deliberately NOT retired: "no provider
+// supported" is a property of the entry, and permanent retirement is reserved
+// for per-account denials (UnavailableForAccount). It therefore returns to the
+// pool, which is acceptable because it fails cheaply.
+func TestNoProviderSupported400Rotates(t *testing.T) {
+	var deadCalls, fbCalls int
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deadCalls++
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":{"message":"Model id : MiniMax/MiniMax-M3 , has no provider supported","request_id":"d84285c4"}}`))
+	}))
+	defer dead.Close()
+	fb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fbCalls++
+		w.Write([]byte(goodBody))
+	}))
+	defer fb.Close()
+
+	s := New(Config{
+		Provider:  "modelscope",
+		BaseURL:   dead.URL,
+		APIKey:    "k",
+		Model:     "MiniMax/MiniMax-M3",
+		Fallbacks: []Upstream{{Provider: "opencode-go", BaseURL: fb.URL, APIKey: "k", Model: "zen-free"}},
+		Port:      0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(
+		`{"model":"MiniMax/MiniMax-M3","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	s.handleMessages(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 from the fallback; the dead catalog entry was "+
+			"surfaced to the caller instead of being rotated past (body=%s)", rec.Code, rec.Body.String())
+	}
+	// Exactly one probe: the halving retry must NOT have run against a route
+	// that no request shape can fix.
+	if deadCalls != 1 {
+		t.Errorf("dead route probed %d times, want 1 (halving retries are pointless here)", deadCalls)
+	}
+	if fbCalls != 1 {
+		t.Errorf("fallback calls = %d, want 1", fbCalls)
 	}
 }
