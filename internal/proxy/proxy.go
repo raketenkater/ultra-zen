@@ -932,6 +932,20 @@ func (s *Server) forwardWithRateLimit(ctx context.Context, primary Upstream, ore
 					// not meter it against the free cap.
 					s.usage.setExhausted(choice.Upstream.Provider, false)
 					s.usage.recordRequest(choice.Upstream.Provider)
+					// Re-seed the quota row from a SUCCESSFUL response. Some
+					// gateways publish their live allowance on every 200 and only
+					// there: SAIA (GWDG, Kong) returns X-RateLimit-Remaining-{Minute,
+					// Hour,Day,Month} plus the matching limits on each completed
+					// request but reports nothing on an empty probe. Recording only
+					// on the 429 branch below left the statusline stuck at
+					// "[saia —]" no matter how much traffic went through it — the
+					// row was seeded from metadata and never updated. The parser is
+					// header-driven and self-guarding (it ignores responses that
+					// carry no such headers), so calling it on the success path is
+					// safe for every provider; note both the 200-with-error-body
+					// and the degenerate-body cases already continued above, so
+					// this only sees real completions.
+					s.usage.recordRateLimit(choice.Upstream.Provider, candidate.Header)
 					// OpenRouter meters :free models (and the openrouter/free
 					// router) against a per-UTC-day request cap with no readable
 					// API for ordinary keys, so count locally for the statusline.

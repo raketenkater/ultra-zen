@@ -1,6 +1,11 @@
 package proxy
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -84,5 +89,62 @@ func TestRecordRateLimitLegacySingleWindowStillWorks(t *testing.T) {
 	}
 	if row.RequestsUsed == nil || *row.RequestsUsed != 3 {
 		t.Fatalf("RequestsUsed = %v, want 3", row.RequestsUsed)
+	}
+}
+
+// TestSuccessfulResponseSeedsQuotaRow is the regression for the SAIA statusline
+// sitting at "[saia —]" through heavy use. recordRateLimit was called ONLY on
+// the 429 branch, so a provider that advertises its allowance on every 200 —
+// SAIA publishes X-RateLimit-Remaining-{Minute,Hour,Day,Month} plus limits on
+// each completed request, and nothing at all on an empty probe — could never
+// populate its row. The 200 path must record too.
+func TestSuccessfulResponseSeedsQuotaRow(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A real success carrying SAIA's header family (shape captured live
+		// 2026-09-23: remaining Day 900 of limit 1000).
+		w.Header().Set("X-RateLimit-Limit-Minute", "30")
+		w.Header().Set("X-RateLimit-Remaining-Minute", "27")
+		w.Header().Set("X-RateLimit-Limit-Day", "1000")
+		w.Header().Set("X-RateLimit-Remaining-Day", "900")
+		w.Header().Set("X-RateLimit-Limit-Month", "3000")
+		w.Header().Set("X-RateLimit-Remaining-Month", "2900")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"x","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	srv := New(Config{
+		BaseURL:  upstream.URL,
+		APIKey:   "saia-key",
+		Provider: "saia",
+		Model:    "meta-llama-3.1-8b-instruct",
+		Port:     0,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := srv.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(srv.BaseURL()+"/v1/messages", "application/json", strings.NewReader(
+		`{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	row := srv.usage.getRowSnapshot("saia")
+	if row == nil {
+		t.Fatal("no saia row after a successful request")
+	}
+	if row.RequestsLimit == nil || *row.RequestsLimit != 1000 {
+		t.Fatalf("RequestsLimit = %v, want 1000 (day window is the headline)", row.RequestsLimit)
+	}
+	if row.RequestsUsed == nil || *row.RequestsUsed != 100 {
+		t.Fatalf("RequestsUsed = %v, want 100 (1000 limit - 900 remaining)", row.RequestsUsed)
 	}
 }
